@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+tests/
+_test_tmp/
+config/state.db*
+config/config.yaml
+.git/
+*.md

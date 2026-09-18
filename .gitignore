@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+config/config.yaml
+state.db
+state.db-wal
+state.db-shm
+.venv/
+venv/
+.DS_Store

@@ -1,0 +1,45 @@
+# UPilot-mini 配置（首次启动会自动从本文件复制到 /config/config.yaml）
+# 修改后 docker compose restart 生效
+
+p115:
+  # 115 账号 cookie，形如 "UID=...; CID=...; SEID=...; KID=..."
+  # 留空则可用环境变量 P115_COOKIE 覆盖，或进容器跑：python /app/app/main.py login
+  cookie: ""
+  # 登录槽位；建议用一个平时不用的端，避免把手机/网页挤下线
+  # web / android / ios / tv / qandroid / wechatmini ...
+  app: "qandroid"
+
+paths:
+  # 容器内监控目录（compose 把宿主机媒体目录挂到 /media/source）
+  source: "/media/source"
+  # 115 上的目标根目录（不存在会自动创建，保留本地相对目录结构）
+  target_root: "/UPILOT-mini"
+
+scan:
+  interval_seconds: 30          # 扫描间隔
+  stable_rounds: 2              # 连续 N 轮 size/mtime 不变才认为文件写完
+  min_size_mb: 0                # 小于该值的文件直接忽略
+  ignore_suffixes: [".!qb", ".part", ".tmp", ".downloading", ".crdownload", ".aria2"]
+
+upload:
+  small_file_mb: 10             # 秒传未命中：小于它直接普通上传；大于它先反复重试秒传
+  partsize_mb: 10               # 分块上传分块大小
+  concurrency: 2                # 同时处理的文件数
+  init_min_interval: 0.5        # 两次秒传/上传初始化之间的最小间隔（防 115 限流）
+  transient_retries: 2          # 401/403/429/5xx 的额外重试次数
+  conflict_strategy: overwrite  # 同名文件：skip / overwrite / overwrite_if_larger
+
+retry:
+  interval_seconds: 60          # 秒传重试间隔（重试只发校验请求，不重传数据）
+  max_count: 5                  # 最多重试次数
+  max_hours: 12                 # 或累计超过这么多小时就放弃重试，转普通上传
+
+state:
+  db: "/config/state.db"        # SQLite：SHA1 缓存、断点、状态
+
+http:
+  enabled: true                 # 起一个极简状态页 /status 与 /health
+  host: "0.0.0.0"
+  port: 9844
+
+log_level: "INFO"

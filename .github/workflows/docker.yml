@@ -1,0 +1,92 @@
+name: Build and push upilot-mini
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "requirements.txt"
+      - "app/**"
+      - "config/config.example.yaml"
+      - ".github/workflows/docker.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: upilot-mini
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # 通过 env 中转，才能在 if 里做非空判断（secrets 上下文不能直接用于 if）
+      DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show build target
+        run: |
+          echo "docker hub : ${DH_USER:-<未配置，将只推 GHCR>}/${IMAGE_NAME}"
+          echo "ghcr target: ghcr.io/${{ github.repository }}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.DH_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DH_USER }}
+          password: ${{ env.DH_TOKEN }}
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push to Docker Hub
+        if: env.DH_TOKEN != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            docker.io/${{ env.DH_USER }}/${{ env.IMAGE_NAME }}:latest
+            docker.io/${{ env.DH_USER }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 构建结果"
+            echo ""
+            echo "- 提交：\`${{ github.sha }}\`"
+            echo "- GHCR：\`ghcr.io/${{ github.repository }}:${{ github.run_number }}\`"
+            if [ -n "${DH_TOKEN}" ]; then
+              echo "- Docker Hub：\`${DH_USER}/${IMAGE_NAME}:${GITHUB_RUN_NUMBER}\`"
+            else
+              echo "- Docker Hub：跳过（未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

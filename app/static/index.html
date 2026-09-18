@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>UPilot-mini · 秒传优先上传器</title>
+<style>
+  :root{
+    --bg:#08090d; --panel:rgba(255,255,255,.035); --panel-2:rgba(255,255,255,.07);
+    --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.15);
+    --fg:#eef1f7; --muted:#b3bac9; --dim:#98a1b2;
+    --indigo:#6366f1; --violet:#8b5cf6; --emerald:#34d399; --sky:#38bdf8;
+    --amber:#fbbf24; --rose:#fb7185; --slate:#94a3b8;
+    --radius:16px;
+    font-synthesis:none;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;font-size:14px;line-height:1.55}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+    background:
+      radial-gradient(46% 40% at 12% -6%, rgba(99,102,241,.20), transparent 70%),
+      radial-gradient(40% 36% at 88% -10%, rgba(52,211,153,.16), transparent 70%),
+      radial-gradient(50% 40% at 60% 108%, rgba(139,92,246,.12), transparent 70%)}
+  .wrap{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding:26px 22px 56px}
+
+  /* ---------- 顶栏 ---------- */
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+  .logo{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;flex:none;
+    background:linear-gradient(140deg,#6366f1,#22d3ee 55%,#34d399);
+    box-shadow:0 10px 30px -10px rgba(99,102,241,.75), inset 0 1px 0 rgba(255,255,255,.35)}
+  .logo svg{width:24px;height:24px}
+  h1{font-size:20px;margin:0;font-weight:650;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
+  .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;
+    border:1px solid var(--line-2);background:var(--panel);font-size:11.5px;color:var(--muted)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--emerald);box-shadow:0 0 0 0 rgba(52,211,153,.7);animation:pulse 2.2s infinite;flex:none}
+  .dot.off{background:var(--rose);animation:none;box-shadow:none}
+  .dot.amber{background:var(--amber);animation:none;box-shadow:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}70%{box-shadow:0 0 0 9px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+  .spacer{flex:1}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line-2);
+    padding:8px 13px;border-radius:11px;cursor:pointer;transition:.16s ease;display:inline-flex;align-items:center;gap:8px}
+  button:hover{background:var(--panel-2);border-color:rgba(255,255,255,.26);transform:translateY(-1px)}
+  button:active{transform:translateY(0)}
+  button.primary{background:linear-gradient(135deg,rgba(99,102,241,.95),rgba(56,189,248,.9));border-color:transparent;
+    box-shadow:0 10px 24px -12px rgba(99,102,241,.9);font-weight:600}
+  button svg{width:15px;height:15px}
+  button.mini{padding:7px 11px;font-size:12.5px;color:var(--muted)}
+
+  /* ---------- 卡片 ---------- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 18px;backdrop-filter:blur(10px);box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
+    transition:border-color .2s ease}
+  .card:hover{border-color:rgba(255,255,255,.14)}
+  .card h2{margin:0 0 12px;font-size:12.5px;font-weight:600;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
+  .grid-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(196px,1fr));gap:14px;margin-bottom:14px}
+  .stat{display:flex;flex-direction:column;gap:3px;position:relative;overflow:hidden}
+  .stat .k{color:var(--muted);font-size:12.5px;display:flex;align-items:center;gap:7px}
+  .stat .k svg{width:14px;height:14px;opacity:.85}
+  .stat .v{font-size:28px;font-weight:680;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+  .stat .s{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  .accent-e{color:var(--emerald)} .accent-i{color:#a5b4fc} .accent-a{color:var(--amber)} .accent-s{color:var(--sky)}
+  .stat::after{content:"";position:absolute;right:-30px;top:-30px;width:96px;height:96px;border-radius:50%;
+    background:radial-gradient(circle,rgba(255,255,255,.05),transparent 65%)}
+
+  .grid-2{display:grid;grid-template-columns:1.5fr 1fr;gap:14px;align-items:start}
+  @media (max-width:980px){.grid-2{grid-template-columns:1fr}}
+  .col{display:flex;flex-direction:column;gap:14px;min-width:0}
+
+  /* ---------- 环形命中率 ---------- */
+  .ring-wrap{display:flex;align-items:center;gap:18px}
+  .ring{position:relative;width:96px;height:96px;flex:none}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .val{position:absolute;inset:0;display:grid;place-items:center;font-size:19px;font-weight:680;font-variant-numeric:tabular-nums}
+  .legend{display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--muted)}
+  .legend b{color:var(--fg);font-variant-numeric:tabular-nums;font-weight:600}
+
+  /* ---------- 列表 ---------- */
+  .row{display:flex;align-items:center;gap:12px;padding:11px 2px;border-top:1px solid var(--line)}
+  .row:first-child{border-top:0}
+  .row .name{min-width:0;flex:1}
+  .row .name .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:560}
+  .row .name .p{color:var(--dim);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .badge{flex:none;font-size:11.5px;padding:3px 9px;border-radius:999px;border:1px solid transparent;font-weight:560}
+  .b-已完成,.b-已上传{color:#bbf7d0;background:rgba(52,211,153,.12);border-color:rgba(52,211,153,.32)}
+  .b-秒传中{color:#bfdbfe;background:rgba(96,165,250,.13);border-color:rgba(96,165,250,.34)}
+  .b-上传中{color:#ddd6fe;background:rgba(167,139,250,.14);border-color:rgba(167,139,250,.34)}
+  .b-待重试{color:#fde68a;background:rgba(251,191,36,.13);border-color:rgba(251,191,36,.34)}
+  .b-待处理,.b-待秒传,.b-待上传{color:#cbd5e1;background:rgba(148,163,184,.13);border-color:rgba(148,163,184,.3)}
+  .b-错误{color:#fecdd3;background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.34)}
+  .bar{height:6px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
+  .bar > i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#6366f1,#38bdf8);
+    background-size:200% 100%;animation:flow 2.4s linear infinite;transition:width .4s ease}
+  .bar > i.rapid{background:linear-gradient(90deg,#0ea5e9,#38bdf8);animation:none}
+  .bar > i.retry{background:linear-gradient(90deg,#f59e0b,#fde68a);animation:none}
+  .bar > i.upload{background:linear-gradient(90deg,#7c3aed,#a78bfa);animation:none}
+  @keyframes flow{0%{background-position:0% 0}100%{background-position:200% 0}}
+  .meta{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums;flex:none;text-align:right}
+
+  table{width:100%;border-collapse:collapse;table-layout:fixed}
+  th{text-align:left;color:var(--muted);font-weight:560;font-size:12px;padding:0 10px 8px 0;border-bottom:1px solid var(--line)}
+  td{padding:9px 10px 9px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:12.5px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);font-size:11.5px}
+  tr:last-child td{border-bottom:0}
+  tbody tr:hover td{background:rgba(255,255,255,.025)}
+  .scroll{flex:1;min-height:0;overflow:auto}
+
+  .kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px}
+  .kv:first-child{border-top:0}
+  .kv span:first-child{color:var(--muted);flex:none}
+  .kv span:last-child{font-variant-numeric:tabular-nums;text-align:right;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;max-width:64%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .empty{color:var(--dim);text-align:center;padding:28px 10px;font-size:12.5px}
+  .hint{font-size:12px;color:var(--muted);background:rgba(255,255,255,.03);border:1px solid var(--line);
+    border-radius:10px;padding:8px 10px;margin-top:8px;line-height:1.5}
+  .hint.warn{color:#fde68a;background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.28)}
+  .hint.err{color:#fecdd3;background:rgba(251,113,133,.09);border-color:rgba(251,113,133,.3)}
+  .bars{display:flex;flex-direction:column;gap:9px}
+  .bars .b1{display:grid;grid-template-columns:78px 1fr 64px;align-items:center;gap:10px;font-size:12px;color:var(--muted)}
+  .bars .track{height:7px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
+  .bars .track > i{display:block;height:100%;border-radius:999px;transition:width .4s ease}
+
+  #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:9;
+    background:rgba(17,19,26,.95);border:1px solid var(--line-2);color:var(--fg);
+    padding:10px 16px;border-radius:12px;box-shadow:0 18px 40px -18px #000;opacity:0;transition:.22s;pointer-events:none;font-size:13px}
+  #toast.on{opacity:1;transform:translate(-50%,0)}
+  footer{color:var(--muted);opacity:.8;font-size:11.5px;margin-top:20px;text-align:center}
+  .live{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
+  .switch{position:relative;width:36px;height:21px;border-radius:999px;background:rgba(255,255,255,.13);cursor:pointer;transition:.2s;flex:none}
+  .switch.on{background:rgba(52,211,153,.55)}
+  .switch i{position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:#fff;transition:.2s}
+  .switch.on i{left:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 19V6"/><path d="M6 12l6-6 6 6"/><path d="M4 21h16"/>
+      </svg>
+    </div>
+    <div>
+      <h1>UPilot-mini
+        <span class="pill" id="env-pill">…</span>
+      </h1>
+      <div class="sub">监控本地目录 · SHA1 秒传优先 · 重试不重传 · 保留目录结构</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="btns">
+      <button id="btn-pause" class="mini" title="暂停/恢复调度（在途任务会跑完）">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 5v14"/><path d="M15 5v14"/></svg>
+        <span id="pause-label">暂停调度</span>
+      </button>
+      <button id="btn-auto" class="mini" title="切换自动刷新间隔（3 / 5 / 10 / 30 秒）">
+        <span class="switch on" id="auto"><i></i></span>自动刷新 <span id="auto-label" style="color:var(--dim)">5s</span>
+      </button>
+      <button id="btn-refresh" class="mini" title="立刻刷新数据">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+        刷新
+      </button>
+      <button id="btn-scan" class="primary" title="立刻扫描监控目录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        立即扫描
+      </button>
+      <button id="btn-retry" class="mini" title="把所有待重试的秒传提前到期">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12a9 9 0 0 1 15-6.7"/><path d="M21 4v6h-6"/><path d="M21 12a9 9 0 0 1-15 6.7"/><path d="M3 20v-6h6"/></svg>
+        立即重试秒传
+      </button>
+      <button id="btn-requeue" class="mini" title="把出错的文件重新排队">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+        失败项重新入队
+      </button>
+    </div>
+  </header>
+
+  <div class="grid-stats">
+    <div class="card stat">
+      <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>文件总数</div>
+      <div class="v" id="s-total">–</div>
+      <div class="s" id="s-total-size">–</div>
+    </div>
+    <div class="card stat">
+      <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>已上传</div>
+      <div class="v accent-e" id="s-done">–</div>
+      <div class="s" id="s-done-size">–</div>
+    </div>
+    <div class="card stat">
+      <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg>秒传命中</div>
+      <div class="v accent-s" id="s-rapid">–</div>
+      <div class="s" id="s-rapid-size">–</div>
+    </div>
+    <div class="card stat">
+      <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>处理中 / 待重试</div>
+      <div class="v accent-i" id="s-active">–</div>
+      <div class="s" id="s-retry">–</div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="col">
+      <div class="card">
+        <h2>处理中 / 待重试</h2>
+        <div id="active-list"></div>
+      </div>
+      <div class="card" style="display:flex;flex-direction:column">
+        <h2>最近活动</h2>
+        <div class="scroll" style="max-height:520px">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:76px">时间</th>
+                <th>文件</th>
+                <th style="width:84px">状态</th>
+                <th style="width:29%">115 目标目录</th>
+                <th style="width:22%">说明</th>
+              </tr>
+            </thead>
+            <tbody id="recent-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h2>运行配置</h2>
+        <div id="cfg-list"></div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h2>秒传命中率</h2>
+        <div class="ring-wrap">
+          <div class="ring">
+            <svg width="96" height="96">
+              <circle cx="48" cy="48" r="40" stroke="rgba(255,255,255,.09)" stroke-width="9" fill="none"/>
+              <circle id="ring-fg" cx="48" cy="48" r="40" stroke="url(#g1)" stroke-width="9" fill="none"
+                      stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="251.2"/>
+              <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#6366f1"/><stop offset="100%" stop-color="#34d399"/></linearGradient></defs>
+            </svg>
+            <div class="val" id="ring-val">–</div>
+          </div>
+          <div class="legend">
+            <div>命中 <b id="l-rapid">–</b> / 已上传 <b id="l-done">–</b></div>
+            <div>省下上行 <b id="l-saved">–</b></div>
+            <div>实际走流量 <b id="l-normal">–</b></div>
+            <div>秒传重试累计 <b id="l-retry">–</b> 次</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>状态分布</h2>
+        <div class="bars" id="status-bars"></div>
+      </div>
+      <div class="card">
+        <h2>连接</h2>
+        <div class="live"><span class="dot" id="live-dot"></span><span id="live-text">每 3 秒自动刷新</span></div>
+        <div class="kv" style="margin-top:10px"><span>上次扫描</span><span id="last-scan">–</span></div>
+        <div class="kv"><span>已扫描轮次</span><span id="scan-rounds">–</span></div>
+      </div>
+      <div class="card">
+        <h2>队列与提示</h2>
+        <div id="queue-list"></div>
+        <div id="hints"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>UPilot-mini · 只做「秒传优先上传」这件事 · 状态存于 <span id="f-db">/config/state.db</span></footer>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtBytes = (b) => {
+  b = Number(b || 0);
+  if (!b) return "0 B";
+  const u = ["B","KB","MB","GB","TB","PB"]; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + " " + u[i];
+};
+const fmtAgo = (ts) => {
+  if (!ts) return "–";
+  const d = Math.max(0, Date.now() / 1000 - ts);
+  if (d < 60) return Math.floor(d) + " 秒前";
+  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+  return Math.floor(d / 86400) + " 天前";
+};
+const secsLeft = (ts) => Math.max(0, Math.round((ts || 0) - Date.now() / 1000));
+const base = (p) => String(p || "").split(/[\\/]/).pop();
+const fmtAbs = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "–";
+const cls = (s) => "b-" + String(s || "").replace(/\s/g, "");
+let auto = true, refreshMs = 5000, lastFetch = 0, paused = false;
+const INTERVALS = [3000, 5000, 10000, 30000];
+
+function toast(msg){
+  const t = $("#toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("on"), 2600);
+}
+
+function ring(pct){
+  const C = 2 * Math.PI * 40;
+  $("#ring-fg").setAttribute("stroke-dashoffset", String(C * (1 - Math.max(0, Math.min(1, pct)))));
+  $("#ring-val").textContent = Math.round(pct * 100) + "%";
+}
+
+function render(d){
+  if (!d || !d.stats) return;
+  const st = d.stats || {}, by = st.by_status || {};
+  const done = by["已上传"]?.count || 0;
+  const activeCount = (by["处理中"]?.count || 0) + (by["秒传中"]?.count || 0)
+    + (by["上传中"]?.count || 0) + (by["待重试"]?.count || 0);
+  $("#env-pill").innerHTML = d.dry_run
+    ? '<span class="dot amber"></span>dry-run 离线自检 · 数字为模拟'
+    : '<span class="dot"></span>在线运行';
+  $("#s-total").textContent = st.total?.count ?? 0;
+  $("#s-total-size").textContent = "合计 " + fmtBytes(st.total?.bytes);
+  $("#s-done").textContent = done;
+  $("#s-done-size").textContent = "分块 " + fmtBytes(st.normal?.bytes) + " 走了流量 · 其中秒传 " + (st.rapid?.count ?? 0) + " 个";
+  $("#s-rapid").textContent = st.rapid?.count ?? 0;
+  $("#s-rapid-size").textContent = "省下上行 " + fmtBytes(st.rapid?.bytes);
+  $("#s-active").textContent = activeCount;
+  $("#s-retry").textContent = "秒传重试累计 " + (st.retry_total ?? 0) + " 次";
+
+  const finished = (st.rapid?.count || 0) + (st.normal?.count || 0);
+  ring(finished ? (st.rapid?.count || 0) / finished : 0);
+  $("#l-rapid").textContent = st.rapid?.count ?? 0;
+  $("#l-done").textContent = (st.rapid?.count || 0) + (st.normal?.count || 0);
+  $("#l-saved").textContent = fmtBytes(st.rapid?.bytes);
+  $("#l-normal").textContent = fmtBytes(st.normal?.bytes);
+  $("#l-retry").textContent = st.retry_total ?? 0;
+
+  // ---- 正在处理 ----
+  const act = d.active || [];
+  const interval = Number(d.config?.retry_interval || 60);
+  $("#active-list").innerHTML = act.length ? act.map(f => {
+    const pct = Number(f.progress || 0);
+    let barCls = "", width = Math.max(pct, 2), note = fmtBytes(f.size);
+    if (f.status === "待重试") {
+      const left = secsLeft(f.next_retry_at);
+      // 倒计时条：剩余时间越少条越短，与「上传中」的增长条区分开
+      barCls = "retry";
+      width = Math.max(4, Math.min(1, left / interval) * 100);
+      note = `倒计时 ${left}s · 第 ${f.retry_count} 次秒传重试`;
+    } else if (f.status === "秒传中") {
+      barCls = "rapid"; width = 100; note = "只发校验请求，不重传数据";
+    } else if (f.status === "上传中") {
+      barCls = "upload"; width = Math.max(pct, 4); note = `分块上传 ${pct.toFixed(1)}%`;
+    } else if (f.status === "处理中") {
+      width = Math.max(pct, 4); note = `计算 SHA1 ${pct.toFixed(0)}%`;
+    }
+    return `<div class="row">
+      <div class="name">
+        <div class="t">${esc(base(f.path))}</div>
+        <div class="p" title="${esc(f.target_dir || f.path)}">${esc(f.target_dir || "…")}</div>
+        <div class="bar"><i class="${barCls}" style="width:${width.toFixed(1)}%"></i></div>
+      </div>
+      <div class="meta">${esc(note)}</div>
+      <div class="badge ${cls(f.status)}">${esc(f.status)}</div>
+    </div>`;
+  }).join("") : '<div class="empty">当前没有在处理的任务 · 静静等着新文件出现</div>';
+
+  // ---- 暂停状态 / 队列 / 提示 ----
+  paused = !!d.paused;
+  $("#pause-label").textContent = paused ? "恢复调度" : "暂停调度";
+  $("#btn-pause").style.color = paused ? "var(--amber)" : "";
+  const q = d.queue || {};
+  $("#queue-list").innerHTML = ["待处理", "待秒传", "待重试", "待上传", "错误"]
+    .map(k => `<div class="kv"><span>${k}</span><span>${q[k] || 0} 个</span></div>`).join("");
+  const hints = [];
+  if (paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务（在途任务会跑完），点「恢复调度」继续</div>');
+  if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
+  if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「最近活动」，可点「失败项重新入队」重试</div>`);
+  if (!hints.length) hints.push('<div class="hint">一切正常：队列为空，没有报错</div>');
+  $("#hints").innerHTML = hints.join("");
+
+  // ---- 最近活动 ----
+  const rec = d.recent || [];
+  $("#recent-body").innerHTML = rec.length ? rec.map(f => {
+    const msg = String(f.message || "");
+    let [note, dirPart] = msg.includes("→") ? msg.split("→").map(s => s.trim()) : [msg, ""];
+    note = note.replace(/将在\s*\d+\s*s?\s*后/, "已排入队列");
+    const dir = f.target_dir || dirPart || "–";
+    return `<tr>
+      <td class="mono" title="${esc(fmtAbs(f.updated_at))}">${fmtAgo(f.updated_at)}</td>
+      <td title="${esc(f.path)}">${esc(base(f.path))}</td>
+      <td><span class="badge ${cls(f.status)}">${esc(f.status)}</span></td>
+      <td class="mono" title="${esc(dir)}">${esc(dir)}</td>
+      <td style="color:var(--muted)" title="${esc(msg)}">${esc(note)}</td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="5" class="empty">还没有记录</td></tr>';
+
+  // ---- 状态分布 ----
+  const order = ["待处理","待秒传","秒传中","待重试","待上传","上传中","已上传","错误"];
+  const colors = {"待处理":"#94a3b8","待秒传":"#94a3b8","秒传中":"#60a5fa","待重试":"#fbbf24",
+                  "待上传":"#94a3b8","上传中":"#a78bfa","已上传":"#34d399","错误":"#fb7185"};
+  const maxv = Math.max(1, ...order.map(k => by[k]?.count || 0));
+  const totalCount = st.total?.count || 0;
+  $("#status-bars").innerHTML = order.map(k => {
+    const c = by[k]?.count || 0;
+    const share = totalCount ? Math.round(c / totalCount * 100) : 0;
+    return `<div class="b1"><span>${k}</span>
+      <div class="track"><i style="width:${(c / maxv * 100).toFixed(1)}%;background:${colors[k]}"></i></div>
+      <span style="text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap"><span style="color:var(--fg)">${c}</span><span style="color:var(--dim);font-size:11px"> ${share}%</span></span></div>`;
+  }).join("");
+
+  // ---- 连接 / 配置 ----
+  $("#last-scan").textContent = fmtAgo(d.last_scan);
+  $("#scan-rounds").textContent = d.scan_rounds ?? 0;
+  const c = d.config || {};
+  const kv = [
+    ["监控目录", c.source],
+    ["115 目标根", c.target_root],
+    ["扫描间隔", c.scan_interval + " 秒"],
+    ["稳定判定", c.stable_rounds + " 轮"],
+    ["并发", c.concurrency + " 个文件"],
+    ["小文件阈值", c.small_file_mb + " MB"],
+    ["分块大小", c.partsize_mb + " MB"],
+    ["秒传重试", `${c.retry_interval} 秒 / ${c.retry_max_count} 次 / ${c.retry_max_hours} 小时`],
+    ["初始化节流", c.init_min_interval + " 秒"],
+  ];
+  $("#cfg-list").innerHTML = kv.map(([k, v]) =>
+    `<div class="kv"><span>${k}</span><span title="${esc(v)}">${esc(v)}</span></div>`).join("");
+  $("#f-db").textContent = c.db || "/config/state.db";
+}
+
+async function refresh(){
+  try{
+    const r = await fetch("/api/status", {cache:"no-store"});
+    const d = await r.json();
+    window.__last = d;
+    render(d);
+    $("#live-dot").classList.remove("off");
+    $("#live-text").textContent = (auto ? `每 ${refreshMs / 1000} 秒自动刷新` : "自动刷新已关闭") + " · 刚刚同步";
+  }catch(e){
+    $("#live-dot").classList.add("off");
+    $("#live-text").textContent = "连接断开，重试中…";
+  }
+}
+
+async function act(path, label){
+  try{
+    const r = await fetch(path, {method:"POST"});
+    const j = await r.json();
+    toast(j.message || label);
+    refresh();
+  }catch(e){ toast("操作失败：" + e); }
+}
+
+$("#btn-scan").onclick = () => act("/api/scan", "已触发扫描");
+$("#btn-retry").onclick = () => act("/api/retry-now", "已提前重试");
+$("#btn-requeue").onclick = () => act("/api/requeue", "已重新入队");
+$("#btn-refresh").onclick = () => { lastFetch = Date.now(); refresh(); toast("已刷新"); };
+$("#btn-pause").onclick = () => act(paused ? "/api/resume" : "/api/pause", paused ? "已恢复调度" : "已暂停调度");
+$("#btn-auto").onclick = () => {
+  const i = INTERVALS.indexOf(refreshMs);
+  if (!auto) { auto = true; refreshMs = INTERVALS[0]; }
+  else if (i === INTERVALS.length - 1) { auto = false; }
+  else { refreshMs = INTERVALS[i + 1]; }
+  $("#auto").classList.toggle("on", auto);
+  $("#auto-label").textContent = auto ? (refreshMs / 1000) + "s" : "关";
+  refresh();
+};
+
+refresh();
+// 每秒 tick：到点拉数据，其余时间用缓存重绘（倒计时、相对时间保持鲜活）
+setInterval(() => {
+  if (!auto) return;
+  if (Date.now() - lastFetch >= refreshMs) { lastFetch = Date.now(); refresh(); }
+  else render(window.__last || {});
+}, 1000);
+</script>
+</body>
+</html>
