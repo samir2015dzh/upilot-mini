@@ -42,7 +42,7 @@ DEFAULTS: dict = {
         "port": 9844,
         # 反代/暴露到内网时打开：页面与 /api/* 需要 HTTP Basic 或 ?token=…
         # /health 始终放行（容器 HEALTHCHECK 在容器内直连）
-        "auth": {"enabled": False, "username": "upilot", "password": ""},
+        "auth": {"enabled": False, "username": "admin", "password": ""},
     },
     "log_level": "INFO",
 }

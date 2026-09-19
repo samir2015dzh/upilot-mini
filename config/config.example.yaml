@@ -48,7 +48,7 @@ http:
   port: 9844
   auth:
     enabled: false              # 要反代/暴露到内网时改成 true
-    username: "upilot"          # HTTP Basic 用户名
+    username: "admin"    # HTTP Basic 用户名
     # 密码留空 = 不校验。设了密码后，页面与 /api/* 都要带 Basic 或 ?token=<密码>；
     # /health 始终放行（容器 HEALTHCHECK 用），不受影响
     password: ""

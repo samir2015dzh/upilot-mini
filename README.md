@@ -125,11 +125,11 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 http:
   auth:
     enabled: true
-    username: "upilot"
+    username: "admin"
     password: "换成一串长随机密码"
 ```
 
-打开后页面和所有 `/api/*` 都要凭据：浏览器走 HTTP Basic 弹窗，脚本用 `curl -u upilot:密码 …` 或 `?token=密码`（例：`curl "http://host:9844/api/status?token=…"`）。`/health` 始终放行，容器 HEALTHCHECK 不受影响。密码留空等同于关闭。
+打开后页面和所有 `/api/*` 都要凭据：浏览器走 HTTP Basic 弹窗，脚本用 `curl -u admin:密码 …` 或 `?token=密码`（例：`curl "http://host:9844/api/status?token=…"`）。`/health` 始终放行，容器 HEALTHCHECK 不受影响。密码留空等同于关闭。
 
 反代只要把 `Authorization` 头透传过去即可，nginx 例：
 
