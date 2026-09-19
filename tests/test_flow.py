@@ -390,9 +390,12 @@ def case_settings_map_and_slots():
     assert "Something => /something" in text, text
 
     appf = cfgmod.find_field("p115.app")
-    assert appf["type"] == "select" and appf["options"][0]["value"] == "qandroid", appf
+    assert appf["type"] == "select" and appf["options"][0]["value"] == "115ipad", appf
     assert cfgmod.app_label("qandroid") == "115管理(Android端)"
     assert cfgmod.app_label("ipad") == "115(iPad端)"
+    assert "qandroid" in cfgmod.QR_UNSUPPORTED and "115ipad" not in cfgmod.QR_UNSUPPORTED
+    assert all(x.get("qr") in (True, False) for x in cfgmod.APP_OPTIONS), "每个槽位都要标能不能扫码"
+    assert cfgmod.APP_OPTIONS[0]["qr"] is True, "能扫码的槽位要排前面"
     try:
         cfgmod.coerce(appf, "不存在的端")
     except ValueError:

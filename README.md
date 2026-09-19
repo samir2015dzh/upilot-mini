@@ -51,17 +51,23 @@ docker compose logs -f
 `/config/config.yaml` 并重建 115 客户端 —— 不用手抄、不用重启。
 
 登录槽位就是 `p115.app`：二维码按该端申请，登录出来的 cookie 也归该端，**所以挑一个自己
-平时不用的端，扫码不会把手机上正在用的 115 / 网页版挤下线**。下拉里是中文标签，常用几个：
+平时不用的端，扫码不会把手机上正在用的 115 / 网页版挤下线**。下拉里是中文标签，并按「能不能出二维码」
+排序（下面是 115 当前的真实返回，面板里不可扫码的会标注「115 已不支持扫码」）：
+
+**能扫码**（115 返回真 PNG）
 
 | 槽位 | 对应客户端 |
 | --- | --- |
-| `qandroid` / `qios` / `qipad` | 115管理（Android / iOS / iPad 端） |
-| `android` / `ios` / `ipad` | 115（Android / iOS / iPad 端） |
-| `tv` / `apple_tv` | 115网盘（Android / Apple 电视端） |
-| `bandroid` | 115生活（Android端） |
-| `wechatmini` / `alipaymini` | 115生活（微信 / 支付宝小程序） |
-| `web` / `windows` / `mac` / `linux` | 网页版 / 电脑端 |
-| `harmony` | 鸿蒙端 |
+| `115ipad` / `ipad` | 115（iPad端·旧版 / iPad端）—— **默认**，多数人平时不在 iPad 上用 115 |
+| `115android` / `115ios` | 115（Android端·旧版 / iOS端·旧版） |
+| `tv` / `apple_tv` | 115网盘（Android电视端 / Apple电视端） |
+| `wechatmini` / `alipaymini` | 115生活（微信小程序 / 支付宝小程序） |
+| `harmony` | 115（鸿蒙端） |
+| `web` | 网页版 |
+| `windows` / `mac` / `linux` | Windows / macOS / Linux 电脑端 |
+
+**扫不了**（115 已改端点，取二维码只回一张 HTML 跳转页）：
+`qandroid`、`qios`、`qipad`、`android`、`ios`、`bandroid` —— 选了面板会直接提示换一个。
 
 **方式 B：命令行扫码**
 
@@ -99,7 +105,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `p115.cookie` / `p115.app` | — / `qandroid` | 115 凭据与登录槽位（扫码与上传都用它，挑平时不用的端） |
+| `p115.cookie` / `p115.app` | — / `115ipad` | 115 凭据与登录槽位（扫码与上传都用它，挑平时不用的端；可选值见 §2） |
 | `paths.source` | `/media/source` | 容器内监控目录 |
 | `paths.target_root` | `/UPILOT-mini` | 没被 `paths.map` 命中的文件落在这里，不存在会自动创建 |
 | `paths.map` | `[]` | 本机相对路径 → 115 目录的映射表（可改名、大小写照写），见 §5「目录映射」 |
@@ -189,9 +195,11 @@ paths:
 用手机 115 官方 App 扫一扫 → 手机上确认，状态会从「等待扫码」变「已登录」，cookie 自动写进配置
 并重建 115 客户端。二维码约 5 分钟有效，过期点「刷新二维码」重来。
 
-- **槽位可选**（下拉 19 个中文选项）就是为了这件事：扫码身份按槽位申请，登录出来的 cookie 也归该端。
-  例如选 `115(iPad端)` 或 `115网盘(Android电视端)`，就不会顶掉你手机上正在用的 115 App / 网页版。
-  槽位下拉改完立刻存进配置，下一次「获取二维码」即生效。
+- **槽位可选**（下拉 19 个中文选项，见 §2 的实测表）就是为了这件事：扫码身份按槽位申请，登录出来的
+  cookie 也归该端。例如选 `115(iPad端·旧版)` 或 `115网盘(Android电视端)`，就不会顶掉你手机上正在用的
+  115 App / 网页版。槽位下拉改完立刻存进配置，下一次「获取二维码」即生效。
+- 115 目前对 `qandroid` / `qios` / `qipad` / `android` / `ios` / `bandroid` 这 6 个槽位不再返回二维码图，
+  面板会标注并提示换一个，不会让你白点。
 - 115 的状态接口是长轮询：有状态变化立刻返回，空闲时会挂住；面板给 5 秒读超时
   （底层还会重试，一次轮询约十几秒），所以扫码后最多十几秒页面上就会显示「已登录」。
 - 命令行方式仍然可用：`docker compose run --rm upilot-mini login`（终端里显示二维码）。

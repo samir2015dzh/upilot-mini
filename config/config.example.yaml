@@ -11,7 +11,7 @@ p115:
   #   android/ios/ipad 115(Android/iOS/iPad端) | bandroid 115生活(Android端)
   #   wechatmini/alipaymini 115生活(微信/支付宝小程序) | tv 115网盘(电视端)
   #   web 网页版 | windows/mac/linux 电脑端 | harmony 鸿蒙端
-  app: "qandroid"
+  app: "115ipad"
 
 paths:
   # 容器内监控目录（compose 把宿主机媒体目录挂到 /media/source）

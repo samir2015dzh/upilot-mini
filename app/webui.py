@@ -284,6 +284,10 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         app = str(app or (cfg.get("p115") or {}).get("app") or "web").strip()
         if app not in cfgmod.APP_VALUES:                  # 白名单，别把任意值塞进 URL
             raise RuntimeError(f"不支持的登录槽位：{app}")
+        if app in cfgmod.QR_UNSUPPORTED:                  # 实测：这些槽位 115 只回一张 HTML 跳转页
+            ok = "、".join(x["label"] for x in cfgmod.QR_SUPPORTED[:5])
+            raise RuntimeError(f"{cfgmod.app_label(app)} 取不到二维码图片（115 已改端点），"
+                               f"换一个：{ok} …（面板下拉里排在前面的都能扫）")
         from p115client import P115Client
 
         token = P115Client.login_qrcode_token(app=app)

@@ -346,7 +346,8 @@ function fillQrApps(groups) {
   sel.innerHTML = (f.options || []).map(o => {
     const v = (o && typeof o === "object") ? o.value : o;
     const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
-    return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}</option>`;
+    const note = (o && typeof o === "object" && o.qr === false) ? "（115 已不支持扫码）" : "";
+    return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}${note}</option>`;
   }).join("");
   const pill = $("#qr-slot");
   if (pill) pill.textContent = "槽位 " + (sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "–");
@@ -366,7 +367,8 @@ function fieldHtml(f) {
     const opts = (f.options || []).map(o => {
       const v = (o && typeof o === "object") ? o.value : o;
       const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
-      return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}</option>`;
+      const note = (o && typeof o === "object" && o.qr === false) ? "（115 已不支持扫码）" : "";
+      return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}${note}</option>`;
     }).join("");
     return `<div class="f"><label>${label}${tag}</label>
       <select data-key="${key}" data-type="select">${opts}</select>${hint}</div>`;

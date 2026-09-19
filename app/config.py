@@ -13,28 +13,31 @@ EXAMPLE_PATH = Path("/app/config/config.example.yaml")
 
 # 115 登录槽位（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
 # 用途：扫码/上传都用它当身份，挑一个自己平时不用的端，就不会把手机/网页挤下线。
+# 顺序 = 能否拿到二维码：能出图的排前面，115 已改端点的排最后（面板里会标注）。
 APP_OPTIONS: list[dict] = [
-    {"value": "qandroid", "label": "115管理(Android端)"},
-    {"value": "qios", "label": "115管理(iOS端)"},
-    {"value": "qipad", "label": "115管理(iPad端)"},
-    {"value": "android", "label": "115(Android端)"},
-    {"value": "ios", "label": "115(iOS端)"},
-    {"value": "ipad", "label": "115(iPad端)"},
-    {"value": "bandroid", "label": "115生活(Android端)"},
-    {"value": "wechatmini", "label": "115生活(微信小程序)"},
-    {"value": "alipaymini", "label": "115生活(支付宝小程序)"},
-    {"value": "tv", "label": "115网盘(Android电视端)"},
-    {"value": "apple_tv", "label": "115网盘(Apple电视端)"},
-    {"value": "harmony", "label": "115(鸿蒙端)"},
-    {"value": "web", "label": "网页版"},
-    {"value": "windows", "label": "Windows 电脑端"},
-    {"value": "mac", "label": "macOS 电脑端"},
-    {"value": "linux", "label": "Linux 电脑端"},
-    {"value": "115android", "label": "115(Android端·旧版)"},
-    {"value": "115ios", "label": "115(iOS端·旧版)"},
-    {"value": "115ipad", "label": "115(iPad端·旧版)"},
+    {"value": "115ipad", "label": "115(iPad端·旧版)", "qr": True},
+    {"value": "ipad", "label": "115(iPad端)", "qr": True},
+    {"value": "115android", "label": "115(Android端·旧版)", "qr": True},
+    {"value": "115ios", "label": "115(iOS端·旧版)", "qr": True},
+    {"value": "tv", "label": "115网盘(Android电视端)", "qr": True},
+    {"value": "apple_tv", "label": "115网盘(Apple电视端)", "qr": True},
+    {"value": "wechatmini", "label": "115生活(微信小程序)", "qr": True},
+    {"value": "alipaymini", "label": "115生活(支付宝小程序)", "qr": True},
+    {"value": "harmony", "label": "115(鸿蒙端)", "qr": True},
+    {"value": "web", "label": "网页版", "qr": True},
+    {"value": "windows", "label": "Windows 电脑端", "qr": True},
+    {"value": "mac", "label": "macOS 电脑端", "qr": True},
+    {"value": "linux", "label": "Linux 电脑端", "qr": True},
+    {"value": "qandroid", "label": "115管理(Android端)", "qr": False},
+    {"value": "qios", "label": "115管理(iOS端)", "qr": False},
+    {"value": "qipad", "label": "115管理(iPad端)", "qr": False},
+    {"value": "android", "label": "115(Android端)", "qr": False},
+    {"value": "ios", "label": "115(iOS端)", "qr": False},
+    {"value": "bandroid", "label": "115生活(Android端)", "qr": False},
 ]
 APP_VALUES = [x["value"] for x in APP_OPTIONS]
+QR_UNSUPPORTED = {x["value"] for x in APP_OPTIONS if not x.get("qr")}
+QR_SUPPORTED = [x for x in APP_OPTIONS if x.get("qr")]
 
 
 def app_label(value: str) -> str:
@@ -45,7 +48,7 @@ def app_label(value: str) -> str:
 
 
 DEFAULTS: dict = {
-    "p115": {"cookie": "", "app": "qandroid"},
+    "p115": {"cookie": "", "app": "115ipad"},
     "paths": {"source": "/media/source", "target_root": "/UPILOT-mini", "map": []},
     "scan": {
         "interval_seconds": 30,
