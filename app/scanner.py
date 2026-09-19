@@ -1,4 +1,4 @@
-"""目录扫描：稳定判定 + 去重入队（不重复读盘、不重复上传）。"""
+"""目录扫描：稳定判定 + 扩展名/目录过滤 + 去重入队（不重复读盘、不重复上传）。"""
 from __future__ import annotations
 
 import logging
@@ -22,14 +22,34 @@ def scan_once(store, cfg: dict) -> int:
         logger.warning("监控目录不存在：%s", src)
         return 0
     ignore = {s.lower() for s in cfg["scan"]["ignore_suffixes"]}
+    include = {str(s).lower() for s in (cfg["scan"].get("include_suffixes") or [])}
+    excludes = [str(d).strip("/\\").replace("\\", "/")
+                for d in (cfg["scan"].get("exclude_dirs") or []) if str(d).strip()]
     stable_rounds = int(cfg["scan"]["stable_rounds"])
     min_bytes = float(cfg["scan"]["min_size_mb"]) * 1024 * 1024
     touched = 0
 
+    def excluded(rel: str) -> bool:
+        return any(rel == e or rel.startswith(e + "/") for e in excludes)
+
     for root, dirs, names in os.walk(src):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "@eaDir"]
+        rel_root = os.path.relpath(root, src).replace("\\", "/")
+        rel_root = "" if rel_root == "." else rel_root
+        keep = []
+        for d in dirs:
+            if d.startswith(".") or d == "@eaDir":
+                continue
+            rel = f"{rel_root}/{d}".lstrip("/")
+            if excluded(rel):
+                logger.debug("按 exclude_dirs 跳过目录：%s", rel)
+                continue
+            keep.append(d)
+        dirs[:] = keep
         for name in names:
-            if name.startswith(".") or os.path.splitext(name)[1].lower() in ignore:
+            if name.startswith("."):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in ignore or (include and ext not in include):
                 continue
             full = os.path.join(root, name)
             try:

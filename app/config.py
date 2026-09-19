@@ -17,6 +17,13 @@ DEFAULTS: dict = {
         "interval_seconds": 30,
         "stable_rounds": 2,
         "min_size_mb": 0,
+        # 只处理这些扩展名；留空列表 [] 表示不过滤（全都要）
+        "include_suffixes": [
+            ".mkv", ".mp4", ".ts", ".m2ts", ".mts", ".avi", ".mov", ".wmv",
+            ".flv", ".rmvb", ".iso", ".vob", ".mpg", ".mpeg", ".divx", ".webm",
+        ],
+        # 相对监控根目录的路径片段，命中则整棵子树跳过（例如 ["@eaDir", "extras"]）
+        "exclude_dirs": [],
         "ignore_suffixes": [".!qb", ".part", ".tmp", ".downloading", ".crdownload", ".aria2"],
     },
     "upload": {

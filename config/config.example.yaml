@@ -19,6 +19,11 @@ scan:
   interval_seconds: 30          # 扫描间隔
   stable_rounds: 2              # 连续 N 轮 size/mtime 不变才认为文件写完
   min_size_mb: 0                # 小于该值的文件直接忽略
+  # 只处理这些扩展名；留空 [] 表示不过滤（全都要）。默认只传视频本体，
+  # 所以整棵媒体库挂进来也不会把 .strm/.nfo/.jpg 这些元数据传上去
+  include_suffixes: [".mkv", ".mp4", ".ts", ".m2ts", ".mts", ".avi", ".mov", ".wmv", ".flv", ".rmvb", ".iso"]
+  # 相对 source 的路径片段，命中则整棵子树跳过（例如 ["@eaDir", "Sample", "extras"]）
+  exclude_dirs: []
   ignore_suffixes: [".!qb", ".part", ".tmp", ".downloading", ".crdownload", ".aria2"]
 
 upload:

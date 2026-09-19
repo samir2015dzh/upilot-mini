@@ -37,6 +37,7 @@ def make_env(stable_rounds: int = 1, small_file_mb: float = 10.0, retry_max_coun
     cfg["paths"] = {"source": src, "target_root": "/UPILOT-mini"}
     cfg["state"] = {"db": os.path.join(tmp, "state.db")}
     cfg["scan"]["stable_rounds"] = stable_rounds
+    cfg["scan"]["include_suffixes"] = []   # 测试里默认不做扩展名过滤（新用例自行覆盖）
     cfg["upload"]["small_file_mb"] = small_file_mb
     cfg["retry"]["interval_seconds"] = retry_interval
     cfg["retry"]["max_count"] = retry_max_count
@@ -165,12 +166,43 @@ async def case_scan_dedupe_and_rewrite():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_scan_suffix_and_dir_filter():
+    """扩展名白名单 + exclude_dirs：非视频扩展名不入队，排除目录整棵跳过。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    try:
+        cfg["scan"]["include_suffixes"] = [".mkv", ".mp4"]
+        cfg["scan"]["exclude_dirs"] = ["Sample", "剧集/三体/extras"]
+        keep1 = write_file(src, "电影/沙丘2.mkv", 2 * 1024 * 1024)
+        keep2 = write_file(src, "剧集/三体/S01E01.mp4", 1024 * 1024)
+        write_file(src, "电影/沙丘2.nfo", 2048)                   # 扩展名不在白名单
+        write_file(src, "电影/poster.jpg", 4096)                  # 同上
+        write_file(src, "电影/沙丘2.strm", 128)                   # strm 元数据不该上传
+        write_file(src, "Sample/沙丘2.sample.mkv", 1024 * 1024)   # 顶层排除目录
+        write_file(src, "剧集/三体/extras/bonus.mkv", 512 * 1024)  # 多级排除目录
+
+        scanner.scan_once(store, cfg)
+        queued = {r["path"] for r in store.by_status("待处理", limit=50)}
+        assert queued == {keep1, keep2}, queued
+        assert store.counts() == {"待处理": 2}, store.counts()
+
+        # 白名单留空 = 不过滤；排除清空 = 全都扫
+        cfg["scan"]["include_suffixes"] = []
+        cfg["scan"]["exclude_dirs"] = []
+        scanner.scan_once(store, cfg)
+        total = sum(store.counts().values())
+        assert total == 7, store.counts()
+        PASS.append("[6] 扩展名白名单 + exclude_dirs：只收视频本体、排除目录整棵跳过；两者留空则全收")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
     await case_small_file_goes_direct_upload()
     await case_retry_exhausted_falls_back()
     await case_scan_dedupe_and_rewrite()
+    await case_scan_suffix_and_dir_filter()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

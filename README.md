@@ -88,6 +88,8 @@ docker compose run --rm upilot-mini login
 | `scan.interval_seconds` | 30 | 扫描间隔 |
 | `scan.stable_rounds` | 2 | 连续 N 轮 size/mtime 不变才处理 |
 | `scan.ignore_suffixes` | 见示例 | 下载中的临时后缀 |
+| `scan.include_suffixes` | 见示例（视频扩展名） | 只处理这些扩展名；留空 `[]` 表示不过滤。默认只传视频本体，整库挂进来也不会把 `.strm`/`.nfo`/图片传上去 |
+| `scan.exclude_dirs` | `[]` | 相对监控根目录的路径片段（如 `["Sample","extras"]`），命中则整棵子树跳过 |
 | `upload.small_file_mb` | 10 | 秒传未命中时，小于该值直接上传；大于则先重试秒传 |
 | `upload.concurrency` | 2 | 同时在处理的文件数 |
 | `upload.init_min_interval` | 0.5 | 两次初始化请求的最小间隔（防 115 限流 401） |
