@@ -138,6 +138,12 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .bars .track{height:7px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
 .bars .track > i{display:block;height:100%;border-radius:999px;transition:width .4s ease}
 
+#qr-canvas{width:184px;height:184px;flex:none;border:1px solid var(--line-2);border-radius:12px;
+  background:#fff;display:grid;place-items:center;overflow:hidden;padding:6px}
+#qr-canvas img{width:100%;height:100%;object-fit:contain;display:block}
+#qr-canvas .ok{color:#059669;font-size:13px}
+#qr-canvas .dim{color:#98a1b2;font-size:12px;text-align:center;padding:0 10px}
+@media (max-width:520px){#qr-canvas{width:152px;height:152px}}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:40;
   background:rgba(17,19,26,.95);border:1px solid var(--line-2);color:var(--fg);
   padding:10px 16px;border-radius:12px;box-shadow:0 18px 40px -18px #000;opacity:0;transition:.22s;pointer-events:none;font-size:13px}

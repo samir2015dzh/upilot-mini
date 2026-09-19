@@ -401,6 +401,54 @@ async function refreshLogs() {
   } catch (e) { $("#logbox").textContent = "读取日志失败：" + e.message; }
 }
 
+/* ---------------- 115 扫码登录 ---------------- */
+let qrTimer = null;
+const QR_TEXT = { idle: "未开始", waiting: "等待扫码", scanned: "待确认", done: "已登录",
+                  expired: "已过期", error: "出错" };
+
+async function qrStart() {
+  clearInterval(qrTimer);
+  $("#qr-state").textContent = "申请中…";
+  $("#qr-msg").textContent = "正在向 115 申请二维码…";
+  try {
+    await post("/api/p115/qrcode");
+    $("#qr-canvas").innerHTML = `<img src="/api/p115/qrcode.png?t=${Date.now()}" alt="115 登录二维码" />`;
+    $("#qr-state").textContent = "等待扫码";
+    $("#qr-msg").textContent = "请用 115 官方 App 扫码（二维码约 5 分钟内有效）";
+    qrTimer = setInterval(qrPoll, 2000);
+  } catch (e) {
+    $("#qr-state").textContent = "出错";
+    $("#qr-msg").textContent = "申请二维码失败：" + e.message;
+  }
+}
+
+async function qrPoll() {
+  try {
+    const j = await api("/api/p115/qrcode/status");
+    const st = j.status || "idle";
+    $("#qr-state").textContent = QR_TEXT[st] || st;
+    if (j.message) $("#qr-msg").textContent = j.message;
+    if (st === "done") {
+      clearInterval(qrTimer);
+      $("#qr-canvas").innerHTML = '<span class="ok">已登录 115</span>';
+      toast(j.message || "115 登录成功");
+      loadConfig(); refreshOverview();
+    } else if (st === "expired" || st === "error") {
+      clearInterval(qrTimer);
+    }
+  } catch (e) {
+    clearInterval(qrTimer);
+    $("#qr-msg").textContent = "状态查询失败：" + e.message;
+  }
+}
+
+function qrCancel() {
+  clearInterval(qrTimer);
+  $("#qr-state").textContent = "未开始";
+  $("#qr-canvas").innerHTML = '<span class="dim">点右侧按钮获取二维码</span>';
+  $("#qr-msg").textContent = "已取消。需要时点「获取二维码」重新开始。";
+}
+
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
   $("#tab-overview").onclick = () => switchTab("overview");
@@ -443,6 +491,8 @@ function bind() {
   // 设置页
   $("#btn-save-settings").onclick = saveSettings;
   $("#btn-save-settings-bottom").onclick = saveSettings;
+  $("#btn-qr-start").onclick = qrStart;
+  $("#btn-qr-cancel").onclick = qrCancel;
   $("#btn-reload-config").onclick = () => { loadConfig(); toast("已重新读取配置"); };
   $("#btn-refresh-logs").onclick = refreshLogs;
   document.addEventListener("click", (e) => {
