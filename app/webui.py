@@ -10,6 +10,12 @@ GET  /login          登录页（form 模式）
 POST /login          提交登录（application/x-www-form-urlencoded 或 JSON）
 GET  /logout         退出登录，清 Cookie
 GET  /api/status     状态：统计、正在处理、最近活动、配置摘要
+GET  /api/config     设置页表单结构（密钥字段只回脱敏状态）
+POST /api/config     保存设置（写回 config.yaml + 更新内存配置 + 必要时重建客户端）
+GET  /api/tasks      任务明细（status/q/limit/offset 翻页）
+GET  /api/task       单个文件详情（?path=）
+POST /api/task       单文件操作（retry / retry-now / upload-now / delete）
+GET  /api/logs       最近运行日志（环形缓冲）
 GET  /health         健康检查（供 Docker HEALTHCHECK 用，始终放行）
 POST /api/scan       立刻触发一轮扫描
 POST /api/retry-now  把「待重试」的文件提前到期（马上再试秒传）
@@ -27,11 +33,38 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
+import config as cfgmod
+
 logger = logging.getLogger("upilot.web")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# 最近日志环形缓冲：界面「运行日志」用，不落盘、重启即清
+LOG_BUFFER: deque = deque(maxlen=400)
+_buffer_attached = False
+
+
+class _BufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            LOG_BUFFER.append({"t": record.created, "level": record.levelname,
+                               "name": record.name, "msg": record.getMessage()})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def attach_log_buffer(level: str = "INFO") -> None:
+    """把环形缓冲挂到根 logger（幂等）。"""
+    global _buffer_attached
+    if _buffer_attached:
+        return
+    handler = _BufferHandler()
+    handler.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    logging.getLogger().addHandler(handler)
+    _buffer_attached = True
 
 COOKIE_NAME = "upilot_session"
 DEFAULT_SESSION_HOURS = 72
@@ -235,6 +268,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
     http_cfg = cfg.get("http") or {}
     if not http_cfg.get("enabled", True):
         return None
+    attach_log_buffer(str(cfg.get("log_level", "INFO")))
     index_file = os.path.join(STATIC_DIR, "index.html")
     login_file = os.path.join(STATIC_DIR, "login.html")
 
@@ -293,6 +327,18 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                               extra={"WWW-Authenticate": 'Basic realm="UPilot-mini"'})
 
         # ---- 页面 ----
+        def _static(self, name: str) -> bool:
+            """只放行白名单里的静态资源，避免目录穿越。"""
+            if name not in ("app.css", "app.js", "index.html", "login.html"):
+                return self._send(404, b"not found", "text/plain")
+            ctype = {"css": "text/css", "js": "application/javascript"}.get(
+                name.rsplit(".", 1)[-1], "text/html")
+            try:
+                with open(os.path.join(STATIC_DIR, name), "rb") as fh:
+                    return self._send(200, fh.read(), ctype + "; charset=utf-8")
+            except OSError:
+                return self._send(404, b"missing", "text/plain")
+
         def _index(self) -> bool:
             try:
                 return self._send(200, self._read_file(index_file).encode("utf-8"),
@@ -329,8 +375,35 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 return
             if path in ("/", "/index.html"):
                 return self._index()
+            if path.startswith("/static/"):
+                return self._static(path[len("/static/"):])
             if path in ("/api/status", "/status.json", "/status"):
                 return self._json(_payload(cfg, store, state))
+            if path == "/api/config":
+                return self._json({"ok": True, **cfgmod.form_payload(cfg)})
+            if path == "/api/tasks":
+                qs = parse_qs(query)
+                try:
+                    limit = max(1, min(500, int(qs.get("limit", ["50"])[0] or 50)))
+                    offset = max(0, int(qs.get("offset", ["0"])[0] or 0))
+                except ValueError:
+                    limit, offset = 50, 0
+                rows, total = store.list_tasks(status=qs.get("status", ["全部"])[0],
+                                               q=qs.get("q", [""])[0],
+                                               limit=limit, offset=offset)
+                return self._json({"ok": True, "total": total, "rows": rows,
+                                   "limit": limit, "offset": offset})
+            if path == "/api/task":
+                one = store.get(parse_qs(query).get("path", [""])[0])
+                if not one:
+                    return self._json({"ok": False, "error": "没找到这个文件记录"}, 404)
+                return self._json({"ok": True, "task": one})
+            if path == "/api/logs":
+                try:
+                    n = int(parse_qs(query).get("limit", ["200"])[0] or 200)
+                except ValueError:
+                    n = 200
+                return self._json({"ok": True, "logs": list(LOG_BUFFER)[-max(1, min(400, n)):]})
             self._send(404, b"not found", "text/plain")
 
         def _body_fields(self) -> dict:
@@ -346,7 +419,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     obj = json.loads(text or "{}")
                 except ValueError:
                     obj = {}
-                return {k: str(v) for k, v in obj.items()} if isinstance(obj, dict) else {}
+                return obj if isinstance(obj, dict) else {}      # JSON 保留原始类型（嵌套对象要原样收）
             return {k: v[0] for k, v in parse_qs(text, keep_blank_values=True).items()}
 
         def _do_login(self, parsed) -> bool:
@@ -358,8 +431,8 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 return self._login_page(_safe_next(q), f"尝试次数过多，请 {left} 秒后再试", code=429)
             fields = self._body_fields()
             nxt = _safe_next(fields.get("next") or parse_qs(parsed.query).get("next", ["/"])[0])
-            user = fields.get("username", "")
-            pwd = fields.get("password", "")
+            user = str(fields.get("username") or "")
+            pwd = str(fields.get("password") or "")
             if check_credentials(a, user, pwd):
                 _note_success(ip)
                 token = make_session(user or _username(a), _password(a), _session_hours(a))
@@ -378,6 +451,61 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 return self._do_login(parsed)
             if not self._guard():
                 return
+            if path == "/api/config":
+                body = self._body_fields()
+                values = body.get("values")
+                if isinstance(values, str):
+                    try:
+                        values = json.loads(values)
+                    except ValueError:
+                        values = {}
+                clear = body.get("clear") or body.get("clear_secrets") or []
+                if isinstance(clear, str):
+                    clear = [x for x in re.split(r"[,\s]+", clear) if x]
+                if not isinstance(values, dict):
+                    return self._json({"ok": False, "error": "values 需要是对象"}, 400)
+                try:
+                    result = cfgmod.apply_values(cfg, values, clear)
+                except ValueError as exc:
+                    return self._json({"ok": False, "error": str(exc)}, 400)
+                cfgmod.save(cfg)
+                if result["reload"]:
+                    state["reload"] = True
+                    state["scan_now"] = True
+                logger.info("界面保存配置：%s", ", ".join(result["changed"]) or "无变化")
+                tips = []
+                if result["reload"]:
+                    tips.append("115 客户端会立即重建")
+                if result["restart"]:
+                    tips.append("监听地址/端口或日志级别要重建容器才生效")
+                return self._json({"ok": True, "changed": result["changed"],
+                                   "reload": result["reload"], "restart": result["restart"],
+                                   "message": "已保存" + ("；" + "；".join(tips) if tips else "")})
+            if path == "/api/task":
+                body = self._body_fields()
+                target = str(body.get("path") or "")
+                action = str(body.get("action") or "")
+                if not target or not store.get(target):
+                    return self._json({"ok": False, "error": "没找到这个文件记录"}, 404)
+                if action == "retry":
+                    n = store.reset_one(target)
+                    state["scan_now"] = True
+                    msg = "已重新排队，马上再试"
+                elif action == "retry-now":
+                    store.set(target, next_retry_at=0)
+                    n, msg = 1, "已提前到期，马上重试秒传"
+                    state["scan_now"] = True
+                elif action == "upload-now":
+                    n = store.mark_ready(target)
+                    state["process_one"] = target
+                    msg = "已跳过等待，立即处理"
+                elif action == "delete":
+                    n = store.forget(target)
+                    msg = "记录已删除（文件本体没动，下次扫描会重新入队）"
+                else:
+                    return self._json({"ok": False, "error": f"不认识的动作：{action}"}, 400)
+                logger.info("界面操作 %s → %s", action, target)
+                return self._json({"ok": True, "affected": n, "message": msg})
             if path == "/api/scan":
                 state["scan_now"] = True
                 return self._json({"ok": True, "action": "scan", "message": "已触发扫描"})

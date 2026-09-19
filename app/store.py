@@ -189,3 +189,60 @@ class Store:
                 "INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (f"cid:{cloud_path}", str(cid))
             )
             self.db.commit()
+
+    # ---------- 任务明细（界面用） ----------
+
+    def list_tasks(self, status: str | None = None, q: str = "", limit: int = 50,
+                   offset: int = 0) -> tuple[list[dict], int]:
+        """按状态/关键词翻页查文件明细，返回 (行, 总数)。"""
+        where: list[str] = []
+        args: list = []
+        if status and status not in ("全部", "all"):
+            if status == "进行中":
+                where.append("status IN ('处理中','秒传中','上传中','待重试')")
+            elif status == "待上传":
+                where.append("status IN ('待处理','待秒传','待上传')")
+            elif status == "已完成":
+                where.append("status='已上传'")
+            else:
+                where.append("status=?")
+                args.append(status)
+        if q:
+            where.append("(path LIKE ? OR target_dir LIKE ? OR message LIKE ?)")
+            like = f"%{q}%"
+            args.extend([like, like, like])
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) c FROM files{clause}", args).fetchone()["c"]
+            rows = self.db.execute(
+                f"SELECT * FROM files{clause} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (*args, int(limit), int(offset))).fetchall()
+        return [dict(r) for r in rows], int(total)
+
+    def forget(self, path: str) -> int:
+        """删掉记录：文件本体不动，下次扫描会当作新文件重新入队。"""
+        with self.lock:
+            cur = self.db.execute("DELETE FROM files WHERE path=?", (path,))
+            self.db.commit()
+            return cur.rowcount
+
+    def reset_one(self, path: str) -> int:
+        """单个文件重新排队（保留已算好的 sha1，省一次读盘）。"""
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE files SET status='待处理', retry_count=0, first_failed_at=NULL,"
+                " next_retry_at=NULL, stable_count=999, message='界面重新入队', updated_at=?"
+                " WHERE path=?", (time.time(), path))
+            self.db.commit()
+            return cur.rowcount
+
+    def mark_ready(self, path: str) -> int:
+        """跳过稳定等待，把文件直接置为可处理（界面上的“立即上传”）。"""
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE files SET stable_count=999, message='界面触发立即上传', updated_at=?"
+                " WHERE path=? AND status IN ('待处理','待秒传','待上传','错误','待重试')",
+                (time.time(), path))
+            self.db.commit()
+            return cur.rowcount

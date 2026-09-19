@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -103,3 +104,209 @@ def save_cookie(cookie: str) -> None:
     if not hit:
         out.insert(1, f'  cookie: "{cookie}"')
     CONFIG_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+# ---------------- 界面可编辑配置（设置页据此渲染，后端据此校验） ----------------
+
+MASK = "••••••••"
+
+FIELD_GROUPS: list[dict] = [
+    {"title": "目录", "fields": [
+        {"key": "paths.source", "label": "监控目录（容器内路径）", "type": "text",
+         "hint": "只读挂载进容器的目录，改这里要跟 compose 的冒号左边保持一致"},
+        {"key": "paths.target_root", "label": "115 目标根目录", "type": "text",
+         "hint": "云端根路径；本地相对结构会原样保留在它下面"},
+    ]},
+    {"title": "115 账号", "fields": [
+        {"key": "p115.cookie", "label": "115 Cookie", "type": "secret",
+         "hint": "留空 = 不改；粘贴完整 cookie 保存即生效（会自动重建 115 客户端）"},
+        {"key": "p115.app", "label": "扫码登录槽位 app", "type": "text", "hint": "一般不用改"},
+    ]},
+    {"title": "扫描", "fields": [
+        {"key": "scan.interval_seconds", "label": "扫描间隔（秒）", "type": "int", "min": 2, "max": 86400},
+        {"key": "scan.stable_rounds", "label": "稳定判定轮数", "type": "int", "min": 1, "max": 20,
+         "hint": "连续几轮大小与修改时间不变才算“传完了”"},
+        {"key": "scan.min_size_mb", "label": "最小文件体积（MB）", "type": "float", "min": 0},
+        {"key": "scan.include_suffixes", "label": "只收这些扩展名", "type": "list",
+         "hint": "逗号分隔；留空 = 全都要"},
+        {"key": "scan.exclude_dirs", "label": "跳过这些目录", "type": "list",
+         "hint": "相对监控根目录的路径片段，命中整棵子树跳过"},
+        {"key": "scan.ignore_suffixes", "label": "忽略这些扩展名", "type": "list",
+         "hint": "下载中的临时后缀，逗号分隔"},
+    ]},
+    {"title": "上传", "fields": [
+        {"key": "upload.concurrency", "label": "并发文件数", "type": "int", "min": 1, "max": 8},
+        {"key": "upload.small_file_mb", "label": "小文件阈值（MB）", "type": "float", "min": 0,
+         "hint": "小于它：秒传未命中就直接分块上传，不排队重试"},
+        {"key": "upload.partsize_mb", "label": "分块大小（MB）", "type": "int", "min": 1, "max": 512},
+        {"key": "upload.init_min_interval", "label": "秒传请求最小间隔（秒）", "type": "float", "min": 0},
+        {"key": "upload.conflict_strategy", "label": "同名冲突处理", "type": "select",
+         "options": ["overwrite", "rename", "skip"]},
+        {"key": "upload.transient_retries", "label": "分块瞬时重试次数", "type": "int", "min": 0, "max": 10},
+    ]},
+    {"title": "秒传重试", "fields": [
+        {"key": "retry.interval_seconds", "label": "重试间隔（秒）", "type": "int", "min": 1, "max": 86400},
+        {"key": "retry.max_count", "label": "最多重试次数", "type": "int", "min": 0, "max": 100},
+        {"key": "retry.max_hours", "label": "重试最长等待（小时）", "type": "float", "min": 0},
+    ]},
+    {"title": "界面与鉴权", "fields": [
+        {"key": "http.enabled", "label": "启用 Web 界面", "type": "bool"},
+        {"key": "http.host", "label": "监听地址", "type": "text", "restart": True},
+        {"key": "http.port", "label": "监听端口", "type": "int", "min": 1, "max": 65535, "restart": True},
+        {"key": "http.public_url", "label": "对外地址（可选）", "type": "text",
+         "hint": "登录页底部显示用，例如 https://up.example.com"},
+        {"key": "http.auth.enabled", "label": "开启登录鉴权", "type": "bool"},
+        {"key": "http.auth.mode", "label": "鉴权方式", "type": "select", "options": ["form", "basic"],
+         "hint": "form = 站内登录页；basic = 浏览器原生弹框"},
+        {"key": "http.auth.username", "label": "登录用户名", "type": "text"},
+        {"key": "http.auth.password", "label": "登录密码", "type": "secret",
+         "hint": "留空 = 不改；改了等于换签名密钥，已登录的浏览器会全部失效"},
+        {"key": "http.auth.session_hours", "label": "登录状态保持（小时）", "type": "int", "min": 1, "max": 8760},
+    ]},
+    {"title": "日志", "fields": [
+        {"key": "log_level", "label": "日志级别", "type": "select",
+         "options": ["DEBUG", "INFO", "WARNING", "ERROR"], "restart": True},
+    ]},
+]
+
+RELOAD_KEYS = {"p115.cookie", "p115.app"}          # 改了要重建 115 客户端
+RESTART_KEYS = {"http.host", "http.port", "log_level"}   # 改了要重建容器
+
+
+def _dig(data: dict, key: str, default=None):
+    cur = data
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def _plant(data: dict, key: str, value) -> None:
+    parts = key.split(".")
+    cur = data
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def find_field(key: str) -> dict | None:
+    for group in FIELD_GROUPS:
+        for field in group["fields"]:
+            if field["key"] == key:
+                return field
+    return None
+
+
+def coerce(field: dict, raw) -> object:
+    """按字段类型把界面传来的值转成配置里的真实类型，顺带做范围校验。"""
+    kind = field["type"]
+    label = field.get("label") or field["key"]
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "on", "yes", "是")
+    if kind in ("int", "float"):
+        text = str(raw).strip()
+        if not text:
+            raise ValueError(f"{label}：请填数字")
+        try:
+            value = float(text) if kind == "float" else int(float(text))
+        except ValueError as exc:
+            raise ValueError(f"{label}：请填数字") from exc
+        lo, hi = field.get("min"), field.get("max")
+        if lo is not None and value < lo:
+            raise ValueError(f"{label}：最小 {lo}")
+        if hi is not None and value > hi:
+            raise ValueError(f"{label}：最大 {hi}")
+        return value
+    if kind == "list":
+        if isinstance(raw, list):
+            items = [str(x).strip() for x in raw]
+        else:
+            items = [x.strip() for x in re.split(r"[,，;；\s]+", str(raw))]
+        return [x for x in items if x]
+    if kind == "select":
+        value = str(raw).strip()
+        options = field.get("options") or []
+        if options and value not in options:
+            raise ValueError(f"{label}：只能是 {'/'.join(options)}")
+        return value
+    return str(raw).strip()
+
+
+def apply_values(cfg: dict, values: dict, clear_secrets: list | None = None) -> dict:
+    """把界面提交的值写进内存 cfg。密钥类字段留空表示保持原值。
+
+    返回 {"changed": [...], "reload": bool, "restart": bool}
+    """
+    clear = {str(k) for k in (clear_secrets or [])}
+    changed: list[str] = []
+    for key, raw in (values or {}).items():
+        field = find_field(key)
+        if field is None:
+            continue                                    # 白名单之外一律忽略
+        old = _dig(cfg, key)
+        if field["type"] == "secret":
+            text = str(raw or "").strip()
+            if key in clear:
+                new: object = ""
+            elif text:
+                new = text
+            else:
+                continue                                # 留空 = 不改
+        else:
+            new = coerce(field, raw)
+        if new != old:
+            _plant(cfg, key, new)
+            changed.append(key)
+    return {
+        "changed": changed,
+        "reload": any(k in RELOAD_KEYS for k in changed),
+        "restart": any(k in RESTART_KEYS for k in changed),
+    }
+
+
+def form_payload(cfg: dict) -> dict:
+    """给设置页用的表单结构：密钥类字段只回脱敏状态，不回落明文。"""
+    groups = []
+    for group in FIELD_GROUPS:
+        fields = []
+        for field in group["fields"]:
+            item = dict(field)
+            value = _dig(cfg, field["key"], "")
+            if field["type"] == "secret":
+                text = str(value or "")
+                # 只回答“设没设、多长”，不回任何明文片段
+                item.update({"value": "", "set": bool(text), "length": len(text), "mask": MASK if text else ""})
+            elif field["type"] == "bool":
+                item["value"] = bool(value)
+            elif field["type"] == "list":
+                item["value"] = ", ".join(str(x) for x in (value or []))
+            else:
+                item["value"] = value
+            fields.append(item)
+        groups.append({"title": group["title"], "fields": fields})
+    return {"groups": groups, "path": str(CONFIG_PATH)}
+
+
+def save(cfg: dict) -> Path:
+    """把当前内存配置落盘（原子写 + 保留一份 .bak）。"""
+    ensure_config()
+    path = CONFIG_PATH
+    body = ("# 本文件由界面保存生成（字段说明见 config.example.yaml）\n"
+            + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False))
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    if path.exists():
+        shutil.copyfile(path, path.parent / (path.name + ".bak"))
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path

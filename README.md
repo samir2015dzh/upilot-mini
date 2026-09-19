@@ -117,6 +117,23 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 | POST | `/api/requeue` | 失败项重新入队 |
 | POST | `/api/pause` `/api/resume` | 暂停 / 恢复派发（在途任务跑完） |
 | GET | `/login` `/logout` | 站内登录页与退出（`mode: form` 时启用） |
+| GET | `/api/tasks` | 任务明细（`status` / `q` / `limit` / `offset`） |
+| GET | `/api/task` | 单个文件详情（`?path=`） |
+| POST | `/api/task` | 单文件操作（`retry` / `retry-now` / `upload-now` / `delete`） |
+| GET | `/api/config` | 设置页表单结构（密钥只回脱敏状态） |
+| POST | `/api/config` | 保存设置（写回 config.yaml 并立即生效） |
+| GET | `/api/logs` | 最近的运行日志（内存环形缓冲，不落盘） |
+| GET | `/static/*` | 前端静态资源（白名单：app.css / app.js） |
+
+### 界面能改什么（三页布局）
+
+面板分三页：**概览 / 任务明细 / 设置**。
+
+- **任务明细**：按状态（全部 / 进行中 / 待上传 / 待重试 / 已完成 / 错误）筛选 + 关键词搜索 + 翻页；每行给出大小、状态、进度、上传方式（秒传 or 分块）、重试次数、SHA1 摘要、更新时间；点「详情」开侧栏看全字段（云端 pid / file_id、断点续传信息、消息、入队与更新时间），并可**立即处理 / 重新排队 / 提前重试秒传 / 删除记录**。
+- **设置**：目录、115 cookie、扫描、上传、秒传重试、界面与鉴权、日志级别都能在页面上直接改；保存后写回 `/config/config.yaml`（旧文件留 `config.yaml.bak`）并即时生效，改了 `p115.cookie` 会自动重建 115 客户端。
+  - cookie / 登录密码这类密钥字段只显示「已设置 · N 字符」，**不返回任何明文片段**；输入框留空 = 保持原值，勾「清除」才会清空。
+  - 带「需重建容器」标记的项（监听地址/端口、日志级别）要 `docker compose up -d --force-recreate` 后才生效。
+  - 保存是整文件重写，config.yaml 里的注释会简化（字段说明以 `config/config.example.yaml` 为准）。
 
 ### 鉴权与反代
 

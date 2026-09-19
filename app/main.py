@@ -45,11 +45,16 @@ def start_http(cfg: dict, store, state: dict):
 
 async def run_service(cfg: dict, dry_run: bool) -> int:
     store = Store(cfg["state"]["db"])
+
+    def build_manager():
+        """按当前配置新建 115 客户端；界面改了 cookie 后重建它即可生效。"""
+        if dry_run:
+            return StubP115(cfg, store)
+        return P115(cfg, store)
+
+    manager = build_manager()
     if dry_run:
-        manager = StubP115(cfg, store)
         logger.warning("dry-run 模式：不联网、不消耗流量，只验证扫描/去重/SHA1/目录映射/状态机")
-    else:
-        manager = P115(cfg, store)
     uploader = Uploader(cfg, store, manager)
 
     state = {"dry_run": dry_run, "scan_rounds": 0}
@@ -63,9 +68,9 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
         except NotImplementedError:      # Windows 上不可用，忽略
             pass
 
-    interval = max(2, int(cfg["scan"]["interval_seconds"]))
     logger.info("开始监控 %s → 115:%s（扫描间隔 %ds，并发 %d）",
-                cfg["paths"]["source"], cfg["paths"]["target_root"], interval,
+                cfg["paths"]["source"], cfg["paths"]["target_root"],
+                max(2, int(cfg["scan"]["interval_seconds"])),
                 int(cfg["upload"]["concurrency"]))
 
     try:
@@ -73,16 +78,25 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
             try:
                 if state.pop("scan_now", False):
                     logger.info("收到界面指令：立即扫描")
+                if state.pop("reload", False):
+                    logger.info("配置已更新：重建 115 客户端与调度器")
+                    manager = build_manager()
+                    uploader = Uploader(cfg, store, manager)
                 scanner.scan_once(store, cfg)
                 state["scan_rounds"] += 1
                 state["last_scan"] = time.time()
                 if state.get("paused"):
                     pass          # 暂停调度：不再派发新任务，在途任务自然跑完
                 else:
+                    one = state.pop("process_one", None)
+                    if one:
+                        logger.info("界面指定立即处理：%s", one)
+                        await uploader._process(one)
                     uploader.dispatch()
             except Exception as exc:  # noqa: BLE001
                 logger.error("本轮扫描/调度出错：%s", exc)
-            # 界面点了「立即扫描」时缩短等待，让操作立刻生效
+            # 间隔每轮重读：界面上改了立刻生效；点过「立即扫描」则缩短等待
+            interval = max(2, int(cfg["scan"]["interval_seconds"]))
             wait_s = 0.5 if state.get("scan_now") else interval
             try:
                 await asyncio.wait_for(stop.wait(), timeout=wait_s)
