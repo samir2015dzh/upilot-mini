@@ -209,15 +209,19 @@
 
     <div class="card" style="margin-top:14px">
       <h2>115 扫码登录 <span class="pill" id="qr-state">未开始</span></h2>
-      <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
-        <div id="qr-canvas"><span style="color:var(--dim);font-size:12px">点右侧按钮获取二维码</span></div>
-        <div style="flex:1;min-width:240px">
-          <div class="btns" style="margin-bottom:10px">
+      <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
+        <div id="qr-canvas"><span class="dim">点右侧按钮获取二维码</span></div>
+        <div style="flex:1;min-width:260px;max-width:520px">
+          <div class="btns" style="margin-bottom:12px">
             <button id="btn-qr-start" class="primary">获取二维码</button>
             <button id="btn-qr-cancel" class="mini">取消</button>
           </div>
-          <div class="hint" id="qr-msg">用 115 官方 App（或微信/支付宝小程序里绑定的 115）扫码并在手机上确认；
-            登录成功后 cookie 会自动写入配置并重建 115 客户端，不用手抄。</div>
+          <div class="qrsteps">
+            <div><b>1</b>　手机打开 115 官方 App（或已绑定 115 的小程序）</div>
+            <div><b>2</b>　用「扫一扫」扫描左边的二维码</div>
+            <div><b>3</b>　手机上点确认，这里的状态会变成「已登录」</div>
+          </div>
+          <div class="qrmsg" id="qr-msg">二维码约 5 分钟内有效；登录成功后 cookie 自动写入配置并重建 115 客户端，不用手抄。</div>
         </div>
       </div>
     </div>

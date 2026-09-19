@@ -138,12 +138,20 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .bars .track{height:7px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
 .bars .track > i{display:block;height:100%;border-radius:999px;transition:width .4s ease}
 
-#qr-canvas{width:184px;height:184px;flex:none;border:1px solid var(--line-2);border-radius:12px;
-  background:#fff;display:grid;place-items:center;overflow:hidden;padding:6px}
+#qr-canvas{width:196px;height:196px;flex:none;border:1px solid var(--line-2);border-radius:12px;
+  background:#fff;display:grid;place-items:center;overflow:hidden;padding:16px}
+.qrsteps{display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--muted);margin-bottom:10px}
+.qrsteps b{display:inline-grid;place-items:center;width:17px;height:17px;border-radius:50%;
+  background:rgba(99,102,241,.22);border:1px solid rgba(129,140,248,.45);color:#c7d2fe;
+  font-size:11px;font-weight:600;margin-right:2px}
+.qrmsg{font-size:12px;color:var(--dim);line-height:1.5;max-width:460px}
+.pill.amber{color:#fde68a;border-color:rgba(251,191,36,.42)}
+.pill.ok{color:#bbf7d0;border-color:rgba(52,211,153,.42)}
+.pill.err{color:#fecdd3;border-color:rgba(251,113,133,.42)}
 #qr-canvas img{width:100%;height:100%;object-fit:contain;display:block}
 #qr-canvas .ok{color:#059669;font-size:13px}
 #qr-canvas .dim{color:#98a1b2;font-size:12px;text-align:center;padding:0 10px}
-@media (max-width:520px){#qr-canvas{width:152px;height:152px}}
+@media (max-width:520px){#qr-canvas{width:160px;height:160px;padding:12px}}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:40;
   background:rgba(17,19,26,.95);border:1px solid var(--line-2);color:var(--fg);
   padding:10px 16px;border-radius:12px;box-shadow:0 18px 40px -18px #000;opacity:0;transition:.22s;pointer-events:none;font-size:13px}

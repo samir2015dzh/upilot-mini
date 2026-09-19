@@ -405,6 +405,15 @@ async function refreshLogs() {
 let qrTimer = null;
 const QR_TEXT = { idle: "未开始", waiting: "等待扫码", scanned: "待确认", done: "已登录",
                   expired: "已过期", error: "出错" };
+const QR_CLASS = { idle: "", waiting: "amber", scanned: "amber", done: "ok", expired: "err", error: "err" };
+
+function qrSetState(st, msg) {
+  const pill = $("#qr-state");
+  pill.textContent = QR_TEXT[st] || st;
+  pill.className = "pill" + (QR_CLASS[st] ? " " + QR_CLASS[st] : "");
+  if (msg) $("#qr-msg").textContent = msg;
+  $("#btn-qr-start").textContent = (st === "waiting" || st === "scanned") ? "刷新二维码" : "获取二维码";
+}
 
 async function qrStart() {
   clearInterval(qrTimer);
@@ -413,8 +422,7 @@ async function qrStart() {
   try {
     await post("/api/p115/qrcode");
     $("#qr-canvas").innerHTML = `<img src="/api/p115/qrcode.png?t=${Date.now()}" alt="115 登录二维码" />`;
-    $("#qr-state").textContent = "等待扫码";
-    $("#qr-msg").textContent = "请用 115 官方 App 扫码（二维码约 5 分钟内有效）";
+    qrSetState("waiting", "请用 115 官方 App 扫码（二维码约 5 分钟内有效）");
     qrTimer = setInterval(qrPoll, 2000);
   } catch (e) {
     $("#qr-state").textContent = "出错";
@@ -426,8 +434,7 @@ async function qrPoll() {
   try {
     const j = await api("/api/p115/qrcode/status");
     const st = j.status || "idle";
-    $("#qr-state").textContent = QR_TEXT[st] || st;
-    if (j.message) $("#qr-msg").textContent = j.message;
+    qrSetState(st, j.message || "");
     if (st === "done") {
       clearInterval(qrTimer);
       $("#qr-canvas").innerHTML = '<span class="ok">已登录 115</span>';
@@ -444,9 +451,8 @@ async function qrPoll() {
 
 function qrCancel() {
   clearInterval(qrTimer);
-  $("#qr-state").textContent = "未开始";
+  qrSetState("idle", "已取消。需要时点「获取二维码」重新开始。");
   $("#qr-canvas").innerHTML = '<span class="dim">点右侧按钮获取二维码</span>';
-  $("#qr-msg").textContent = "已取消。需要时点「获取二维码」重新开始。";
 }
 
 /* ---------------- 事件绑定 ---------------- */
