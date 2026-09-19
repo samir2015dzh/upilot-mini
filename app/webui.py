@@ -9,16 +9,44 @@ POST /api/requeue   把「错误」的文件重新入队
 """
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import logging
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("upilot.web")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def auth_cfg(cfg: dict) -> dict:
+    return (cfg.get("http") or {}).get("auth") or {}
+
+
+def check_auth(cfg: dict, headers, query: str) -> bool:
+    """HTTP Basic 或 ?token=… 任一通过即放行；未开启鉴权（或没设密码）时恒真。
+
+    /health 不走这里（Docker HEALTHCHECK 在容器内直连，不需要凭据）。
+    """
+    a = auth_cfg(cfg)
+    pwd = str(a.get("password") or "")
+    if not a.get("enabled") or not pwd:
+        return True
+    if parse_qs(query).get("token", [""])[0] == pwd:
+        return True
+    raw = headers.get("Authorization", "")
+    if raw.startswith("Basic "):
+        try:
+            user, _, given = base64.b64decode(raw[6:]).decode("utf-8", "replace").partition(":")
+        except Exception:  # noqa: BLE001
+            return False
+        want_user = str(a.get("username") or "")
+        return hmac.compare_digest(given, pwd) and (not want_user or user == want_user)
+    return False
 
 
 def _payload(cfg: dict, store, state: dict) -> dict:
@@ -62,16 +90,27 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         server_version = "upilot-mini"
 
         # ---- 工具 ----
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             try:
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        # ---- 鉴权 ----
+        def _guard(self) -> bool:
+            """开启 http.auth 后，所有页面与 API 都需要凭据。"""
+            if check_auth(cfg, self.headers, urlparse(self.path).query):
+                return True
+            self._send(401, b"auth required", "text/plain",
+                       extra={"WWW-Authenticate": 'Basic realm="UPilot-mini"'})
+            return False
 
         def _json(self, obj, code: int = 200) -> None:
             self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
@@ -86,17 +125,21 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         # ---- 路由 ----
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
+            if path.startswith("/health"):             # 健康检查豁免：容器内 HEALTHCHECK 直连
+                return self._send(200, b"ok", "text/plain")
+            if not self._guard():
+                return
             if path in ("/", "/index.html"):
                 return self._index()
             if path in ("/api/status", "/status.json"):
                 return self._json(_payload(cfg, store, state))
-            if path.startswith("/health"):
-                return self._send(200, b"ok", "text/plain")
             if path == "/status":                      # 兼容老路径：给人看的 JSON
                 return self._json(_payload(cfg, store, state))
             self._send(404, b"not found", "text/plain")
 
         def do_POST(self):  # noqa: N802
+            if not self._guard():
+                return
             path = urlparse(self.path).path
             if path == "/api/scan":
                 state["scan_now"] = True
@@ -123,5 +166,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
 
     srv = ThreadingHTTPServer((http_cfg.get("host", "0.0.0.0"), int(http_cfg.get("port", 9844))), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    logger.info("界面已启动：http://<host>:%s/", http_cfg.get("port", 9844))
+    a = auth_cfg(cfg)
+    logger.info("界面已启动：http://<host>:%s/（鉴权：%s）", http_cfg.get("port", 9844),
+                "已开启" if (a.get("enabled") and a.get("password")) else "关闭")
     return srv

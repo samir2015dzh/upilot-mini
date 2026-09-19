@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import builtins
 import copy
 import gc
@@ -15,12 +16,15 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
 sys.path.insert(0, APP)
 
 import config as cfgmod          # noqa: E402
 import scanner                   # noqa: E402
+import webui                     # noqa: E402
 from p115 import StubP115        # noqa: E402
 from store import Store          # noqa: E402
 from uploader import Uploader, sha1_of   # noqa: E402
@@ -196,6 +200,45 @@ async def case_scan_suffix_and_dir_filter():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def http_get(url: str, user: str | None = None, pwd: str = "") -> tuple[int, bytes]:
+    req = urllib.request.Request(url)
+    if user is not None:
+        token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()[:64]
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+
+
+async def case_http_auth():
+    """HTTP 鉴权：开启后页面与 API 都要凭据，/health 始终放行，关掉即恢复开放。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+    try:
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "username": "upilot", "password": "s3cret-token"}}
+        state = {"scan_rounds": 0, "dry_run": True}
+        srv = webui.serve(cfg, store, state)
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        assert http_get(f"{base}/health")[0] == 200, "健康检查应始终放行"
+        assert http_get(f"{base}/api/status")[0] == 401, "无凭据应 401"
+        assert http_get(f"{base}/")[0] == 401, "页面无凭据应 401"
+        assert http_get(f"{base}/api/status", "upilot", "wrong")[0] == 401, "错密码应 401"
+        assert http_get(f"{base}/api/status", "upilot", "s3cret-token")[0] == 200, "Basic 应放行"
+        assert http_get(f"{base}/api/status?token=s3cret-token")[0] == 200, "?token= 应放行"
+
+        cfg["http"]["auth"]["enabled"] = False            # 关掉鉴权 → 恢复开放
+        assert http_get(f"{base}/api/status")[0] == 200, "关闭后应开放"
+        PASS.append("[7] HTTP 鉴权：Basic 与 ?token= 放行、无凭据 401、/health 始终 200、可随时关闭")
+    finally:
+        if srv is not None:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -203,6 +246,7 @@ async def main():
     await case_retry_exhausted_falls_back()
     await case_scan_dedupe_and_rewrite()
     await case_scan_suffix_and_dir_filter()
+    await case_http_auth()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

@@ -117,6 +117,32 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 | POST | `/api/requeue` | 失败项重新入队 |
 | POST | `/api/pause` `/api/resume` | 暂停 / 恢复派发（在途任务跑完） |
 
+### 鉴权与反代
+
+面板默认**没有鉴权**（只绑 `127.0.0.1`，外面碰不到）。要反代/暴露到内网，先在 `config.yaml` 打开：
+
+```yaml
+http:
+  auth:
+    enabled: true
+    username: "upilot"
+    password: "换成一串长随机密码"
+```
+
+打开后页面和所有 `/api/*` 都要凭据：浏览器走 HTTP Basic 弹窗，脚本用 `curl -u upilot:密码 …` 或 `?token=密码`（例：`curl "http://host:9844/api/status?token=…"`）。`/health` 始终放行，容器 HEALTHCHECK 不受影响。密码留空等同于关闭。
+
+反代只要把 `Authorization` 头透传过去即可，nginx 例：
+
+```nginx
+location / {
+    proxy_pass http://<server-ip>:9844;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+}
+```
+
+也可以在反代上再叠一层 `auth_basic` / Authelia；应用侧这层保证即使反代配置写漏，面板也不是裸的。
+
 ## 6. 离线自检（不需要 cookie）
 
 ```bash

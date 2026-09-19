@@ -36,7 +36,14 @@ DEFAULTS: dict = {
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12},
     "state": {"db": "/config/state.db"},
-    "http": {"enabled": True, "host": "0.0.0.0", "port": 9844},
+    "http": {
+        "enabled": True,
+        "host": "0.0.0.0",
+        "port": 9844,
+        # 反代/暴露到内网时打开：页面与 /api/* 需要 HTTP Basic 或 ?token=…
+        # /health 始终放行（容器 HEALTHCHECK 在容器内直连）
+        "auth": {"enabled": False, "username": "upilot", "password": ""},
+    },
     "log_level": "INFO",
 }
 
