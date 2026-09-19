@@ -6,76 +6,120 @@
 <meta name="robots" content="noindex, nofollow" />
 <title>登录 · UPilot-mini</title>
 <style>
-  /* 极简浅色风（对齐参考稿）：白底、320px 居中单列、直角输入框与按钮、单一主色 #2196F3 */
+  /* 与仪表盘同一套设计语言：同样的色板变量、卡片、圆角、渐变主按钮、pill、hint */
   :root{
-    --bg:#ffffff; --fg:#333333; --muted:#757575; --border:#e5e5e5;
-    --blue:#2196f3; --blue-dark:#1976d2; --danger-bg:#fdecea; --danger-bd:#f5c6c0; --danger-fg:#c62828;
+    --bg:#08090d; --panel:rgba(255,255,255,.035); --panel-2:rgba(255,255,255,.07);
+    --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.15);
+    --fg:#eef1f7; --muted:#b3bac9; --dim:#98a1b2;
+    --indigo:#6366f1; --violet:#8b5cf6; --emerald:#34d399; --sky:#38bdf8;
+    --amber:#fbbf24; --rose:#fb7185; --slate:#94a3b8;
+    --radius:16px;
     font-synthesis:none;
   }
   *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--fg);
-    display:flex;align-items:center;justify-content:center;padding:32px 24px;
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5}
-  .box{width:100%;max-width:320px}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;font-size:14px;line-height:1.55}
+  body{min-height:100vh;display:grid;place-items:center;padding:28px}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+    background:
+      radial-gradient(46% 40% at 12% -6%, rgba(99,102,241,.20), transparent 70%),
+      radial-gradient(40% 36% at 88% -10%, rgba(52,211,153,.16), transparent 70%),
+      radial-gradient(50% 40% at 60% 108%, rgba(139,92,246,.12), transparent 70%)}
 
-  /* logo：64px 描边圆 + 主色图标 */
-  .logo{width:64px;height:64px;margin:0 auto 12px;border-radius:50%;
-    border:2px solid var(--blue);display:grid;place-items:center}
-  .logo svg{width:28px;height:28px;stroke:var(--blue)}
+  form{position:relative;z-index:1;width:100%;max-width:392px;
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:22px;backdrop-filter:blur(10px);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.04), 0 26px 60px -48px #000}
 
-  /* 两行主标题 */
-  h1{margin:0 0 33px;font-size:40px;font-weight:600;line-height:46px;text-align:center;
-    letter-spacing:-.2px;color:var(--fg)}
-  h1 span{display:block}
+  .brand{display:flex;align-items:center;gap:13px;margin-bottom:20px}
+  .logo{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;flex:none;
+    background:linear-gradient(140deg,#6366f1,#22d3ee 55%,#34d399);
+    box-shadow:0 10px 30px -10px rgba(99,102,241,.75), inset 0 1px 0 rgba(255,255,255,.35)}
+  .logo svg{width:24px;height:24px}
+  h1{margin:0;font-size:20px;font-weight:650;letter-spacing:.2px;display:flex;align-items:center;gap:9px}
+  .sub{color:#bcc3d0;font-size:12.5px;margin-top:3px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;
+    border:1px solid var(--line-2);background:var(--panel);font-size:11.5px;font-weight:500;color:var(--muted)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--emerald);flex:none}
+  .dot.amber{background:var(--amber)}
 
-  input[type=text],input[type=password]{display:block;width:100%;height:36px;padding:0 14px;
-    font:inherit;color:var(--fg);background:#fff;border:1px solid var(--border);border-radius:0;
-    outline:none;transition:border-color .15s ease}
-  form > input[type=text],form > input[type=password]{margin-top:9px}
-  form > input[type=text]:first-of-type{margin-top:0}
-  input::placeholder{color:var(--muted)}
-  input[type=text]:focus,input[type=password]:focus{border-color:var(--blue)}
+  label{display:block;color:var(--muted);font-size:12.5px;margin:0 0 7px}
+  .field{margin-bottom:15px}
+  input[type=text],input[type=password]{width:100%;font:inherit;color:var(--fg);
+    background:rgba(255,255,255,.04);border:1px solid var(--line-2);border-radius:11px;
+    padding:11px 12px;transition:.16s ease;outline:none}
+  input::placeholder{color:rgba(255,255,255,.26)}
+  input[type=text]:hover,input[type=password]:hover{border-color:rgba(255,255,255,.24)}
+  input[type=text]:focus,input[type=password]:focus{border-color:rgba(99,102,241,.85);
+    box-shadow:0 0 0 3px rgba(99,102,241,.18);background:rgba(255,255,255,.06)}
 
-  button{display:block;width:100%;height:37px;margin-top:10px;font:inherit;font-size:15px;
-    color:#fff;background:var(--blue);border:0;border-radius:0;cursor:pointer;
-    transition:background .15s ease}
-  button:hover{background:var(--blue-dark)}
-  button:focus-visible{outline:2px solid var(--blue-dark);outline-offset:2px}
+  button{width:100%;font:inherit;font-weight:600;color:var(--fg);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    padding:11px 14px;border:1px solid transparent;border-radius:11px;transition:.16s ease;
+    background:linear-gradient(135deg,rgba(99,102,241,.95),rgba(56,189,248,.9));
+    box-shadow:0 10px 24px -12px rgba(99,102,241,.9)}
+  button:hover{transform:translateY(-1px);box-shadow:0 14px 30px -12px rgba(99,102,241,1)}
+  button:active{transform:translateY(0)}
+  button svg{width:16px;height:16px}
 
-  .err{display:flex;align-items:center;gap:7px;margin:9px 0 10px;padding:8px 10px;
-    font-size:13px;color:var(--danger-fg);background:var(--danger-bg);border:1px solid var(--danger-bd)}
-  .err svg{width:14px;height:14px;flex:none;stroke:currentColor;position:relative;top:.5px}
-  .err + input[type=text]{margin-top:0}
+  .err{display:flex;align-items:center;gap:8px;margin-bottom:15px;padding:9px 11px;border-radius:10px;
+    font-size:12.5px;color:#fecdd3;background:rgba(251,113,133,.09);border:1px solid rgba(251,113,133,.3)}
+  .err svg{width:15px;height:15px;flex:none}
 
-  .site{margin-top:16px;text-align:center;color:#d0d0d0;font-size:11.5px;
+  .hint{display:flex;gap:8px;align-items:flex-start;margin-top:15px;padding:8px 10px;
+    font-size:12px;color:var(--muted);background:rgba(255,255,255,.03);
+    border:1px solid var(--line);border-radius:10px;line-height:1.5}
+  .hint svg{width:14px;height:14px;flex:none;opacity:.85;margin-top:2px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
+    background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;
+    padding:1px 5px;color:var(--fg)}
+  .site{margin-top:12px;text-align:center;color:var(--dim);font-size:11.5px;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-  @media (max-width:380px){h1{font-size:30px;line-height:40px}}
+  @media (max-width:420px){form{padding:18px}}
 </style>
 </head>
 <body>
-<div class="box">
-  <div class="logo">
-    <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M5 20h14"/>
-    </svg>
+<form method="post" action="/login" autocomplete="on">
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 19V6"/><path d="M6 12l6-6 6 6"/><path d="M4 21h16"/>
+      </svg>
+    </div>
+    <div>
+      <h1>UPilot-mini <span class="pill"><span class="dot amber"></span>未登录</span></h1>
+      <div class="sub">监控本地目录 · SHA1 秒传优先 · 重试不重传</div>
+    </div>
   </div>
 
-  <h1><span>UPilot-mini</span><span>秒传优先上传</span></h1>
+  {{ERROR}}
 
-  <form method="post" action="/login" autocomplete="on">
-    {{ERROR}}
+  <div class="field">
+    <label for="username">用户名</label>
+    <input id="username" name="username" type="text" value="{{USER}}" autocomplete="username"
+           autofocus required spellcheck="false" />
+  </div>
+  <div class="field">
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required />
+  </div>
+  <input type="hidden" name="next" value="{{NEXT}}" />
+  <button type="submit">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/>
+    </svg>
+    登录
+  </button>
 
-    <input name="username" type="text" value="{{USER}}" placeholder="用户名"
-           autocomplete="username" autofocus required spellcheck="false" />
-    <input name="password" type="password" placeholder="密码"
-           autocomplete="current-password" required />
-    <input type="hidden" name="next" value="{{NEXT}}" />
-    <button type="submit">登录</button>
-  </form>
+  <div class="hint">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16h.01"/>
+    </svg>
+    <span>登录状态在本机浏览器保持数天 · 连续输错会被短暂锁定 · 也可用 <code>?token=</code> 给脚本走</span>
+  </div>
 
   {{SITE_BLOCK}}
-</div>
+</form>
 </body>
 </html>
