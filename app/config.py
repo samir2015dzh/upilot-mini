@@ -11,9 +11,42 @@ import yaml
 CONFIG_PATH = Path(os.environ.get("UPILOT_CONFIG", "/config/config.yaml"))
 EXAMPLE_PATH = Path("/app/config/config.example.yaml")
 
+# 115 登录槽位（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
+# 用途：扫码/上传都用它当身份，挑一个自己平时不用的端，就不会把手机/网页挤下线。
+APP_OPTIONS: list[dict] = [
+    {"value": "qandroid", "label": "115管理(Android端)"},
+    {"value": "qios", "label": "115管理(iOS端)"},
+    {"value": "qipad", "label": "115管理(iPad端)"},
+    {"value": "android", "label": "115(Android端)"},
+    {"value": "ios", "label": "115(iOS端)"},
+    {"value": "ipad", "label": "115(iPad端)"},
+    {"value": "bandroid", "label": "115生活(Android端)"},
+    {"value": "wechatmini", "label": "115生活(微信小程序)"},
+    {"value": "alipaymini", "label": "115生活(支付宝小程序)"},
+    {"value": "tv", "label": "115网盘(Android电视端)"},
+    {"value": "apple_tv", "label": "115网盘(Apple电视端)"},
+    {"value": "harmony", "label": "115(鸿蒙端)"},
+    {"value": "web", "label": "网页版"},
+    {"value": "windows", "label": "Windows 电脑端"},
+    {"value": "mac", "label": "macOS 电脑端"},
+    {"value": "linux", "label": "Linux 电脑端"},
+    {"value": "115android", "label": "115(Android端·旧版)"},
+    {"value": "115ios", "label": "115(iOS端·旧版)"},
+    {"value": "115ipad", "label": "115(iPad端·旧版)"},
+]
+APP_VALUES = [x["value"] for x in APP_OPTIONS]
+
+
+def app_label(value: str) -> str:
+    for item in APP_OPTIONS:
+        if item["value"] == value:
+            return item["label"]
+    return value
+
+
 DEFAULTS: dict = {
     "p115": {"cookie": "", "app": "qandroid"},
-    "paths": {"source": "/media/source", "target_root": "/UPILOT-mini"},
+    "paths": {"source": "/media/source", "target_root": "/UPILOT-mini", "map": []},
     "scan": {
         "interval_seconds": 30,
         "stable_rounds": 2,
@@ -115,12 +148,16 @@ FIELD_GROUPS: list[dict] = [
         {"key": "paths.source", "label": "监控目录（容器内路径）", "type": "text",
          "hint": "只读挂载进容器的目录，改这里要跟 compose 的冒号左边保持一致"},
         {"key": "paths.target_root", "label": "115 目标根目录", "type": "text",
-         "hint": "云端根路径；本地相对结构会原样保留在它下面"},
+         "hint": "没被下面映射命中的文件，云端结构 = 它 + 本地相对路径"},
+        {"key": "paths.map", "label": "本机 → 115 目录映射", "type": "map", "rows": 6,
+         "hint": "每行一条：本机相对路径 => 115 目录。例 TVs => /TVs｜Movies/Others => /Movies/Others｜Anime => /OtherAnime（可改名、大小写照写）。命中时取最长前缀，其下结构原样保留"},
     ]},
     {"title": "115 账号", "fields": [
         {"key": "p115.cookie", "label": "115 Cookie", "type": "secret",
          "hint": "留空 = 不改；粘贴完整 cookie 保存即生效（会自动重建 115 客户端）"},
-        {"key": "p115.app", "label": "扫码登录槽位 app", "type": "text", "hint": "一般不用改"},
+        {"key": "p115.app", "label": "115 登录槽位（扫码与上传都用它）", "type": "select",
+         "options": APP_OPTIONS,
+         "hint": "选一个平时不用的端，扫码时就不会把手机/网页版挤下线；改完保存，扫码卡片会同步"},
     ]},
     {"title": "扫描", "fields": [
         {"key": "scan.interval_seconds", "label": "扫描间隔（秒）", "type": "int", "min": 2, "max": 86400},
@@ -230,11 +267,31 @@ def coerce(field: dict, raw) -> object:
         else:
             items = [x.strip() for x in re.split(r"[,，;；\s]+", str(raw))]
         return [x for x in items if x]
+    if kind == "map":
+        lines = raw if isinstance(raw, list) else re.split(r"[\r\n]+", str(raw or ""))
+        out: list[dict] = []
+        for line in lines:
+            text = str(line).strip()
+            if not text or text.startswith("#"):
+                continue
+            sep = "=>" if "=>" in text else ("->" if "->" in text else None)
+            if sep is None:
+                raise ValueError(f"{label}：每行要写成「本机相对路径 => 115 目录」，收到：{text}")
+            src, _, dst = text.partition(sep)
+            src = src.strip().strip("/").strip("\\")
+            dst = dst.strip()
+            if not dst:
+                raise ValueError(f"{label}：缺少 115 目录 —— {text}")
+            if not dst.startswith("/"):
+                dst = "/" + dst
+            out.append({"from": src, "to": dst})
+        return out
     if kind == "select":
         value = str(raw).strip()
         options = field.get("options") or []
-        if options and value not in options:
-            raise ValueError(f"{label}：只能是 {'/'.join(options)}")
+        allowed = [o["value"] if isinstance(o, dict) else str(o) for o in options]
+        if allowed and value not in allowed:
+            raise ValueError(f"{label}：只能是 {'/'.join(allowed)}")
         return value
     return str(raw).strip()
 
@@ -287,6 +344,10 @@ def form_payload(cfg: dict) -> dict:
                 item["value"] = bool(value)
             elif field["type"] == "list":
                 item["value"] = ", ".join(str(x) for x in (value or []))
+            elif field["type"] == "map":
+                item["value"] = "\n".join(
+                    f'{str(m.get("from") or "")} => {str(m.get("to") or "")}'
+                    for m in (value or []) if isinstance(m, dict))
             else:
                 item["value"] = value
             fields.append(item)

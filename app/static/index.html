@@ -208,20 +208,25 @@
     <div id="settings-msg"></div>
 
     <div class="card" style="margin-top:14px">
-      <h2>115 扫码登录 <span class="pill" id="qr-state">未开始</span></h2>
+      <h2>115 扫码登录 <span class="pill" id="qr-state">未开始</span>
+        <span class="pill" id="qr-slot">槽位 –</span></h2>
       <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
         <div id="qr-canvas"><span class="dim">点右侧按钮获取二维码</span></div>
-        <div style="flex:1;min-width:260px;max-width:520px">
+        <div style="flex:1;min-width:280px">
+          <div class="fieldline">
+            <label for="qr-app">登录槽位</label>
+            <select id="qr-app" title="选一个平时不用的端，扫码后不会把手机 / 网页版挤下线"></select>
+          </div>
           <div class="btns" style="margin-bottom:12px">
             <button id="btn-qr-start" class="primary">获取二维码</button>
             <button id="btn-qr-cancel" class="mini">取消</button>
           </div>
-          <div class="qrsteps">
-            <div><b>1</b>　手机打开 115 官方 App（或已绑定 115 的小程序）</div>
-            <div><b>2</b>　用「扫一扫」扫描左边的二维码</div>
-            <div><b>3</b>　手机上点确认，这里的状态会变成「已登录」</div>
-          </div>
-          <div class="qrmsg" id="qr-msg">二维码约 5 分钟内有效；登录成功后 cookie 自动写入配置并重建 115 客户端，不用手抄。</div>
+          <div class="qrmsg" id="qr-msg">扫码用的是所选槽位的登录身份，不会顶掉你手机上正在用的那个端；槽位改动会立刻存进配置。</div>
+        </div>
+        <div class="qrsteps" style="flex:none;width:min(320px,100%)">
+          <div><b>1</b>　选好登录槽位（例如 iPad 端 / 电视端 —— 挑自己平时不用的）</div>
+          <div><b>2</b>　用手机 115 官方 App「扫一扫」扫左边的二维码</div>
+          <div><b>3</b>　手机上点确认，状态变「已登录」，cookie 自动写入并重建客户端</div>
         </div>
       </div>
     </div>

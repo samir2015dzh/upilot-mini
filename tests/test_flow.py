@@ -25,7 +25,7 @@ sys.path.insert(0, APP)
 import config as cfgmod          # noqa: E402
 import scanner                   # noqa: E402
 import webui                     # noqa: E402
-from p115 import StubP115        # noqa: E402
+from p115 import StubP115, resolve_upload_target   # noqa: E402
 from store import Store          # noqa: E402
 from uploader import Uploader, sha1_of   # noqa: E402
 
@@ -325,6 +325,83 @@ async def case_form_auth():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_dir_mapping():
+    """本机相对路径 → 115 目录：改名（Anime→/OtherAnime）、大小写、最长前缀、未命中兜底。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1, fail_first=0, small_file_mb=0.0)
+    try:
+        cfg["paths"]["target_root"] = "/UPILOT-mini"
+        cfg["paths"]["map"] = [
+            {"from": "TVs", "to": "/TVs"},
+            {"from": "Movies/Others", "to": "/Movies/Others"},
+            {"from": "Movies/AnimeMovies", "to": "/Movies/AnimeMovies"},
+            {"from": "Anime", "to": "/OtherAnime"},
+            {"from": "Something", "to": "/something"},
+        ]
+        cases = {
+            "TVs/我的剧集/S01E01.mkv": "/TVs/我的剧集",
+            "Movies/Others/某电影/movie.mkv": "/Movies/Others/某电影",
+            "Movies/AnimeMovies/某动画电影/a.mkv": "/Movies/AnimeMovies/某动画电影",
+            "Anime/葬送的芙莉莲/E01.mkv": "/OtherAnime/葬送的芙莉莲",
+            "Something/杂物/a.bin": "/something/杂物",
+            "Movies/某电影/hit.mkv": "/UPILOT-mini/Movies/某电影",        # 未命中 → 回落 target_root
+            "tvs/小写不算命中/x.mkv": "/UPILOT-mini/tvs/小写不算命中",     # 大小写敏感
+            "顶层的文件.mkv": "/UPILOT-mini",                            # 没有子目录
+        }
+        for rel, want in cases.items():
+            full = os.path.join(src, rel.replace("/", os.sep))
+            got = resolve_upload_target(full, src, cfg["paths"]["target_root"], cfg["paths"]["map"])
+            assert got == want, f"{rel} → {got}（期望 {want}）"
+
+        path = write_file(src, "Anime/葬送的芙莉莲/E01.mkv", 2 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        rec = await drive(up, store, path)
+        assert rec["status"] == "已上传", rec
+        assert rec["target_dir"] == "/OtherAnime/葬送的芙莉莲", rec["target_dir"]
+        assert "/OtherAnime/葬送的芙莉莲" in mgr._mem, mgr._mem
+        PASS.append("[9] 目录映射：TVs→/TVs、Anime→/OtherAnime（改名）、Movies/Others 保留、"
+                    "大小写敏感、最长前缀、未命中回落 target_root")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_settings_map_and_slots():
+    """设置页：多行「本机 => 115 目录」解析与回填、坏行拒绝、登录槽位中文下拉。"""
+    field = cfgmod.find_field("paths.map")
+    assert field is not None and field["type"] == "map", field
+    parsed = cfgmod.coerce(field, "TVs => /TVs\nAnime -> /OtherAnime\n\n# 注释行跳过\nSomething=>something")
+    assert parsed == [{"from": "TVs", "to": "/TVs"}, {"from": "Anime", "to": "/OtherAnime"},
+                      {"from": "Something", "to": "/something"}], parsed
+    # 「=> /x」是合法的：from 留空表示整个监控根映射过去
+    assert cfgmod.coerce(field, "=> /root-mapped") == [{"from": "", "to": "/root-mapped"}]
+    for bad in ("只有一边", "TVs => "):
+        try:
+            cfgmod.coerce(field, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"坏行应被拒：{bad!r}")
+
+    cfg = copy.deepcopy(cfgmod.DEFAULTS)
+    cfg["paths"]["map"] = parsed
+    payload = cfgmod.form_payload(cfg)
+    text = [f for g in payload["groups"] for f in g["fields"] if f["key"] == "paths.map"][0]["value"]
+    assert "Anime => /OtherAnime" in text, text
+    assert "Something => /something" in text, text
+
+    appf = cfgmod.find_field("p115.app")
+    assert appf["type"] == "select" and appf["options"][0]["value"] == "qandroid", appf
+    assert cfgmod.app_label("qandroid") == "115管理(Android端)"
+    assert cfgmod.app_label("ipad") == "115(iPad端)"
+    try:
+        cfgmod.coerce(appf, "不存在的端")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知登录槽位应被拒")
+    PASS.append("[10] 设置页：映射多行解析/回填、坏行拒绝；登录槽位中文下拉 + 未知值拒绝")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -334,6 +411,8 @@ async def main():
     await case_scan_suffix_and_dir_filter()
     await case_http_auth()
     await case_form_auth()
+    await case_dir_mapping()
+    case_settings_map_and_slots()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

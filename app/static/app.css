@@ -235,3 +235,15 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
   .filters input[type=text]{min-width:0}
   .grid-stats{grid-template-columns:1fr}
 }
+
+/* ---------- 目录映射（多行）与登录槽位 ---------- */
+.f.wide{grid-column:1 / -1}
+.f textarea{width:100%;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+  background:rgba(255,255,255,.05);border:1px solid var(--line-2);border-radius:11px;
+  padding:10px 12px;outline:none;resize:vertical;transition:.16s ease;min-height:74px}
+.f textarea::placeholder{color:rgba(255,255,255,.26)}
+.f textarea:hover{border-color:rgba(255,255,255,.24)}
+.f textarea:focus{border-color:rgba(99,102,241,.85);box-shadow:0 0 0 3px rgba(99,102,241,.18);background:rgba(255,255,255,.06)}
+.fieldline{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.fieldline label{color:var(--muted);font-size:12.5px;flex:none}
+.fieldline select{flex:1;min-width:0}

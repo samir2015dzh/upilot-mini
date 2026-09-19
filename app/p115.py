@@ -29,8 +29,14 @@ def normalize_cloud_path(p: str) -> str:
     return "/" + "/".join(x for x in (p or "").replace("\\", "/").split("/") if x)
 
 
-def resolve_upload_target(file_path: str, source_path: str, target_root: str) -> str:
-    """本地相对目录结构 → 115 目标目录。相对基准是监控根目录，不在其下则只用文件名。"""
+def resolve_upload_target(file_path: str, source_path: str, target_root: str,
+                          mapping: list | None = None) -> str:
+    """本地相对目录结构 → 115 目标目录。
+
+    mapping 形如 [{"from": "Anime", "to": "/OtherAnime"}, ...]：按「本机相对路径」的
+    最长前缀命中（逐段、大小写敏感），命中就用 to —— 所以支持改名与大小写差异；
+    其下结构原样保留。没命中则落到 target_root + 原相对目录。
+    """
     root = (target_root or "").rstrip("/").rstrip("\\")
     try:
         rel = os.path.relpath(file_path, source_path)
@@ -38,10 +44,33 @@ def resolve_upload_target(file_path: str, source_path: str, target_root: str) ->
         rel = os.path.basename(file_path)
     if rel.startswith(".."):
         rel = os.path.basename(file_path)
-    rel_dir = os.path.dirname(rel)
-    if rel_dir and rel_dir != ".":
-        rel_dir = rel_dir.replace("\\", "/")
-        root = f"{root}/{rel_dir}" if root else rel_dir
+    rel = rel.replace("\\", "/")
+    parts = [x for x in os.path.dirname(rel).split("/") if x and x != "."]
+
+    best_n, best_to = -1, None
+    for item in (mapping or []):
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("from") or "").strip().strip("/")
+        dst = str(item.get("to") or "").strip()
+        if not dst:
+            continue
+        if not src:
+            n = 0
+        else:
+            segs = [x for x in src.split("/") if x]
+            if parts[:len(segs)] != segs:                 # 逐段全等，大小写敏感
+                continue
+            n = len(segs)
+        if n > best_n:
+            best_n, best_to = n, dst
+    if best_to is not None:
+        rest = "/".join(parts[best_n:])
+        return normalize_cloud_path(f"{best_to}/{rest}" if rest else best_to)
+
+    if parts:
+        joined = "/".join(parts)
+        root = f"{root}/{joined}" if root else joined
     return normalize_cloud_path(root)
 
 

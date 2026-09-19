@@ -275,25 +275,29 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
     attach_log_buffer(str(cfg.get("log_level", "INFO")))
 
     # ---------- 115 扫码登录（设置页里的「获取二维码」） ----------
-    def qr_start() -> dict:
+    def qr_start(app: str = "") -> dict:
         """申请二维码：token → PNG 字节，存内存等前端轮询。
 
-        115 只对部分 app 返回真二维码图片（web / windows / linux 实测有效，
-        qandroid / android / ios 会返回一张 HTML 错误页），所以扫码链路固定用
-        web 身份；上传客户端仍然按配置里的 p115.app 走，两者互不影响。
+        app 就是 p115.app 登录槽位：二维码按该端申请，登录出来的 cookie 也归该端，
+        所以挑一个自己平时不用的端，就不会把手机/网页版挤下线。换槽位 = 换一个身份。
         """
+        app = str(app or (cfg.get("p115") or {}).get("app") or "web").strip()
+        if app not in cfgmod.APP_VALUES:                  # 白名单，别把任意值塞进 URL
+            raise RuntimeError(f"不支持的登录槽位：{app}")
         from p115client import P115Client
 
-        token = P115Client.login_qrcode_token(app="web")
+        token = P115Client.login_qrcode_token(app=app)
         data = token.get("data") if isinstance(token, dict) else None
         if not data or not data.get("uid"):
             raise RuntimeError(f"115 未返回二维码：{str(token)[:160]}")
-        png = P115Client.login_qrcode(data, app="web")
+        png = P115Client.login_qrcode(data, app=app)
         if not isinstance(png, (bytes, bytearray)) or not bytes(png).startswith(b"\x89PNG\r\n\x1a\n"):
-            raise RuntimeError(f"115 返回的不是 PNG 二维码（{str(png)[:120]}）")
+            raise RuntimeError(f"{cfgmod.app_label(app)} 这个槽位没给出二维码图片，换一个端再试"
+                               f"（115 返回：{str(png)[:80]}）")
         QR_SESSION.clear()
-        QR_SESSION.update({"token": data, "png": bytes(png), "ts": time.time(), "app": "web"})
-        return {"status": "waiting", "message": "请用 115 官方 App 扫码"}
+        QR_SESSION.update({"token": data, "png": bytes(png), "ts": time.time(), "app": app})
+        return {"status": "waiting", "app": app, "app_label": cfgmod.app_label(app),
+                "message": f"请用 115 官方 App 扫码（登录槽位：{cfgmod.app_label(app)}）"}
 
     def qr_poll() -> dict:
         """查扫码状态；确认后取 cookie 写配置，并请求重建 115 客户端。"""
@@ -337,12 +341,14 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         if not cookie:
             return {"status": "error", "message": f"取 cookie 失败：{str(result)[:200]}"}
         cfg.setdefault("p115", {})["cookie"] = str(cookie)
+        cfg.setdefault("p115", {})["app"] = app            # cookie 与登录槽位保持一致
         cfgmod.save(cfg)
         QR_SESSION.clear()
         state["reload"] = True
         state["scan_now"] = True
-        logger.info("界面扫码登录 115 成功：cookie 已写入配置并重建客户端")
-        return {"status": "done", "message": "登录成功，cookie 已写入配置；115 客户端正在重建"}
+        logger.info("界面扫码登录 115 成功（槽位 %s）：cookie 已写入配置并重建客户端", app)
+        return {"status": "done", "app": app, "app_label": cfgmod.app_label(app),
+                "message": f"登录成功（{cfgmod.app_label(app)}），cookie 已写入配置；115 客户端正在重建"}
     index_file = os.path.join(STATIC_DIR, "index.html")
     login_file = os.path.join(STATIC_DIR, "login.html")
 
@@ -597,8 +603,9 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 return self._json({"ok": True, "affected": n, "message": msg})
             if path == "/api/p115/qrcode":
                 try:
-                    info = qr_start()
-                    logger.info("界面申请 115 扫码登录二维码")
+                    fields = self._body_fields()
+                    info = qr_start(str(fields.get("app") or ""))
+                    logger.info("界面申请 115 扫码登录二维码（槽位 %s）", info.get("app"))
                     return self._json({"ok": True, **info})
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("申请 115 二维码失败：%s", exc)

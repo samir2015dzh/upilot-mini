@@ -103,7 +103,8 @@ class Uploader:
 
         # 2) 目录：先建好（保留本地相对结构），秒传/分块上传共用这个 pid
         cloud_dir = resolve_upload_target(path, self.cfg["paths"]["source"],
-                                          self.cfg["paths"]["target_root"])
+                                          self.cfg["paths"]["target_root"],
+                                          self.cfg["paths"].get("map"))
         pid = await self.mgr.ensure_pid(cloud_dir)
         self.store.set(path, target_dir=cloud_dir, pid=pid)
 

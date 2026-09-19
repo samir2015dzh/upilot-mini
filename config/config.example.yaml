@@ -5,15 +5,28 @@ p115:
   # 115 账号 cookie，形如 "UID=...; CID=...; SEID=...; KID=..."
   # 留空则可用环境变量 P115_COOKIE 覆盖，或进容器跑：python /app/app/main.py login
   cookie: ""
-  # 登录槽位；建议用一个平时不用的端，避免把手机/网页挤下线
-  # web / android / ios / tv / qandroid / wechatmini ...
+  # 登录槽位：扫码登录与上传都用它当身份。挑一个自己平时不用的端，
+  # 扫码就不会把手机上正在用的 115 / 网页版挤下线。可选值（面板里是中文下拉）：
+  #   qandroid 115管理(Android端) | qios 115管理(iOS端) | qipad 115管理(iPad端)
+  #   android/ios/ipad 115(Android/iOS/iPad端) | bandroid 115生活(Android端)
+  #   wechatmini/alipaymini 115生活(微信/支付宝小程序) | tv 115网盘(电视端)
+  #   web 网页版 | windows/mac/linux 电脑端 | harmony 鸿蒙端
   app: "qandroid"
 
 paths:
   # 容器内监控目录（compose 把宿主机媒体目录挂到 /media/source）
   source: "/media/source"
-  # 115 上的目标根目录（不存在会自动创建，保留本地相对目录结构）
+  # 115 上的目标根目录（没被下面 map 命中的文件都落在这里，保留本地相对目录结构）
   target_root: "/UPILOT-mini"
+  # 本机相对路径 → 115 目录：命中时取最长前缀（可改名、大小写照写），
+  # 命中目录之下的结构原样保留；没命中才用 target_root。
+  # 面板「目录」组里是同一个东西的多行写法：本机相对路径 => 115 目录
+  map:
+    - {from: "TVs",              to: "/TVs"}                 # /media/source/TVs/…     → /TVs/…
+    - {from: "Movies/Others",    to: "/Movies/Others"}       # …/Movies/Others/…       → /Movies/Others/…
+    - {from: "Movies/AnimeMovies", to: "/Movies/AnimeMovies"} # …/Movies/AnimeMovies/… → /Movies/AnimeMovies/…
+    - {from: "Anime",            to: "/OtherAnime"}          # …/Anime/…               → /OtherAnime/…（改名）
+    - {from: "Something",        to: "/something"}           # …/Something/…           → /something/…（大小写）
 
 scan:
   interval_seconds: 30          # 扫描间隔

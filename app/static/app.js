@@ -51,6 +51,7 @@ async function post(path, body) {
 /* ---------------- 标签切换 ---------------- */
 function switchTab(name) {
   S.tab = name;
+  if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
   for (const t of ["overview", "tasks", "settings"]) {
     $("#view-" + t).hidden = (t !== name);
     $("#tab-" + t).classList.toggle("on", t === name);
@@ -333,6 +334,22 @@ function renderSettings(payload) {
     </div>`).join("");
   $("#cfg-path").textContent = payload.path || "/config/config.yaml";
   $("#settings-msg").innerHTML = "";
+  fillQrApps(groups);
+}
+
+function fillQrApps(groups) {
+  const sel = $("#qr-app");
+  if (!sel) return;
+  let f = null;
+  (groups || []).forEach(g => (g.fields || []).forEach(x => { if (x.key === "p115.app") f = x; }));
+  if (!f) return;
+  sel.innerHTML = (f.options || []).map(o => {
+    const v = (o && typeof o === "object") ? o.value : o;
+    const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
+    return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}</option>`;
+  }).join("");
+  const pill = $("#qr-slot");
+  if (pill) pill.textContent = "槽位 " + (sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "–");
 }
 
 function fieldHtml(f) {
@@ -346,10 +363,18 @@ function fieldHtml(f) {
     </div>`;
   }
   if (f.type === "select") {
-    const opts = (f.options || []).map(o =>
-      `<option value="${esc(o)}" ${String(f.value) === String(o) ? "selected" : ""}>${esc(o)}</option>`).join("");
+    const opts = (f.options || []).map(o => {
+      const v = (o && typeof o === "object") ? o.value : o;
+      const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
+      return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}</option>`;
+    }).join("");
     return `<div class="f"><label>${label}${tag}</label>
       <select data-key="${key}" data-type="select">${opts}</select>${hint}</div>`;
+  }
+  if (f.type === "map") {
+    const rows = f.rows || 5;
+    return `<div class="f wide"><label>${label}${tag}</label>
+      <textarea rows="${rows}" spellcheck="false" data-key="${key}" data-type="map" placeholder="TVs => /TVs&#10;Movies/Others => /Movies/Others&#10;Anime => /OtherAnime">${esc(f.value ?? "")}</textarea>${hint}</div>`;
   }
   if (f.type === "secret") {
     const state = f.set
@@ -364,7 +389,7 @@ function fieldHtml(f) {
   const type = f.type === "int" || f.type === "float" ? "number" : "text";
   const extra = f.type === "float" ? ' step="0.1"' : "";
   return `<div class="f"><label>${label}${tag}</label>
-    <input type="${type}"${extra} data-key="${key}" data-type="${esc(f.type)}" value="${esc(f.value ?? "")}" />${hint}</div>`;
+    <input type="${type}"${extra} data-key="${key}" data-type="${esc(f.type)}" title="${esc(f.value ?? "")}" value="${esc(f.value ?? "")}" />${hint}</div>`;
 }
 
 async function saveSettings() {
@@ -417,12 +442,14 @@ function qrSetState(st, msg) {
 
 async function qrStart() {
   clearTimeout(qrTimer);
+  const sel = $("#qr-app");
+  const app = sel ? sel.value : "";
   $("#qr-state").textContent = "申请中…";
-  $("#qr-msg").textContent = "正在向 115 申请二维码…";
+  $("#qr-msg").textContent = "正在按所选登录槽位申请二维码…";
   try {
-    await post("/api/p115/qrcode");
+    const j = await post("/api/p115/qrcode", { app });
     $("#qr-canvas").innerHTML = `<img src="/api/p115/qrcode.png?t=${Date.now()}" alt="115 登录二维码" />`;
-    qrSetState("waiting", "请用 115 官方 App 扫码（二维码约 5 分钟内有效）");
+    qrSetState("waiting", (j && j.message ? j.message : "请用 115 官方 App 扫码") + "；二维码约 5 分钟内有效");
     qrKick();
   } catch (e) {
     $("#qr-state").textContent = "出错";
@@ -465,6 +492,16 @@ function qrCancel() {
 
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
+  if ($("#qr-app")) $("#qr-app").onchange = async () => {
+    const sel = $("#qr-app");
+    const lb = sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : sel.value;
+    if ($("#qr-slot")) $("#qr-slot").textContent = "槽位 " + lb;
+    try {
+      await post("/api/config", { values: { "p115.app": sel.value } });
+      toast("登录槽位已改为 " + lb + "（点「获取二维码」即用）");
+    } catch (e) { toast("槽位保存失败：" + e.message); }
+  };
+
   $("#tab-overview").onclick = () => switchTab("overview");
   $("#tab-tasks").onclick = () => switchTab("tasks");
   $("#tab-settings").onclick = () => switchTab("settings");
@@ -523,7 +560,12 @@ function bind() {
 
 /* ---------------- 启动 ---------------- */
 bind();
-switchTab("overview");
+const _startTab = (location.hash || "").replace("#", "");
+switchTab(["overview", "tasks", "settings"].includes(_startTab) ? _startTab : "overview");
+window.addEventListener("hashchange", () => {
+  const t = (location.hash || "").replace("#", "");
+  if (["overview", "tasks", "settings"].includes(t) && t !== S.tab) switchTab(t);
+});
 refreshOverview();
 refreshLogs();
 setInterval(() => {

@@ -42,20 +42,37 @@ docker compose logs -f
 
 界面：`http://<host>:9844/` ｜ JSON 状态：`http://<host>:9844/api/status` ｜ 健康检查：`http://<host>:9844/health`
 
-## 2. 拿 115 cookie（两种方式）
+## 2. 拿 115 cookie（三种方式）
 
-**方式 A：扫码登录（推荐）**
+**方式 A：面板里扫码（推荐，有界面就用它）**
+
+打开 Web 界面 → 设置页 →「115 扫码登录」卡片 → 选「登录槽位」→ 点「获取二维码」→
+手机 115 官方 App 扫一扫 → 手机上确认。状态变「已登录」后 cookie 自动写进
+`/config/config.yaml` 并重建 115 客户端 —— 不用手抄、不用重启。
+
+登录槽位就是 `p115.app`：二维码按该端申请，登录出来的 cookie 也归该端，**所以挑一个自己
+平时不用的端，扫码不会把手机上正在用的 115 / 网页版挤下线**。下拉里是中文标签，常用几个：
+
+| 槽位 | 对应客户端 |
+| --- | --- |
+| `qandroid` / `qios` / `qipad` | 115管理（Android / iOS / iPad 端） |
+| `android` / `ios` / `ipad` | 115（Android / iOS / iPad 端） |
+| `tv` / `apple_tv` | 115网盘（Android / Apple 电视端） |
+| `bandroid` | 115生活（Android端） |
+| `wechatmini` / `alipaymini` | 115生活（微信 / 支付宝小程序） |
+| `web` / `windows` / `mac` / `linux` | 网页版 / 电脑端 |
+| `harmony` | 鸿蒙端 |
+
+**方式 B：命令行扫码**
 
 ```bash
-docker compose run --rm upilot-mini login
+docker compose run --rm upilot-mini login                      # 槽位取 config.yaml 的 p115.app
+docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的容器里做
 ```
 
-终端出二维码，用 115 App 扫；成功后 cookie 自动写入 `/config/config.yaml`，然后 `docker compose up -d`。
-`p115.app` 换成你平时不用的槽位（默认 `qandroid`），避免把手机/网页端挤下线。
+终端里出二维码，用 115 App 扫；成功后 cookie 写入 `/config/config.yaml`，然后 `docker compose restart`。
 
-（也可以进正在运行的容器执行：`docker compose exec upilot-mini python /app/app/main.py login`）
-
-**方式 B：直接填**
+**方式 C：直接填**
 把浏览器抓到的 `UID=...; CID=...; SEID=...; KID=...` 填进 `config.yaml` 的 `p115.cookie`，或用环境变量 `P115_COOKIE`。
 
 ## 3. 工作流程（与官方行为一致）
@@ -82,9 +99,10 @@ docker compose run --rm upilot-mini login
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `p115.cookie` / `p115.app` | — / `qandroid` | 115 凭据与登录槽位 |
+| `p115.cookie` / `p115.app` | — / `qandroid` | 115 凭据与登录槽位（扫码与上传都用它，挑平时不用的端） |
 | `paths.source` | `/media/source` | 容器内监控目录 |
-| `paths.target_root` | `/UPILOT-mini` | 115 目标根目录，不存在会自动创建 |
+| `paths.target_root` | `/UPILOT-mini` | 没被 `paths.map` 命中的文件落在这里，不存在会自动创建 |
+| `paths.map` | `[]` | 本机相对路径 → 115 目录的映射表（可改名、大小写照写），见 §5「目录映射」 |
 | `scan.interval_seconds` | 30 | 扫描间隔 |
 | `scan.stable_rounds` | 2 | 连续 N 轮 size/mtime 不变才处理 |
 | `scan.ignore_suffixes` | 见示例 | 下载中的临时后缀 |
@@ -135,14 +153,45 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
   - 带「需重建容器」标记的项（监听地址/端口、日志级别）要 `docker compose up -d --force-recreate` 后才生效。
   - 保存是整文件重写，config.yaml 里的注释会简化（字段说明以 `config/config.example.yaml` 为准）。
 
+### 目录映射（本机子目录 → 115 指定目录）
+
+设置页「目录」组里的「本机 → 115 目录映射」，或 `config.yaml` 里的 `paths.map`：
+
+```yaml
+paths:
+  source: "/media/source"
+  target_root: "/UPILOT-mini"        # 没命中映射的文件都落这里
+  map:
+    - {from: "TVs",              to: "/TVs"}
+    - {from: "Movies/Others",    to: "/Movies/Others"}
+    - {from: "Movies/AnimeMovies", to: "/Movies/AnimeMovies"}
+    - {from: "Anime",            to: "/OtherAnime"}     # 云端改名
+    - {from: "Something",        to: "/something"}      # 云端大小写照你写的来
+```
+
+规则很短：`from` 是**相对监控根目录**的路径（逐段比对、大小写敏感），命中时**取最长前缀**，
+云端目录 = `to` + 命中点之下的剩余结构；一个都没命中才回落到 `target_root`。
+所以 `from` 留空（写成 `=> /Root`）表示「整个监控根平移到 /Root」。
+
+对应关系示例（挂载 `/data/media → /media/source`）：
+
+| 本机 | 云端 |
+| --- | --- |
+| `/media/source/TVs/我的剧集/S01E01.mkv` | `/TVs/我的剧集/S01E01.mkv` |
+| `/media/source/Movies/Others/某电影/a.mkv` | `/Movies/Others/某电影/a.mkv` |
+| `/media/source/Anime/葬送的芙莉莲/E01.mkv` | `/OtherAnime/葬送的芙莉莲/E01.mkv` |
+| `/media/source/Something/杂物/a.bin` | `/something/杂物/a.bin` |
+| `/media/source/Movies/某电影/a.mkv`（未命中） | `/UPILOT-mini/Movies/某电影/a.mkv` |
+
 ### 115 扫码登录（面板里直接扫）
 
-设置页顶部有「115 扫码登录」卡片：点「获取二维码」→ 用手机 115 官方 App 扫一扫 →
-手机上确认，面板状态会从「等待扫码」变「已登录」，cookie 自动写进配置并重建 115 客户端。
-二维码约 5 分钟有效，过期点「刷新二维码」重来。
+设置页顶部有「115 扫码登录」卡片：**先选「登录槽位」**（就是 `p115.app`）→ 点「获取二维码」→
+用手机 115 官方 App 扫一扫 → 手机上确认，状态会从「等待扫码」变「已登录」，cookie 自动写进配置
+并重建 115 客户端。二维码约 5 分钟有效，过期点「刷新二维码」重来。
 
-- 扫码链路固定用 `web` 身份取二维码（115 只对 web / windows / linux 返回真图片，
-  `qandroid` 之类会返回一张 HTML 错误页）；上传客户端仍按配置里的 `p115.app` 走。
+- **槽位可选**（下拉 19 个中文选项）就是为了这件事：扫码身份按槽位申请，登录出来的 cookie 也归该端。
+  例如选 `115(iPad端)` 或 `115网盘(Android电视端)`，就不会顶掉你手机上正在用的 115 App / 网页版。
+  槽位下拉改完立刻存进配置，下一次「获取二维码」即生效。
 - 115 的状态接口是长轮询：有状态变化立刻返回，空闲时会挂住；面板给 5 秒读超时
   （底层还会重试，一次轮询约十几秒），所以扫码后最多十几秒页面上就会显示「已登录」。
 - 命令行方式仍然可用：`docker compose run --rm upilot-mini login`（终端里显示二维码）。
