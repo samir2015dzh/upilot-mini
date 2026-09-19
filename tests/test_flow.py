@@ -239,6 +239,92 @@ async def case_http_auth():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_form_auth():
+    """站内登录页（mode=form）：未登录跳 /login，登录后 Cookie 放行，Basic 与 ?token= 仍是脚本通道。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):      # 保留 302，便于断言跳转目标
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def raw(url: str, cookie: str = "") -> tuple[int, dict, bytes]:
+        req = urllib.request.Request(url)
+        if cookie:
+            req.add_header("Cookie", cookie)
+        try:
+            resp = opener.open(req, timeout=5)
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
+
+    def login(user: str, pwd: str, nxt: str = "/") -> tuple[int, dict, bytes]:
+        data = urllib.parse.urlencode({"username": user, "password": pwd, "next": nxt}).encode()
+        req = urllib.request.Request(f"{base}/login", data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            resp = opener.open(req, timeout=5)
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
+
+    try:
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "mode": "form", "username": "admin",
+                                "password": "s3cret-token", "session_hours": 72}}
+        state = {"scan_rounds": 0, "dry_run": True}
+        srv = webui.serve(cfg, store, state)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+
+        # 未登录：页面跳登录页，API 给 401 JSON，/health 照旧放行
+        assert raw(f"{base}/health")[0] == 200, "健康检查应始终放行"
+        code, hdrs, _ = raw(f"{base}/")
+        assert code == 302 and hdrs.get("location", "").startswith("/login?next="), \
+            f"未登录访问首页应 302 到登录页，实际 {code} {hdrs.get('location')}"
+        code, _, body = raw(f"{base}/api/status")
+        assert code == 401 and b'"login"' in body, "未登录 API 应 401 并给出登录地址"
+        code, _, body = raw(f"{base}/login")
+        assert code == 200 and b"login" in body and b'name="password"' in body, "登录页应 200 且带密码框"
+
+        # 登录
+        code, _, body = login("admin", "wrong")
+        assert code == 401 and "用户名或密码不对".encode() in body, "错密码应回到登录页并提示"
+        code, hdrs, _ = login("admin", "s3cret-token", "/api/status")
+        jar = hdrs.get("set-cookie", "")
+        assert code == 302 and hdrs.get("location") == "/api/status", f"登录成功应 302 回原地址，实际 {code}"
+        assert jar.startswith("upilot_session=") and "HttpOnly" in jar and "SameSite=Lax" in jar, \
+            f"应下发 HttpOnly 会话 Cookie，实际 {jar[:60]}"
+        token = jar.split(";", 1)[0]
+
+        # 带着 Cookie：页面与 API 都放行
+        assert raw(f"{base}/api/status", token)[0] == 200, "带会话 Cookie 访问 API 应放行"
+        code, _, body = raw(f"{base}/", token)
+        assert code == 200 and b"UPilot-mini" in body, "带会话 Cookie 应看到仪表盘"
+
+        # 伪造 Cookie 不放行；Basic 与 ?token= 仍是脚本通道
+        assert raw(f"{base}/api/status", "upilot_session=ZmFrZXxleHA=.deadbeef")[0] == 401, "伪造 Cookie 应 401"
+        assert http_get(f"{base}/api/status", "admin", "s3cret-token")[0] == 200, "Basic 通道应保留"
+        assert http_get(f"{base}/api/status?token=s3cret-token")[0] == 200, "?token= 通道应保留"
+
+        # 退出：清 Cookie 并回登录页
+        code, hdrs, _ = raw(f"{base}/logout", token)
+        assert code == 302 and hdrs.get("location") == "/login", "退出应回登录页"
+        assert "Max-Age=0" in hdrs.get("set-cookie", ""), "退出应清 Cookie"
+
+        # 关掉鉴权 → 恢复开放
+        cfg["http"]["auth"]["enabled"] = False
+        assert raw(f"{base}/api/status")[0] == 200, "关闭鉴权后应开放"
+        PASS.append("[8] 站内登录页（form）：未登录 302 /login、错密码提示、HttpOnly Cookie 放行、"
+                    "伪造 Cookie 401、Basic 与 ?token= 保留、退出清 Cookie、/health 始终 200")
+    finally:
+        if srv is not None:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -247,6 +333,7 @@ async def main():
     await case_scan_dedupe_and_rewrite()
     await case_scan_suffix_and_dir_filter()
     await case_http_auth()
+    await case_form_auth()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

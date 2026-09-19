@@ -1,42 +1,136 @@
-"""Web 界面：单页仪表盘 + JSON API（纯标准库，无外部依赖）。
+"""Web 界面：单页仪表盘 + JSON API + 可选鉴权（纯标准库，无外部依赖）。
 
-GET  /              单页界面（app/static/index.html）
-GET  /api/status    状态：统计、正在处理、最近活动、配置摘要
-GET  /health        健康检查（供 Docker HEALTHCHECK 用）
-POST /api/scan      立刻触发一轮扫描
-POST /api/retry-now 把「待重试」的文件提前到期（马上再试秒传）
-POST /api/requeue   把「错误」的文件重新入队
+鉴权（http.auth）两种模式，由 http.auth.mode 决定：
+  basic  默认。浏览器弹原生 Basic 框；脚本用 -u user:pass 或 ?token=pass
+  form   站内登录页 /login，登录后下发签名 Cookie 会话；Basic 与 ?token= 仍
+         保留为脚本通道（curl / 监控 / 反代探活不受影响）
+
+GET  /               单页界面（app/static/index.html）
+GET  /login          登录页（form 模式）
+POST /login          提交登录（application/x-www-form-urlencoded 或 JSON）
+GET  /logout         退出登录，清 Cookie
+GET  /api/status     状态：统计、正在处理、最近活动、配置摘要
+GET  /health         健康检查（供 Docker HEALTHCHECK 用，始终放行）
+POST /api/scan       立刻触发一轮扫描
+POST /api/retry-now  把「待重试」的文件提前到期（马上再试秒传）
+POST /api/requeue    把「错误」的文件重新入队
+POST /api/pause /api/resume   暂停 / 恢复调度
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 logger = logging.getLogger("upilot.web")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
+COOKIE_NAME = "upilot_session"
+DEFAULT_SESSION_HOURS = 72
+MAX_LOGIN_FAILURES = 5          # 同一来源连续失败次数上限
+LOGIN_LOCK_SECONDS = 60         # 触顶后锁定时长
 
+# 登录失败计数：{来源: [连续失败数, 解锁时间戳]}，仅内存，重启即清
+_FAILURES: dict[str, list] = {}
+_FAIL_LOCK = threading.Lock()
+
+
+# ---------- 配置读取 ----------
 def auth_cfg(cfg: dict) -> dict:
     return (cfg.get("http") or {}).get("auth") or {}
 
 
-def check_auth(cfg: dict, headers, query: str) -> bool:
-    """HTTP Basic 或 ?token=… 任一通过即放行；未开启鉴权（或没设密码）时恒真。
+def _enabled(a: dict) -> bool:
+    return bool(a.get("enabled")) and bool(str(a.get("password") or ""))
 
-    /health 不走这里（Docker HEALTHCHECK 在容器内直连，不需要凭据）。
+
+def _password(a: dict) -> str:
+    return str(a.get("password") or "")
+
+
+def _username(a: dict) -> str:
+    return str(a.get("username") or "")
+
+
+def _mode(a: dict) -> str:
+    mode = str(a.get("mode") or "basic").strip().lower()
+    return mode if mode in ("basic", "form") else "basic"
+
+
+def _session_hours(a: dict) -> int:
+    try:
+        return max(1, int(a.get("session_hours", DEFAULT_SESSION_HOURS)))
+    except (TypeError, ValueError):
+        return DEFAULT_SESSION_HOURS
+
+
+# ---------- 会话签名（HMAC-SHA256，密钥取自 http.auth.password） ----------
+def _sign(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_session(user: str, secret: str, hours: int = DEFAULT_SESSION_HOURS,
+                 now: float | None = None) -> str:
+    exp = int((now if now is not None else time.time()) + hours * 3600)
+    payload = f"{user}|{exp}"
+    body = base64.urlsafe_b64encode(payload.encode("utf-8")).decode().rstrip("=")
+    return f"{body}.{_sign(secret, payload)}"
+
+
+def parse_session(token: str, secret: str) -> str | None:
+    """校验 Cookie 值，通过则返回用户名，否则 None。"""
+    if not token or "." not in token:
+        return None
+    try:
+        body, sig = token.rsplit(".", 1)
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8")
+        user, _, exp = payload.rpartition("|")
+        if int(exp) < time.time():
+            return None
+        if not hmac.compare_digest(sig, _sign(secret, payload)):
+            return None
+        return user
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_cookie(raw: str) -> dict:
+    out = {}
+    for part in (raw or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k:
+            out[k] = v
+    return out
+
+
+# ---------- 凭据校验 ----------
+def check_credentials(a: dict, user: str, pwd: str) -> bool:
+    want_user = _username(a)
+    if not hmac.compare_digest(pwd, _password(a)):
+        return False
+    return (not want_user) or hmac.compare_digest(user, want_user)
+
+
+def check_auth(cfg: dict, headers, query: str) -> bool:
+    """三条通道任一通过即放行：签名 Cookie / ?token=密码 / HTTP Basic。
+
+    未开启鉴权（或没设密码）时恒真；/health 不走这里。
     """
     a = auth_cfg(cfg)
-    pwd = str(a.get("password") or "")
-    if not a.get("enabled") or not pwd:
+    if not _enabled(a):
         return True
+    pwd = _password(a)
     if parse_qs(query).get("token", [""])[0] == pwd:
+        return True
+    if parse_session(parse_cookie(headers.get("Cookie", "")).get(COOKIE_NAME, ""), pwd):
         return True
     raw = headers.get("Authorization", "")
     if raw.startswith("Basic "):
@@ -44,13 +138,46 @@ def check_auth(cfg: dict, headers, query: str) -> bool:
             user, _, given = base64.b64decode(raw[6:]).decode("utf-8", "replace").partition(":")
         except Exception:  # noqa: BLE001
             return False
-        want_user = str(a.get("username") or "")
-        return hmac.compare_digest(given, pwd) and (not want_user or user == want_user)
+        return check_credentials(a, user, given)
     return False
+
+
+def _safe_next(raw: str) -> str:
+    """只允许同源相对路径，挡掉 //evil.com 这类开放跳转。"""
+    val = (raw or "").strip()
+    if val.startswith("/") and not val.startswith("//") and "\r" not in val and "\n" not in val:
+        return val
+    return "/"
+
+
+def _rate_limited(ip: str) -> int:
+    """返回剩余锁定秒数，0 表示未锁定。"""
+    with _FAIL_LOCK:
+        rec = _FAILURES.get(ip)
+        if not rec:
+            return 0
+        if rec[1] > time.time():
+            return int(rec[1] - time.time()) + 1
+        return 0
+
+
+def _note_failure(ip: str) -> None:
+    with _FAIL_LOCK:
+        rec = _FAILURES.setdefault(ip, [0, 0.0])
+        rec[0] += 1
+        if rec[0] >= MAX_LOGIN_FAILURES:
+            rec[1] = time.time() + LOGIN_LOCK_SECONDS
+            rec[0] = 0
+
+
+def _note_success(ip: str) -> None:
+    with _FAIL_LOCK:
+        _FAILURES.pop(ip, None)
 
 
 def _payload(cfg: dict, store, state: dict) -> dict:
     up, rt, sc = cfg["upload"], cfg["retry"], cfg["scan"]
+    a = auth_cfg(cfg)
     stats = store.stats()
     return {
         "ok": True,
@@ -63,6 +190,11 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "queue": store.counts(),
         "active": store.active(50),
         "recent": store.recent(25),
+        "auth": {
+            "enabled": _enabled(a),
+            "mode": _mode(a),
+            "user": _username(a) if _enabled(a) else "",
+        },
         "config": {
             "source": cfg["paths"]["source"],
             "target_root": cfg["paths"]["target_root"],
@@ -80,17 +212,37 @@ def _payload(cfg: dict, store, state: dict) -> dict:
     }
 
 
+def _fill_login(tpl: str, next_url: str, error: str, user: str, site: str) -> bytes:
+    def esc(s: str) -> str:
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                 .replace('"', "&quot;").replace("'", "&#39;"))
+    err_html = ""
+    if error:
+        err_html = ('<div class="err"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                    'stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/>'
+                    '<path d="M12 8v5"/><path d="M12 16h.01"/></svg><span>'
+                    + esc(error) + "</span></div>")
+    site_html = f'<div class="site">{esc(site)}</div>' if site else ""
+    html = (tpl.replace("{{ERROR}}", err_html)
+               .replace("{{SITE_BLOCK}}", site_html)
+               .replace("{{SITE}}", esc(site))
+               .replace("{{NEXT}}", esc(next_url))
+               .replace("{{USER}}", esc(user)))
+    return html.encode("utf-8")
+
+
 def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
     http_cfg = cfg.get("http") or {}
     if not http_cfg.get("enabled", True):
         return None
     index_file = os.path.join(STATIC_DIR, "index.html")
+    login_file = os.path.join(STATIC_DIR, "login.html")
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "upilot-mini"
 
         # ---- 工具 ----
-        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> bool:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
@@ -102,45 +254,130 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
-
-        # ---- 鉴权 ----
-        def _guard(self) -> bool:
-            """开启 http.auth 后，所有页面与 API 都需要凭据。"""
-            if check_auth(cfg, self.headers, urlparse(self.path).query):
-                return True
-            self._send(401, b"auth required", "text/plain",
-                       extra={"WWW-Authenticate": 'Basic realm="UPilot-mini"'})
             return False
 
-        def _json(self, obj, code: int = 200) -> None:
-            self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+        def _json(self, obj, code: int = 200, extra: dict | None = None) -> bool:
+            return self._send(code, json.dumps(obj, ensure_ascii=False).encode(),
+                              "application/json; charset=utf-8", extra=extra)
 
-        def _index(self) -> None:
+        def _redirect(self, target: str, extra: dict | None = None) -> bool:
+            return self._send(302, b"", "text/plain", extra=dict(extra or {}, Location=target))
+
+        def _read_file(self, path: str) -> str:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+
+        def _cookie_header(self, token: str, max_age: int) -> str:
+            return (f"{COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; "
+                    "HttpOnly; SameSite=Lax")
+
+        # ---- 鉴权 ----
+        def _client_ip(self) -> str:
+            fwd = self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or ""
+            if fwd:
+                return fwd.split(",")[0].strip()
+            return self.client_address[0] if self.client_address else "?"
+
+        def _guard(self) -> bool:
+            """放行返回 True；否则自行应答并返回 False。"""
+            a = auth_cfg(cfg)
+            if check_auth(cfg, self.headers, urlparse(self.path).query):
+                return True
+            path = urlparse(self.path).path
+            if _mode(a) == "form":
+                if path.startswith("/api/"):
+                    return self._json({"ok": False, "error": "unauthorized",
+                                       "mode": "form", "login": "/login"}, 401)
+                return self._redirect("/login?next=" + quote(self.path or "/", safe=""))
+            return self._send(401, b"auth required", "text/plain",
+                              extra={"WWW-Authenticate": 'Basic realm="UPilot-mini"'})
+
+        # ---- 页面 ----
+        def _index(self) -> bool:
             try:
-                with open(index_file, "rb") as f:
-                    self._send(200, f.read(), "text/html; charset=utf-8")
+                return self._send(200, self._read_file(index_file).encode("utf-8"),
+                                  "text/html; charset=utf-8")
             except OSError:
-                self._send(500, b"index.html missing", "text/plain")
+                return self._send(500, b"index.html missing", "text/plain")
+
+        def _login_page(self, next_url: str = "/", error: str = "", user: str = "",
+                        code: int = 200) -> bool:
+            try:
+                tpl = self._read_file(login_file)
+            except OSError:
+                return self._send(500, b"login.html missing", "text/plain")
+            site = (cfg.get("http") or {}).get("public_url") or ""
+            body = _fill_login(tpl, _safe_next(next_url), error, user, site)
+            return self._send(code, body, "text/html; charset=utf-8")
 
         # ---- 路由 ----
         def do_GET(self):  # noqa: N802
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path, query = parsed.path, parsed.query
             if path.startswith("/health"):             # 健康检查豁免：容器内 HEALTHCHECK 直连
                 return self._send(200, b"ok", "text/plain")
+            a = auth_cfg(cfg)
+            if _mode(a) == "form" and _enabled(a):
+                if path == "/login":
+                    if check_auth(cfg, self.headers, query):
+                        return self._redirect(_safe_next(parse_qs(query).get("next", ["/"])[0]))
+                    return self._login_page(parse_qs(query).get("next", ["/"])[0])
+                if path == "/logout":
+                    return self._redirect("/login", extra={
+                        "Set-Cookie": self._cookie_header("", 0)})
             if not self._guard():
                 return
             if path in ("/", "/index.html"):
                 return self._index()
-            if path in ("/api/status", "/status.json"):
-                return self._json(_payload(cfg, store, state))
-            if path == "/status":                      # 兼容老路径：给人看的 JSON
+            if path in ("/api/status", "/status.json", "/status"):
                 return self._json(_payload(cfg, store, state))
             self._send(404, b"not found", "text/plain")
 
+        def _body_fields(self) -> dict:
+            """解析表单或 JSON 请求体，返回字段字典。"""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b""
+            text = raw.decode("utf-8", "replace")
+            if "application/json" in (self.headers.get("Content-Type") or ""):
+                try:
+                    obj = json.loads(text or "{}")
+                except ValueError:
+                    obj = {}
+                return {k: str(v) for k, v in obj.items()} if isinstance(obj, dict) else {}
+            return {k: v[0] for k, v in parse_qs(text, keep_blank_values=True).items()}
+
+        def _do_login(self, parsed) -> bool:
+            a = auth_cfg(cfg)
+            ip = self._client_ip()
+            left = _rate_limited(ip)
+            if left:
+                q = parse_qs(parsed.query).get("next", ["/"])[0] or "/"
+                return self._login_page(_safe_next(q), f"尝试次数过多，请 {left} 秒后再试", code=429)
+            fields = self._body_fields()
+            nxt = _safe_next(fields.get("next") or parse_qs(parsed.query).get("next", ["/"])[0])
+            user = fields.get("username", "")
+            pwd = fields.get("password", "")
+            if check_credentials(a, user, pwd):
+                _note_success(ip)
+                token = make_session(user or _username(a), _password(a), _session_hours(a))
+                logger.info("登录成功：%s（来源 %s）", user, ip)
+                return self._redirect(nxt, extra={
+                    "Set-Cookie": self._cookie_header(token, _session_hours(a) * 3600)})
+            _note_failure(ip)
+            logger.warning("登录失败：%s（来源 %s）", user or "-", ip)
+            return self._login_page(nxt, "用户名或密码不对", user, code=401)
+
         def do_POST(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            a = auth_cfg(cfg)
+            if path == "/login" and _mode(a) == "form" and _enabled(a):
+                return self._do_login(parsed)
             if not self._guard():
                 return
-            path = urlparse(self.path).path
             if path == "/api/scan":
                 state["scan_now"] = True
                 return self._json({"ok": True, "action": "scan", "message": "已触发扫描"})
@@ -159,6 +396,8 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     "ok": True, "action": path.rsplit("/", 1)[-1], "paused": state["paused"],
                     "message": "已暂停调度（在途任务继续跑完）" if state["paused"] else "已恢复调度",
                 })
+            if path == "/logout":
+                return self._redirect("/login", extra={"Set-Cookie": self._cookie_header("", 0)})
             self._send(404, b"not found", "text/plain")
 
         def log_message(self, *args):  # 静音访问日志
@@ -167,6 +406,8 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
     srv = ThreadingHTTPServer((http_cfg.get("host", "0.0.0.0"), int(http_cfg.get("port", 9844))), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     a = auth_cfg(cfg)
-    logger.info("界面已启动：http://<host>:%s/（鉴权：%s）", http_cfg.get("port", 9844),
-                "已开启" if (a.get("enabled") and a.get("password")) else "关闭")
+    state_desc = "关闭"
+    if _enabled(a):
+        state_desc = "站内登录页（form）" if _mode(a) == "form" else "HTTP Basic"
+    logger.info("界面已启动：http://<host>:%s/（鉴权：%s）", http_cfg.get("port", 9844), state_desc)
     return srv

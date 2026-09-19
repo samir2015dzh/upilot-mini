@@ -116,6 +116,7 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 | POST | `/api/retry-now` | 把所有待重试的秒传提前到期 |
 | POST | `/api/requeue` | 失败项重新入队 |
 | POST | `/api/pause` `/api/resume` | 暂停 / 恢复派发（在途任务跑完） |
+| GET | `/login` `/logout` | 站内登录页与退出（`mode: form` 时启用） |
 
 ### 鉴权与反代
 
@@ -125,23 +126,37 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 http:
   auth:
     enabled: true
+    mode: form                  # form = 站内登录页（推荐）；basic = 浏览器原生弹框
     username: "admin"
     password: "换成一串长随机密码"
+    session_hours: 72           # 仅 mode=form：登录状态保持多少小时
 ```
 
-打开后页面和所有 `/api/*` 都要凭据：浏览器走 HTTP Basic 弹窗，脚本用 `curl -u admin:密码 …` 或 `?token=密码`（例：`curl "http://host:9844/api/status?token=…"`）。`/health` 始终放行，容器 HEALTHCHECK 不受影响。密码留空等同于关闭。
+`mode: form` 是反代场景该用的那种：未登录访问页面会跳到 `/login`——跟仪表盘同款的站内登录页，不再出现浏览器那个灰白原生弹框。登录成功后下发 `HttpOnly; SameSite=Lax` 的签名 Cookie（HMAC-SHA256，密钥取自 `password`），到期自动失效；仪表盘右上角会多一个「退出登录」。连续输错 5 次锁 60 秒。
 
-反代只要把 `Authorization` 头透传过去即可，nginx 例：
+`mode: basic` 保持原样：浏览器直接弹原生框，适合临时排查。
+
+两种模式下脚本通道都在：
+
+```bash
+curl -u admin:密码 http://host:9844/api/status      # HTTP Basic
+curl "http://host:9844/api/status?token=密码"               # 令牌，适合监控脚本
+```
+
+`/health` 始终放行（容器 HEALTHCHECK 用）。密码留空等同于关闭。改掉 `password` 等于换掉签名密钥——所有已登录的浏览器立刻失效，这就是强制全员下线的做法。
+
+反代把 `Cookie` 与 `Authorization` 头透传即可（nginx 默认透传 Cookie）：
 
 ```nginx
 location / {
     proxy_pass http://<server-ip>:9844;
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Real-IP $remote_addr;   # 登录失败限速按它区分来源
 }
 ```
 
-也可以在反代上再叠一层 `auth_basic` / Authelia；应用侧这层保证即使反代配置写漏，面板也不是裸的。
+注意：反代域名自己若叠了 `auth_basic`，看到的仍是浏览器原生弹框——要站内登录页就别在反代层开 Basic，交给应用这层。
 
 ## 6. 离线自检（不需要 cookie）
 

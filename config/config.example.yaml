@@ -48,9 +48,14 @@ http:
   port: 9844
   auth:
     enabled: false              # 要反代/暴露到内网时改成 true
-    username: "admin"    # HTTP Basic 用户名
-    # 密码留空 = 不校验。设了密码后，页面与 /api/* 都要带 Basic 或 ?token=<密码>；
+    mode: basic                 # basic = 浏览器弹原生框；form = 站内登录页 /login（反代推荐）
+    username: "admin"    # 登录用户名
+    # 密码留空 = 不校验。设了密码后，页面与 /api/* 都要带凭据；
+    #   mode=basic：浏览器弹原生 Basic 框，脚本用 -u user:pass 或 ?token=<密码>
+    #   mode=form ：未登录跳 /login（HMAC 签名 Cookie 会话），Basic 与 ?token= 仍是脚本通道
     # /health 始终放行（容器 HEALTHCHECK 用），不受影响
     password: ""
+    session_hours: 72           # 仅 mode=form：登录状态保持多少小时
+    # public_url: "https://up.example.com"   # 可选：登录页底部显示对外地址
 
 log_level: "INFO"

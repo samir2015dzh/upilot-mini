@@ -178,6 +178,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
         失败项重新入队
       </button>
+      <button id="btn-logout" class="mini" title="退出登录" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>
+        <span id="logout-label">退出登录</span>
+      </button>
     </div>
   </header>
 
@@ -321,6 +325,10 @@ function render(d){
   $("#env-pill").innerHTML = d.dry_run
     ? '<span class="dot amber"></span>dry-run 离线自检 · 数字为模拟'
     : '<span class="dot"></span>在线运行';
+  const au = d.auth || {};
+  const useSession = !!(au.enabled && au.mode === "form");
+  $("#btn-logout").style.display = useSession ? "" : "none";
+  if (useSession) $("#logout-label").textContent = "退出 " + (au.user || "");
   $("#s-total").textContent = st.total?.count ?? 0;
   $("#s-total-size").textContent = "合计 " + fmtBytes(st.total?.bytes);
   $("#s-done").textContent = done;
@@ -435,6 +443,7 @@ function render(d){
 async function refresh(){
   try{
     const r = await fetch("/api/status", {cache:"no-store"});
+    if (r.status === 401) { location.href = "/login"; return; }
     const d = await r.json();
     window.__last = d;
     render(d);
@@ -455,6 +464,7 @@ async function act(path, label){
   }catch(e){ toast("操作失败：" + e); }
 }
 
+$("#btn-logout").onclick = () => { location.href = "/logout"; };
 $("#btn-scan").onclick = () => act("/api/scan", "已触发扫描");
 $("#btn-retry").onclick = () => act("/api/retry-now", "已提前重试");
 $("#btn-requeue").onclick = () => act("/api/requeue", "已重新入队");
