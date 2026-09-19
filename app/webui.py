@@ -307,9 +307,10 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         token = QR_SESSION["token"]
         app = str(QR_SESSION.get("app") or "web")
         try:
-            # 115 的 /get/status/ 是长轮询（约 30 秒才回一次），给个短超时：
-            # 超时就当“还没扫”，免得前端轮询被拖死。
-            resp = P115Client.login_qrcode_scan_status(token, timeout=12)
+            # 115 的 /get/status/ 是长轮询：有状态变化会立刻返回，空闲时才会一直挂着。
+            # 给 5 秒读超时（底层默认还会重试，总耗时约 15 秒），超时按“还没扫”处理，
+            # 这样扫码后最多十几秒就能看到状态变化，前端也不会被拖住。
+            resp = P115Client.login_qrcode_scan_status(token, timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.debug("扫码状态长轮询超时，按未扫描处理：%s", exc)
             return {"status": "waiting", "message": "等待扫码…"}
