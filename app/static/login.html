@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow" />
 <title>登录 · UPilot-mini</title>
 <style>
-  /* 与仪表盘同一套设计语言：同样的色板变量、卡片、圆角、渐变主按钮、pill、hint */
+  /* 与仪表盘同一套设计语言：同样的色板变量、卡片、圆角、渐变主按钮、pill */
   :root{
     --bg:#08090d; --panel:rgba(255,255,255,.035); --panel-2:rgba(255,255,255,.07);
     --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.15);
@@ -67,13 +67,6 @@
     font-size:12.5px;color:#fecdd3;background:rgba(251,113,133,.09);border:1px solid rgba(251,113,133,.3)}
   .err svg{width:15px;height:15px;flex:none}
 
-  .hint{display:flex;gap:8px;align-items:flex-start;margin-top:15px;padding:8px 10px;
-    font-size:12px;color:var(--muted);background:rgba(255,255,255,.03);
-    border:1px solid var(--line);border-radius:10px;line-height:1.5}
-  .hint svg{width:14px;height:14px;flex:none;opacity:.85;margin-top:2px}
-  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
-    background:rgba(255,255,255,.10);border:1px solid var(--line-2);border-radius:6px;
-    padding:1px 5px;color:#a5b4fc}
   .site{margin-top:12px;text-align:center;color:var(--dim);font-size:11.5px;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
   @media (max-width:420px){form{padding:18px}}
@@ -112,12 +105,6 @@
     登录
   </button>
 
-  <div class="hint">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-      <circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16h.01"/>
-    </svg>
-    <span>登录状态在本机浏览器保持数天 · 连续输错会被短暂锁定 · 也可用 <code>?token=</code> 给脚本走</span>
-  </div>
 
   {{SITE_BLOCK}}
 </form>
