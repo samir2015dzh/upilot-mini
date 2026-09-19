@@ -149,7 +149,7 @@ FIELD_GROUPS: list[dict] = [
          "hint": "只读挂载进容器的目录，改这里要跟 compose 的冒号左边保持一致"},
         {"key": "paths.target_root", "label": "115 目标根目录", "type": "text",
          "hint": "没被下面映射命中的文件，云端结构 = 它 + 本地相对路径"},
-        {"key": "paths.map", "label": "本机 → 115 目录映射", "type": "map", "rows": 6,
+        {"key": "paths.map", "label": "本机 → 115 目录映射", "type": "map", "rows": 9,
          "hint": "每行一条：本机相对路径 => 115 目录。例 TVs => /TVs｜Movies/Others => /Movies/Others｜Anime => /OtherAnime（可改名、大小写照写）。命中时取最长前缀，其下结构原样保留"},
     ]},
     {"title": "115 账号", "fields": [
