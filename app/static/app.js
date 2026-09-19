@@ -416,14 +416,14 @@ function qrSetState(st, msg) {
 }
 
 async function qrStart() {
-  clearInterval(qrTimer);
+  clearTimeout(qrTimer);
   $("#qr-state").textContent = "申请中…";
   $("#qr-msg").textContent = "正在向 115 申请二维码…";
   try {
     await post("/api/p115/qrcode");
     $("#qr-canvas").innerHTML = `<img src="/api/p115/qrcode.png?t=${Date.now()}" alt="115 登录二维码" />`;
     qrSetState("waiting", "请用 115 官方 App 扫码（二维码约 5 分钟内有效）");
-    qrTimer = setInterval(qrPoll, 2000);
+    qrKick();
   } catch (e) {
     $("#qr-state").textContent = "出错";
     $("#qr-msg").textContent = "申请二维码失败：" + e.message;
@@ -436,21 +436,29 @@ async function qrPoll() {
     const st = j.status || "idle";
     qrSetState(st, j.message || "");
     if (st === "done") {
-      clearInterval(qrTimer);
+      clearTimeout(qrTimer);
       $("#qr-canvas").innerHTML = '<span class="ok">已登录 115</span>';
       toast(j.message || "115 登录成功");
       loadConfig(); refreshOverview();
-    } else if (st === "expired" || st === "error") {
-      clearInterval(qrTimer);
+      return false;
     }
+    if (st === "expired" || st === "error") { clearTimeout(qrTimer); return false; }
+    return true;
   } catch (e) {
-    clearInterval(qrTimer);
+    clearTimeout(qrTimer);
     $("#qr-msg").textContent = "状态查询失败：" + e.message;
+    return false;
   }
 }
 
+function qrKick() {
+  // 串行轮询：上一次请求回来后再等 2.5 秒发下一次（115 的状态接口是长轮询，不能并发压）
+  clearTimeout(qrTimer);
+  qrTimer = setTimeout(async () => { if (await qrPoll()) qrKick(); }, 2500);
+}
+
 function qrCancel() {
-  clearInterval(qrTimer);
+  clearTimeout(qrTimer);
   qrSetState("idle", "已取消。需要时点「获取二维码」重新开始。");
   $("#qr-canvas").innerHTML = '<span class="dim">点右侧按钮获取二维码</span>';
 }

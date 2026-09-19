@@ -276,17 +276,23 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
 
     # ---------- 115 扫码登录（设置页里的「获取二维码」） ----------
     def qr_start() -> dict:
-        """申请二维码：token → PNG 字节，存内存等前端轮询。"""
+        """申请二维码：token → PNG 字节，存内存等前端轮询。
+
+        115 只对部分 app 返回真二维码图片（web / windows / linux 实测有效，
+        qandroid / android / ios 会返回一张 HTML 错误页），所以扫码链路固定用
+        web 身份；上传客户端仍然按配置里的 p115.app 走，两者互不影响。
+        """
         from p115client import P115Client
 
-        app = str((cfg.get("p115") or {}).get("app") or "qandroid")
-        token = P115Client.login_qrcode_token(app=app)
+        token = P115Client.login_qrcode_token(app="web")
         data = token.get("data") if isinstance(token, dict) else None
         if not data or not data.get("uid"):
             raise RuntimeError(f"115 未返回二维码：{str(token)[:160]}")
-        png = P115Client.login_qrcode(data, app=app)
+        png = P115Client.login_qrcode(data, app="web")
+        if not isinstance(png, (bytes, bytearray)) or not bytes(png).startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError(f"115 返回的不是 PNG 二维码（{str(png)[:120]}）")
         QR_SESSION.clear()
-        QR_SESSION.update({"token": data, "png": png, "ts": time.time(), "app": app})
+        QR_SESSION.update({"token": data, "png": bytes(png), "ts": time.time(), "app": "web"})
         return {"status": "waiting", "message": "请用 115 官方 App 扫码"}
 
     def qr_poll() -> dict:
@@ -299,17 +305,29 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             QR_SESSION.clear()
             return {"status": "expired", "message": "二维码已过期，请重新获取"}
         token = QR_SESSION["token"]
-        app = str(QR_SESSION.get("app") or "qandroid")
-        resp = P115Client.login_qrcode_scan_status(token)
+        app = str(QR_SESSION.get("app") or "web")
+        try:
+            # 115 的 /get/status/ 是长轮询（约 30 秒才回一次），给个短超时：
+            # 超时就当“还没扫”，免得前端轮询被拖死。
+            resp = P115Client.login_qrcode_scan_status(token, timeout=12)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("扫码状态长轮询超时，按未扫描处理：%s", exc)
+            return {"status": "waiting", "message": "等待扫码…"}
         rdata = (resp.get("data") or {}) if isinstance(resp, dict) else {}
-        status = rdata.get("status")
+        resp_state = resp.get("state") if isinstance(resp, dict) else None
+        if resp_state in (0, False, "0"):
+            return {"status": "expired",
+                    "message": str(resp.get("message") or "二维码已失效，请重新获取")}
+        try:
+            status = int(rdata.get("status"))
+        except (TypeError, ValueError):
+            status = -1
         if status == 0:
             return {"status": "waiting", "message": "请用 115 官方 App 扫码"}
         if status == 1:
             return {"status": "scanned", "message": "已扫码，请在手机上点确认"}
         if status != 2:
-            return {"status": "expired",
-                    "message": str((resp or {}).get("message") or "二维码已失效，请重新获取")}
+            return {"status": "waiting", "message": "等待扫码…"}
         uid = str(rdata.get("uid") or (token or {}).get("uid") or "")
         result = P115Client.login_qrcode_scan_result(uid, app=app)
         cookie = ((result.get("data") or {}) if isinstance(result, dict) else {}).get("cookie")
