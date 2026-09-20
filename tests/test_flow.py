@@ -860,9 +860,51 @@ async def case_cleanup_previous_versions():
         assert rc.deleted == ["888"], rc.deleted        # 只删旧版，绝不碰刚上传那条
         assert res["deleted"] == [dv_name], res
 
+        # 7b) 真机实测：秒传落库的 file_id 是 pickcode（abcd0demo0pick001），列表里的 fid 是数字串，
+        #     所以排除必须同时认 fid / pc / file_id 三栏，否则这道护栏等于没有
+        class _PickcodeCloud:
+            def __init__(self):
+                self.deleted: list[str] = []
+
+            async def list_dir(self, pid):
+                return [{"n": nov_name, "fid": "1000000000000000013", "pc": "abcd0demo0pick001",
+                         "s": 3 * 1024 * 1024, "ico": "mkv"},                 # 刚上传那条（无 s 缺失，靠 pc 认）
+                        {"n": dv_name, "fid": "1000000000000000014", "pc": "abcd0demo0pick004",
+                         "s": 5 * 1024 * 1024, "ico": "mkv"}]
+
+            async def delete_file(self, fid):
+                self.deleted.append(fid)
+                return True
+
+        pc_cloud = _PickcodeCloud()
+        res_pc = await p115mod.P115.cleanup_previous(pc_cloud, 1, nov_name, 0, 3,
+                                                    keep_fid="abcd0demo0pick001")
+        assert pc_cloud.deleted == ["1000000000000000014"], pc_cloud.deleted
+        assert res_pc["deleted"] == [dv_name], res_pc
+
+        # 8) 115 文档要求 fs_delete 不得并发执行：并发删除由实例锁串行化（这里走真代码路径）
+        class _SlowClient:
+            def __init__(self):
+                self.inflight = 0
+                self.peak = 0
+
+            async def fs_delete(self, payload, async_=True):
+                self.inflight += 1
+                self.peak = max(self.peak, self.inflight)
+                await asyncio.sleep(0.05)
+                self.inflight -= 1
+                return {"state": True}
+
+        shell = p115mod.P115.__new__(p115mod.P115)
+        shell.client = _SlowClient()
+        shell._delete_lock = asyncio.Lock()
+        await asyncio.gather(shell.delete_file("1"), shell.delete_file("2"), shell.delete_file("3"))
+        assert shell.client.peak == 1, f"fs_delete 被并发调用了（峰值 {shell.client.peak}）"
+
         PASS.append("[18] 洗板清理：带 DV 的旧版进回收站并留痕；开关关着/不同集/非视频/"
                     "别的剧都不动；同集旧版超过上限整体跳过；新版认不出季集也不猜；"
-                    "list_dir 只收文件（文件夹条目滤掉）+ 走缓存；新版被 115 改名也靠 file_id 排除")
+                    "list_dir 只收文件（文件夹条目滤掉）+ 走缓存；新版被改名时按 fid 或 "
+                    "pickcode 排除；fs_delete 不并发（实例锁串行化）")
     finally:
         for t in tmps:
             shutil.rmtree(t, ignore_errors=True)

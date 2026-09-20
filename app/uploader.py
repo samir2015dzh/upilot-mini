@@ -158,8 +158,8 @@ class Uploader:
             size = os.path.getsize(local_path)
         except OSError:
             size = 0
-        # 刚上传那条的 115 file_id（秒传/分块成功时已落库）——比文件名可靠：
-        # 115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
+        # 刚上传那条的标识（秒传/分块成功时已落库；实测是 115 的 pickcode，形如 abcd0demo0pick001）——
+        # 比文件名可靠：115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
         cur = self.store.get(local_path) or {}
         keep_fid = str(cur.get("file_id") or "")
         try:

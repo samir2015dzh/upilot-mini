@@ -165,6 +165,9 @@ class P115:
         # 洗板清理是「一个文件列一次目录」，整季下载会连打，所以加 TTL 复用。
         self._dir_cache: dict[int, tuple[list, float]] = {}
         self._dir_cache_ttl = 30.0
+        # 115 的 fs_delete 文档明确要求「不要并发执行」（删除与从回收站还原互斥），
+        # 而 upload.concurrency 允许两个文件同时走到清理，所以删除必须串行化。
+        self._delete_lock = asyncio.Lock()
 
     # ---------- 节流 + 瞬态重试 ----------
 
@@ -260,16 +263,22 @@ class P115:
         return out
 
     async def delete_file(self, file_id) -> bool:
-        """把文件移进 115 回收站（可恢复，非物理删除）。"""
-        resp = await self.client.fs_delete({"fid": str(file_id)}, async_=True)
+        """把文件移进 115 回收站（`/rb/delete`，可恢复，非物理删除）。
+
+        115 的接口文档明确要求「不要并发执行」（删除与从回收站还原互斥），
+        而 upload.concurrency 允许两个文件同时走到清理，所以用实例锁串行化。
+        """
+        async with self._delete_lock:
+            resp = await self.client.fs_delete({"fid": str(file_id)}, async_=True)
         return bool(isinstance(resp, dict) and resp.get("state"))
 
     async def cleanup_previous(self, pid: int, keep_name: str, keep_size: int,
                                max_delete: int, keep_fid: str = "") -> dict:
         """洗板清理：同一集只留刚上传那条，其余同集旧版本移进回收站。
 
-        三道「别动它」：file_id 命中（最可靠，115 同名时会给新版改名）、文件名完全相同、
-        大小完全相同（后两道是为改名的情形兜底）。
+        三道「别动它」：标识命中（最可靠，见下）、文件名完全相同、大小完全相同。
+        标识那道要注意：秒传落库的 file_id 实测是 **pickcode**（形如 abcd0demo0pick001），
+        而目录条目里的 `fid` 是数字串 —— 所以必须同时比对 `fid` / `pc` / `file_id`。
         返回 {"deleted": [文件名…], "note": 说明}；认不出季集 / 没有旧版本 / 多于上限都只回说明。
         """
         key = episode_key(keep_name)
@@ -285,8 +294,11 @@ class P115:
             fid = row.get("fid") or row.get("file_id")
             if not name or fid in (None, ""):
                 continue                                 # list_dir 已滤掉目录，这里再兜一层
-            if keep_fid and str(fid) == keep_fid:
-                continue                                 # 刚上传那条（按 id，最可靠）
+            if keep_fid:
+                marks = {str(row.get(k)) for k in ("fid", "pc", "file_id")
+                         if row.get(k) not in (None, "")}
+                if keep_fid in marks:
+                    continue                             # 刚上传那条（按标识，最可靠）
             if name == keep_name:
                 continue                                 # 刚上传那条（按名字）
             if episode_key(name) != key:
