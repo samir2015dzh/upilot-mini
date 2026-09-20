@@ -282,12 +282,12 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         所以挑一个自己平时不用的端，就不会把手机/网页版挤下线。换槽位 = 换一个身份。
         """
         app = str(app or (cfg.get("p115") or {}).get("app") or "web").strip()
+        if app in cfgmod.QR_UNSUPPORTED:                  # 老配置里遗留的槽位：115 只回一张 HTML 跳转页
+            ok = "、".join(x["label"] for x in cfgmod.QR_SUPPORTED[:4])
+            raise RuntimeError(f"{cfgmod.app_label(app)} 已经被 115 停用（取不到二维码图片），"
+                               f"去「登录槽位」里换一个：{ok} …")
         if app not in cfgmod.APP_VALUES:                  # 白名单，别把任意值塞进 URL
             raise RuntimeError(f"不支持的登录槽位：{app}")
-        if app in cfgmod.QR_UNSUPPORTED:                  # 实测：这些槽位 115 只回一张 HTML 跳转页
-            ok = "、".join(x["label"] for x in cfgmod.QR_SUPPORTED[:5])
-            raise RuntimeError(f"{cfgmod.app_label(app)} 取不到二维码图片（115 已改端点），"
-                               f"换一个：{ok} …（面板下拉里排在前面的都能扫）")
         from p115client import P115Client
 
         token = P115Client.login_qrcode_token(app=app)

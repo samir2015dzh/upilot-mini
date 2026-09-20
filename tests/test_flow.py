@@ -394,8 +394,10 @@ def case_settings_map_and_slots():
     assert cfgmod.app_label("qandroid") == "115管理(Android端)"
     assert cfgmod.app_label("ipad") == "115(iPad端)"
     assert "qandroid" in cfgmod.QR_UNSUPPORTED and "115ipad" not in cfgmod.QR_UNSUPPORTED
-    assert all(x.get("qr") in (True, False) for x in cfgmod.APP_OPTIONS), "每个槽位都要标能不能扫码"
-    assert cfgmod.APP_OPTIONS[0]["qr"] is True, "能扫码的槽位要排前面"
+    assert all(x["qr"] is True for x in cfgmod.APP_OPTIONS), "下拉里只留能扫码的槽位"
+    assert not (set(cfgmod.APP_VALUES) & cfgmod.QR_UNSUPPORTED), "已停用的槽位不该出现在下拉里"
+    assert cfgmod.app_label("qandroid") == "115管理(Android端)", "老配置里的槽位仍要能读出中文名"
+    assert len(cfgmod.APP_OPTIONS) == 13, len(cfgmod.APP_OPTIONS)
     try:
         cfgmod.coerce(appf, "不存在的端")
     except ValueError:

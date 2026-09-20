@@ -260,8 +260,13 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
 .dd-btn .chev{width:13px;height:13px;flex:none;opacity:.75;transition:transform .18s ease}
 .dd.on .dd-btn{border-color:rgba(99,102,241,.85);box-shadow:0 0 0 3px rgba(99,102,241,.18);background:rgba(255,255,255,.06)}
 .dd.on .dd-btn .chev{transform:rotate(180deg)}
-.dd-panel{position:absolute;z-index:25;left:0;top:calc(100% + 6px);min-width:100%;
-  width:max-content;max-width:min(460px,92vw);max-height:300px;overflow:auto;
+/* 展开中的下拉必须浮在所有卡片之上：.card/.fg 带 backdrop-filter，各自会成层，
+   光给面板 z-index 是压不住下面那些卡的，所以用 :has() 把当前这张卡整体提上来。 */
+.dd.on{position:relative;z-index:30}
+.card:has(.dd.on),.fg:has(.dd.on){position:relative;z-index:60}
+.dd.up .dd-panel{top:auto;bottom:calc(100% + 6px)}
+.dd-panel{position:absolute;z-index:70;left:0;top:calc(100% + 6px);min-width:100%;
+  width:max-content;max-width:min(460px,92vw);max-height:min(560px,70vh);overflow:auto;
   display:none;padding:6px;border-radius:12px;border:1px solid var(--line-2);background:#171a24;
   box-shadow:0 28px 60px -22px #000,0 0 0 1px rgba(0,0,0,.55)}
 .dd.on .dd-panel{display:block}

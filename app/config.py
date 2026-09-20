@@ -13,7 +13,8 @@ EXAMPLE_PATH = Path("/app/config/config.example.yaml")
 
 # 115 登录槽位（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
 # 用途：扫码/上传都用它当身份，挑一个自己平时不用的端，就不会把手机/网页挤下线。
-# 顺序 = 能否拿到二维码：能出图的排前面，115 已改端点的排最后（面板里会标注）。
+# 只列「实测能拿到二维码」的槽位（115 当前对另外 6 个槽位只回一张 HTML 跳转页，已从下拉里去掉）。
+# 排序即推荐度：iPad 端排第一，多数人平时不在 iPad 上用 115，扫码不会挤掉手机/网页版。
 APP_OPTIONS: list[dict] = [
     {"value": "115ipad", "label": "115(iPad端·旧版)", "qr": True},
     {"value": "ipad", "label": "115(iPad端)", "qr": True},
@@ -28,23 +29,24 @@ APP_OPTIONS: list[dict] = [
     {"value": "windows", "label": "Windows 电脑端", "qr": True},
     {"value": "mac", "label": "macOS 电脑端", "qr": True},
     {"value": "linux", "label": "Linux 电脑端", "qr": True},
-    {"value": "qandroid", "label": "115管理(Android端)", "qr": False},
-    {"value": "qios", "label": "115管理(iOS端)", "qr": False},
-    {"value": "qipad", "label": "115管理(iPad端)", "qr": False},
-    {"value": "android", "label": "115(Android端)", "qr": False},
-    {"value": "ios", "label": "115(iOS端)", "qr": False},
-    {"value": "bandroid", "label": "115生活(Android端)", "qr": False},
 ]
 APP_VALUES = [x["value"] for x in APP_OPTIONS]
-QR_UNSUPPORTED = {x["value"] for x in APP_OPTIONS if not x.get("qr")}
-QR_SUPPORTED = [x for x in APP_OPTIONS if x.get("qr")]
+QR_SUPPORTED = list(APP_OPTIONS)
+
+# 115 已改端点、取不到二维码的槽位：不再出现在下拉里；老 config.yaml 里若还写着它们，
+# 扫码时给一句可读提示（而不是丢一个 500 栈）。
+REMOVED_APPS = {
+    "qandroid": "115管理(Android端)", "qios": "115管理(iOS端)", "qipad": "115管理(iPad端)",
+    "android": "115(Android端)", "ios": "115(iOS端)", "bandroid": "115生活(Android端)",
+}
+QR_UNSUPPORTED = set(REMOVED_APPS)
 
 
 def app_label(value: str) -> str:
     for item in APP_OPTIONS:
         if item["value"] == value:
             return item["label"]
-    return value
+    return REMOVED_APPS.get(value, value)
 
 
 DEFAULTS: dict = {

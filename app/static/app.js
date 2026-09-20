@@ -372,6 +372,24 @@ function renderLimitDd(value) {
   wrap.innerHTML = ddInner(limitOptions(), String(value));
 }
 
+/* 面板默认向下弹；下方空间不够、上方更宽裕时改成向上弹，并按可视空间收高度，
+   免得展开后被页面底边或下面的卡片吃掉。 */
+function openDd(dd) {
+  const btn = dd.querySelector(".dd-btn");
+  const panel = dd.querySelector(".dd-panel");
+  dd.classList.remove("up");
+  if (panel) panel.style.maxHeight = "";
+  dd.classList.add("on");
+  if (!btn || !panel) return;
+  const r = btn.getBoundingClientRect();
+  const below = window.innerHeight - r.bottom - 16;
+  const above = r.top - 16;
+  const want = Math.min(panel.scrollHeight + 12, 560);
+  const goUp = below < want && above > below;
+  dd.classList.toggle("up", goUp);
+  panel.style.maxHeight = Math.max(150, Math.min(560, goUp ? above : below)) + "px";
+}
+
 function ddLabel(options, value) {
   const cur = (options || []).find(o => String((o && typeof o === "object") ? o.value : o) === String(value ?? ""));
   if (!cur) return value || "–";
@@ -587,7 +605,7 @@ function bind() {
       const dd = ddBtn.closest(".dd");
       const wasOn = dd.classList.contains("on");
       document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
-      if (!wasOn) dd.classList.add("on");
+      if (!wasOn) openDd(dd);
       return;
     }
     if (!e.target.closest(".dd")) document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
