@@ -252,6 +252,18 @@ notify:
 
 删了照样能播：播放链路是 symedia 建好的 strm，指向云端那套路径，从 115 直接读，跟本地这份源文件没关系。
 
+前置条件（缺一个都会删不动，实测踩过）：
+
+1. compose 里监控目录必须是 `:rw` 挂载，写成 `:ro` 时容器只能读到 `Read-only file system`
+2. 容器以 uid 1000 运行，而源目录通常是 `root:root 775` —— 光改 `:rw` 还不够，会报 `Permission denied`。给容器用户单独授权（不动属主，可逆）：
+
+```bash
+setfacl -R -m u:1000:rwx /data/media
+setfacl -R -d -m u:1000:rwx /data/media     # 默认 ACL，新下载的文件也继承
+```
+
+撤销用 `setfacl -b -R /data/media`。这两步是宿主侧的，重新部署时会丢，要重做。
+
 护栏都写在代码里，不依赖配置：
 
 - 只删 `paths.source` 监控目录**内部**的文件，路径跑到外面一律跳过并记警告

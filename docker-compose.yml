@@ -14,8 +14,12 @@ services:
       # - /home/<user>/symedia/config:/symedia-config:ro
       # 配置文件 + SQLite 状态（可读可写）
       - ./config:/config
-      # 要监控的媒体目录（挂载点固定为 /media/source，只读即可）
-      - /path/to/your/media:/media/source:ro
+      # 要监控的媒体目录（挂载点固定为 /media/source）
+      # 开了「传完就删掉本地源文件」就必须可写（rw），并且给容器用户 uid 1000 单独授权：
+      #   setfacl -R -m u:1000:rwx /path/to/your/media
+      #   setfacl -R -d -m u:1000:rwx /path/to/your/media   # 新文件也继承
+      # 只读监控（不开删除）时用 :ro 更稳妥
+      - /path/to/your/media:/media/source:rw
     ports:
       # 只在本机开放状态页；不需要可以删掉
       - "127.0.0.1:9844:9844"
