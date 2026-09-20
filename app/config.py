@@ -326,6 +326,8 @@ FIELD_GROUPS: list[dict] = [
 ]
 
 RELOAD_KEYS = {"p115.cookie", "p115.app"}          # 改了要重建 115 客户端
+# 这几段是 Uploader / Notifier 构造时读的：改了就顺手重建，免得非要重启容器才生效
+RELOAD_PREFIXES = ("notify.", "upload.", "retry.")
 RESTART_KEYS = {"http.host", "http.port", "log_level"}   # 改了要重建容器
 
 
@@ -442,7 +444,7 @@ def apply_values(cfg: dict, values: dict, clear_secrets: list | None = None) -> 
             changed.append(key)
     return {
         "changed": changed,
-        "reload": any(k in RELOAD_KEYS for k in changed),
+        "reload": any(k in RELOAD_KEYS or k.startswith(RELOAD_PREFIXES) for k in changed),
         "restart": any(k in RESTART_KEYS for k in changed),
     }
 

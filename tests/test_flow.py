@@ -641,8 +641,16 @@ async def case_notify_webhook():
         assert rec3["status"] == "已上传" and rec3["upload_mode"] == "normal", rec3
         assert not got, got
 
+        # 4) 面板改 notify.* 应当触发重建（否则要重启容器才生效）
+        cfg4 = copy.deepcopy(cfgmod.DEFAULTS)
+        r4 = cfgmod.apply_values(cfg4, {"notify.url": "http://127.0.0.1:9/x"})
+        assert r4["reload"] is True and "notify.url" in r4["changed"], r4
+        r5 = cfgmod.apply_values(copy.deepcopy(cfgmod.DEFAULTS), {"upload.mode": "rapid_then_upload"})
+        assert r5["reload"] is True, r5
+
         PASS.append("[15] Webhook 通知：秒传命中按 CD2 file_notify 契约发 create"
-                    "（路径补前缀、带 auth）；对方不通不影响上传；on=rapid_hit 时上传完成不发")
+                    "（路径补前缀、带 auth）；对方不通不影响上传；on=rapid_hit 时上传完成不发；"
+                    "面板改 notify./upload./retry. 即时重建")
     finally:
         srv.shutdown()
         for d in dirs:
