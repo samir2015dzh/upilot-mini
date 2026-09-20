@@ -55,6 +55,18 @@ retry:
   max_hours: 12                 # 仅 rapid_then_upload：累计超过这么多小时就放弃重试，转普通上传
   long_interval_seconds: 900    # 仅 rapid_only：短间隔用完后改成这个节奏继续等（默认 15 分钟）
 
+notify:
+  # 秒传命中 / 分块上传完成后，通知别的程序（默认按 CloudDrive2 file_notify 契约，
+  # symedia 的「链接同步（Webhook 模式）」认这个格式）
+  enabled: false
+  url: ""                       # 例：http://127.0.0.1:8095/api/v1/webhook/clouddrive2/file_notify
+  query: ""                     # 例：device_name=upilot-mini&user_name=upilot-mini&type=notify
+  path_prefix: ""               # 115 路径前缀，例：/CloudNAS/CloudDrive/115open（symedia 认 CD2 挂载视图）
+  auth: ""                      # 可选：Basic xxx / Bearer xxx
+  on: rapid_hit                 # rapid_hit | uploaded | both
+  timeout: 10
+  retries: 2
+
 state:
   db: "/config/state.db"        # SQLite：SHA1 缓存、断点、状态
 

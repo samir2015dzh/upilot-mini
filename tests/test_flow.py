@@ -557,6 +557,98 @@ async def case_rapid_only_mode():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_notify_webhook():
+    """秒传命中 / 上传完成后，按 CloudDrive2 file_notify 契约通知别的程序。
+
+    symedia 的「链接同步（Webhook 模式）」就是靠这个端点收文件变更事件的，
+    所以 body 必须与 CD2 的一致（action / is_dir / source_file），路径还得换成
+    CD2 挂载视图（path_prefix）。
+    """
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    got: list = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n)
+            try:
+                got.append((self.path, dict(self.headers), _json.loads(raw or b"{}")))
+            except Exception:  # noqa: BLE001
+                got.append((self.path, dict(self.headers), {}))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):  # 关掉测试输出
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    dirs: list[str] = []
+    try:
+        base = {"enabled": True,
+                "url": f"http://127.0.0.1:{port}/api/v1/webhook/clouddrive2/file_notify",
+                "query": "device_name=upilot-mini&user_name=upilot-mini&type=notify",
+                "path_prefix": "/CloudNAS/CloudDrive/115open",
+                "auth": "Basic dTpw", "on": "both", "timeout": 5, "retries": 0}
+
+        # 1) 秒传命中 → 发一条 create 通知，路径补成 CD2 视角
+        cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+        dirs.append(tmp)
+        cfg["paths"]["map"] = [{"from": "TVs", "to": "/TVs"}]
+        cfg["notify"] = dict(base)
+        up = Uploader(cfg, store, mgr)
+        path = write_file(src, "TVs/甲剧 (2026) [tmdbid=100001]/Season 01/E27.mkv", 12 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        rec = await drive(up, store, path, rounds=6)
+        assert rec["status"] == "已上传" and rec["upload_mode"] == "rapid", rec
+        assert len(got) == 1, got
+        p_, hdrs, body = got[0]
+        assert "file_notify" in p_ and "type=notify" in p_, p_
+        assert hdrs.get("Authorization") == "Basic dTpw", hdrs
+        assert body.get("event_category") == "file" and body.get("event_name") == "notify", body
+        item = (body.get("data") or [{}])[0]
+        assert item.get("action") == "create" and item.get("is_dir") == "false", item
+        assert item.get("source_file") == ("/CloudNAS/CloudDrive/115open/TVs/"
+                                          "甲剧 (2026) [tmdbid=100001]/Season 01/E27.mkv"), item
+
+        # 2) 对方打不通 → 上传本身照常成功（通知失败不阻塞、不改状态）
+        got.clear()
+        cfg2, store2, mgr2, up2, tmp2, src2 = make_env(stable_rounds=0, fail_first=0)
+        dirs.append(tmp2)
+        cfg2["notify"] = dict(base, url="http://127.0.0.1:1/nope", retries=0, timeout=2)
+        up2 = Uploader(cfg2, store2, mgr2)
+        p2 = write_file(src2, "小文件/cover.jpg", 512 * 1024)
+        scanner.scan_once(store2, cfg2)
+        rec2 = await drive(up2, store2, p2, rounds=4)
+        assert rec2["status"] == "已上传", rec2
+        assert not got, got
+
+        # 3) on=rapid_hit 时，走分块上传完成不发通知
+        cfg3, store3, mgr3, up3, tmp3, src3 = make_env(stable_rounds=0, fail_first=99,
+                                                       retry_max_count=0)
+        dirs.append(tmp3)
+        cfg3["notify"] = dict(base, on="rapid_hit")
+        up3 = Uploader(cfg3, store3, mgr3)
+        p3 = write_file(src3, "小文件/photo.jpg", 300 * 1024)
+        scanner.scan_once(store3, cfg3)
+        rec3 = await drive(up3, store3, p3, rounds=4)
+        assert rec3["status"] == "已上传" and rec3["upload_mode"] == "normal", rec3
+        assert not got, got
+
+        PASS.append("[15] Webhook 通知：秒传命中按 CD2 file_notify 契约发 create"
+                    "（路径补前缀、带 auth）；对方不通不影响上传；on=rapid_hit 时上传完成不发")
+    finally:
+        srv.shutdown()
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -572,6 +664,7 @@ async def main():
     case_cookie_sync_from_file()
     await case_cid_parse_and_ensure_pid()
     await case_rapid_only_mode()
+    await case_notify_webhook()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

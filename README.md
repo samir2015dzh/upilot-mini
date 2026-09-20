@@ -219,6 +219,28 @@ paths:
 - **挂目录而不是单个文件** —— 对方保存配置时往往是整文件替换，挂单文件会跟丢。
 - 找不到 cookie 时什么都不做（不会把配置写坏）；留空 `p115.cookie_from` 就关掉这个功能。
 
+### 秒传完成后通知别的程序（symedia 联动）
+
+秒传命中（或分块上传完成）后，可以 POST 一个事件给别的程序，让对方立刻处理这个文件。典型用法是
+**symedia 的「链接同步」**：它在 Webhook 模式下靠 `/api/v1/webhook/clouddrive2/file_notify` 收
+CloudDrive2 的文件变更事件，收到就对该文件做目录树同步、生成 strm。我们按同一份契约发
+（`action=create`、`is_dir=false`、`source_file` 是文件路径），symedia 会当成「CD2 报告多了一个文件」来处理。
+
+```yaml
+notify:
+  enabled: true
+  url: "http://127.0.0.1:8095/api/v1/webhook/clouddrive2/file_notify"
+  query: "device_name=upilot-mini&user_name=upilot-mini&type=notify"
+  path_prefix: "/CloudNAS/CloudDrive/115open"   # symedia 认 CD2 挂载视图
+  on: rapid_hit                                 # rapid_hit | uploaded | both
+```
+
+- `path_prefix` 负责把 115 网盘路径换算成对方视角：`/TVs/x.mkv` → `/CloudNAS/CloudDrive/115open/TVs/x.mkv`。
+  这个前缀就是 symedia 某个链接同步任务的「媒体目录」去掉网盘内目录后的那一段（symedia 里能看到）。
+- `on` 默认 `rapid_hit`（只在秒传命中时发）；纯秒传模式下基本都是这条。
+- 通知失败只写日志，**不影响上传本身**；`timeout` / `retries` 可调。
+- 对方要认证就填 `auth`（`Basic xxx` / `Bearer xxx`），会作为 `Authorization` 头带上。
+
 ### 鉴权与反代
 
 面板默认**没有鉴权**（只绑 `127.0.0.1`，外面碰不到）。要反代/暴露到内网，先在 `config.yaml` 打开：

@@ -85,6 +85,24 @@ DEFAULTS: dict = {
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
               "long_interval_seconds": 900},
+    "notify": {
+        # 秒传命中 / 分块上传完成后，POST 一个事件给别的程序。默认按 CloudDrive2 的
+        # file_notify 契约发，symedia 的「链接同步（Webhook 模式）」就认这个格式：
+        #   POST {url}?{query}
+        #   {"device_name":…,"event_category":"file","event_name":"notify",
+        #    "event_time":…,"send_time":…,"data":[{"action":"create","is_dir":"false",
+        #    "source_file":"<path_prefix + 115 路径>","destination_file":""}]}
+        "enabled": False,
+        "url": "",
+        "query": "",
+        # 115 网盘路径 → 对方视角：symedia 认 CD2 挂载路径，例如
+        # /CloudNAS/CloudDrive/115open（那么 /TVs/x.mkv → /CloudNAS/CloudDrive/115open/TVs/x.mkv）
+        "path_prefix": "",
+        "auth": "",                  # 可选：Basic xxx / Bearer xxx
+        "on": "rapid_hit",           # rapid_hit | uploaded | both
+        "timeout": 10,
+        "retries": 2,
+    },
     "state": {"db": "/config/state.db"},
     "http": {
         "enabled": True,
@@ -267,6 +285,25 @@ FIELD_GROUPS: list[dict] = [
          "hint": "短间隔用完后改成这个节奏继续等云端出现同 hash，默认 900（15 分钟）"},
         {"key": "retry.max_hours", "label": "重试最长等待（小时）", "type": "float", "min": 0,
          "hint": "仅「秒传优先」模式生效：累计超过这么多小时就放弃重试，转普通上传"},
+    ]},
+    {"title": "通知别的程序（Webhook）", "fields": [
+        {"key": "notify.enabled", "label": "启用通知", "type": "bool",
+         "hint": "秒传命中 / 分块上传完成后 POST 一个事件给别的程序，让它立刻同步这个文件"},
+        {"key": "notify.url", "label": "通知地址", "type": "text",
+         "hint": "symedia「链接同步」收事件用的端点：http://127.0.0.1:8095/api/v1/webhook/clouddrive2/file_notify"},
+        {"key": "notify.query", "label": "URL 查询串", "type": "text",
+         "hint": "例：device_name=upilot-mini&user_name=upilot-mini&type=notify"},
+        {"key": "notify.path_prefix", "label": "路径前缀（115 → 对方视角）", "type": "text",
+         "hint": "通知里的路径会在 115 网盘路径前面补上它。symedia 认的是 CD2 挂载路径，例 /CloudNAS/CloudDrive/115open"},
+        {"key": "notify.auth", "label": "Authorization 头（可选）", "type": "secret",
+         "hint": "对方要认证时填，如 Basic xxx / Bearer xxx；留空 = 不带"},
+        {"key": "notify.on", "label": "通知时机", "type": "select",
+         "options": [{"value": "rapid_hit", "label": "只在秒传命中时"},
+                     {"value": "uploaded", "label": "只在分块上传完成后"},
+                     {"value": "both", "label": "两者都通知"}],
+         "hint": "纯秒传模式下几乎都是「秒传命中」"},
+        {"key": "notify.timeout", "label": "超时（秒）", "type": "float", "min": 1, "max": 120},
+        {"key": "notify.retries", "label": "失败重试次数", "type": "int", "min": 0, "max": 5},
     ]},
     {"title": "界面与鉴权", "fields": [
         {"key": "http.enabled", "label": "启用 Web 界面", "type": "bool"},

@@ -13,6 +13,7 @@ import logging
 import os
 import time
 
+from notify import Notifier
 from p115 import resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
@@ -62,6 +63,7 @@ class Uploader:
         self.mode = str(up.get("mode") or "rapid_then_upload")
         self.rapid_only = self.mode == "rapid_only"
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
+        self.notifier = Notifier(cfg)
 
     # ---------- 调度 ----------
 
@@ -81,6 +83,16 @@ class Uploader:
                 self._active.discard(path)
 
         asyncio.create_task(run())
+
+    async def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
+        """秒传命中 / 上传完成后通知别的程序（webhook）。任何异常都不影响上传本身。"""
+        if not self.notifier.ready or not self.notifier.should_fire(mode):
+            return
+        cloud_path = f"{cloud_dir.rstrip('/')}/{os.path.basename(local_path)}"
+        try:
+            await asyncio.to_thread(self.notifier.send, cloud_path, mode)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("通知出错（不影响上传）：%s", exc)
 
     def dispatch(self) -> None:
         todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
@@ -139,6 +151,7 @@ class Uploader:
                           message=f"秒传命中 → {cloud_dir}")
                 logger.info("秒传命中：%s → %s（未消耗上行流量）",
                             os.path.basename(path), cloud_dir)
+                await self._notify(cloud_dir, "rapid_hit", path)
                 return
 
             if not self.rapid_only and rec["size"] < self.small_bytes:
@@ -185,6 +198,7 @@ class Uploader:
                       file_id=str((result or {}).get("file_id", "")),
                       message=f"分块上传完成 → {cloud_dir}")
             logger.info("分块上传完成：%s → %s", os.path.basename(path), cloud_dir)
+            await self._notify(cloud_dir, "uploaded", path)
         except Exception as exc:  # noqa: BLE001
             store.set(path, status="错误", message=f"分块上传失败：{exc}")
             logger.error("分块上传失败：%s：%s", path, exc)
