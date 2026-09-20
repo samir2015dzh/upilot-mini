@@ -74,6 +74,7 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                 int(cfg["upload"]["concurrency"]))
 
     last_cookie_sync = 0.0
+    cookie_sig = None        # (mtime_ns, size)：文件没动就连读都不读，只做一次 stat
     try:
         while not stop.is_set():
             try:
@@ -82,15 +83,23 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                 if src and time.monotonic() - last_cookie_sync >= 60:
                     last_cookie_sync = time.monotonic()
                     try:
-                        fresh = cfgmod.load_cookie_from(src)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("读取 cookie 来源失败（%s）：%s", src, exc)
-                        fresh = ""
-                    if fresh and fresh != (cfg["p115"].get("cookie") or ""):
-                        cfg["p115"]["cookie"] = fresh
-                        cfgmod.save(cfg)
-                        state["reload"] = True
-                        logger.info("已从 %s 同步 115 cookie（长度 %d），115 客户端将重建", src, len(fresh))
+                        st = os.stat(src)
+                        sig = (st.st_mtime_ns, st.st_size)
+                    except OSError as exc:
+                        sig = None
+                        logger.debug("cookie 来源读不到（%s）：%s", src, exc)
+                    if sig is not None and sig != cookie_sig:
+                        cookie_sig = sig                      # 只有文件真的变了才解析
+                        try:
+                            fresh = cfgmod.load_cookie_from(src)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("解析 cookie 来源失败（%s）：%s", src, exc)
+                            fresh = ""
+                        if fresh and fresh != (cfg["p115"].get("cookie") or ""):
+                            cfg["p115"]["cookie"] = fresh
+                            cfgmod.save(cfg)
+                            state["reload"] = True
+                            logger.info("已从 %s 同步 115 cookie（长度 %d），115 客户端将重建", src, len(fresh))
                 if state.pop("scan_now", False):
                     logger.info("收到界面指令：立即扫描")
                 if state.pop("reload", False):
