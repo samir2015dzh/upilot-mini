@@ -281,8 +281,8 @@ FIELD_GROUPS: list[dict] = [
                      {"value": "skip", "label": "旧的留着，新的不要"}]},
         {"key": "upload.delete_after_upload", "label": "传完就删掉本地源文件", "type": "bool",
          "danger_note": "删掉就找不回来了，确认 MoviePilot 那边不需要再留着它",
-         "hint": "秒传命中（或分块传完）之后，把监控目录里那个源文件删掉，省地方。\n"
-                 "播放不受影响——symedia 建好 strm 后是直接从云端读的，不碰这个文件。\n"
+         "hint": "秒传命中（或分块传完）之后，把监控目录里那个源文件删掉，省地方。"
+                 "播放不受影响——symedia 建好 strm 后是直接从云端读的，不碰这个文件。"
                  "只删文件本身，不删文件夹；只删监控目录里面的东西。"},
         {"key": "upload.partsize_mb", "label": "上传切多大一块（MB）", "type": "int", "min": 1, "max": 512,
          "advanced": True, "hint": "一般不用改"},
