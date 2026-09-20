@@ -56,6 +56,25 @@ def episode_key(name: str) -> str | None:
     return None
 
 
+def upload_mark(result) -> str:
+    """从 115 的接口响应里取「这条文件在云端的标识」（fid 或 pickcode，有啥取啥）。
+
+    实测：秒传（upload_file_init）返回的是 **pickcode**（形如 abcd0demo0pick001），
+    分块完成的 OSS 回调响应里带的是 `pick_code`/`pickcode`、**没有 file_id** ——
+    不统一在这里取一次，分块路径落库的标识就是空的，「别删刚上传那条」的护栏会缺一道。
+    """
+    if not isinstance(result, dict):
+        return ""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    for cand in (result.get("file_id"), data.get("file_id"),
+                 result.get("id"), data.get("id"),
+                 result.get("pickcode"), data.get("pickcode"),
+                 result.get("pick_code"), data.get("pick_code")):
+        if cand not in (None, "", 0, "0"):
+            return str(cand)
+    return ""
+
+
 def is_transient(exc: Exception) -> bool:
     from urllib.error import HTTPError
     return isinstance(exc, HTTPError) and exc.code in TRANSIENT_HTTP_CODES
@@ -423,7 +442,15 @@ class P115:
                 done.append(part)
 
         result = await up.complete(done, async_=True, headers=headers)
-        return result if isinstance(result, dict) else {"state": True}
+        if not isinstance(result, dict):
+            return {"state": True}
+        # OSS 完成后的 115 回调响应里带的是 pick_code/pickcode、没有 file_id ——
+        # 不补这一手，分块路径落库的标识就是空的，「别删刚上传那条」那道护栏会缺一角
+        if not result.get("file_id"):
+            mark = upload_mark(result)
+            if mark:
+                result["file_id"] = mark
+        return result
 
 
 class StubP115:

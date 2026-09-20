@@ -910,6 +910,22 @@ async def case_cleanup_previous_versions():
             shutil.rmtree(t, ignore_errors=True)
 
 
+def case_upload_mark():
+    """[19] 上传标识解析：秒传给 pickcode、分块回调给 pick_code，都要能取到。"""
+    from p115 import upload_mark as M
+
+    assert M({"state": True, "data": {"file_id": "1000000000000000013"}}) == "1000000000000000013"
+    assert M({"state": True, "pickcode": "abcd0demo0pick001"}) == "abcd0demo0pick001"
+    assert M({"state": True, "data": {"pickcode": "abcd0demo0pick001"}}) == "abcd0demo0pick001"
+    assert M({"state": True, "data": {"pick_code": "abcd0demo0pick001"}}) == "abcd0demo0pick001"
+    assert M({"state": True, "data": {"id": "1000000000000000013"}}) == "1000000000000000013"
+    assert M({"state": True}) == "", "什么都没有时给空串，调用方据此退回名字/大小护栏"
+    assert M({"state": True, "file_id": 0, "data": {"file_id": "0"}}) == "", "0 / '0' 都当没有"
+    assert M(None) == "" and M("x") == ""
+    PASS.append("[19] 上传标识解析：fid / id / pickcode / pick_code 都能取（秒传给前者、"
+                "分块回调给后者），全空或 0 则空串，调用方退回名字+大小护栏")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -928,6 +944,7 @@ async def main():
     await case_notify_webhook()
     await case_delete_after_upload()
     case_episode_key()
+    case_upload_mark()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
