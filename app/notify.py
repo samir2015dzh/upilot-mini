@@ -99,7 +99,9 @@ class Notifier:
         for attempt in range(self.retries + 1):
             try:
                 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                # 内网通知不该走代理：容器里若设了 http_proxy，这里显式绕开
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=self.timeout) as resp:
                     code = resp.status
                     resp.read()
                 if 200 <= code < 300:
