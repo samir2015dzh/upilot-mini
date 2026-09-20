@@ -537,6 +537,63 @@ def case_cookie_sync_from_file():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_cid_parse_and_ensure_pid():
+    """fs_makedirs 两种返回形态都要能解析出 cid。
+
+    线上真实故障：目录已存在时 115 只回 {"data": {"file_id": ...}}，早期只处理
+    data 为路径段列表的情况，导致同一个目录第二次进来就抛「无法解析 cid」。
+    """
+    import p115 as p115mod
+
+    P = p115mod.parse_dir_cid
+    # 形态 1：整条路径新建 → 路径段列表，取最后一段
+    assert P({"state": True, "data": [{"id": "0", "name": "根目录"},
+                                      {"id": "2325467636346843491", "name": "TVs"},
+                                      {"id": "1000000000000000100", "name": "Season 01"}]}) \
+        == 1000000000000000100
+    # 形态 2：目录已存在（线上真实响应）
+    assert P({"state": True, "error": "", "errno": 0,
+              "data": {"file_id": "1000000000000000100", "is_private": "0"}}) == 1000000000000000100
+    # 形态 3：顶层兜底
+    assert P({"state": True, "file_id": "123"}) == 123
+    # 失败 / 认不出来 → None（调用方据此抛错，不把文件丢到根目录）
+    assert P({"state": False, "data": {"file_id": "1"}}) is None
+    assert P({"state": True, "data": {}}) is None
+    assert P({"state": True, "data": []}) is None
+    assert P({}) is None
+
+    # 集成：目录已存在也要拿到 cid，且第二次走缓存不再请求
+    class FakeStore:
+        def __init__(self):
+            self.saved = {}
+
+        def cid_get(self, p):
+            return self.saved.get(p)
+
+        def cid_set(self, p, c):
+            self.saved[p] = c
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        async def fs_makedirs(self, path, async_=True):
+            self.calls.append(path)
+            return {"state": True, "error": "", "errno": 0,
+                    "data": {"file_id": "1000000000000000100", "is_private": "0"}}
+
+    mgr = p115mod.P115.__new__(p115mod.P115)
+    mgr.store, mgr.client = FakeStore(), FakeClient()
+    mgr._cid_mem, mgr._makedirs_lock = {}, asyncio.Lock()
+
+    cloud = "/TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
+    pid1 = await mgr.ensure_pid(cloud)
+    assert pid1 == 1000000000000000100, pid1
+    pid2 = await mgr.ensure_pid(cloud)
+    assert pid2 == pid1 and len(mgr.client.calls) == 1, mgr.client.calls
+    PASS.append("[13] fs_makedirs「目录已存在」响应（dict/file_id）也能解析出 cid，且第二次走缓存")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -550,6 +607,7 @@ async def main():
     await case_dir_mapping()
     case_settings_map_and_slots()
     case_cookie_sync_from_file()
+    await case_cid_parse_and_ensure_pid()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

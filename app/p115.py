@@ -29,6 +29,36 @@ def normalize_cloud_path(p: str) -> str:
     return "/" + "/".join(x for x in (p or "").replace("\\", "/").split("/") if x)
 
 
+def parse_dir_cid(resp) -> int | None:
+    """从 fs_makedirs 的响应里解析目标目录 cid。
+
+    115 同一接口有两种返回形态：
+    - 整条路径新建 → data 是路径段列表，最后一段的 id 就是目标目录；
+    - 目录已存在（没啥可建）→ data 只有一个 {"file_id": "...", "is_private": "0"}。
+    只认第一种的话，同一个目录第二次进来（或目录本来就存在）会直接解析失败，
+    线上表现就是「fs_makedirs 无法解析 cid」反复报错。这里按上游
+    p115_path._parse_cid_from_response 的顺序做三层兜底。
+    """
+    if not isinstance(resp, dict) or resp.get("state") is False:
+        return None
+    data = resp.get("data")
+    cands: list = []
+    if isinstance(data, list) and data and isinstance(data[-1], dict):
+        last = data[-1]
+        cands += [last.get("id"), last.get("cid"), last.get("file_id")]
+    if isinstance(data, dict):
+        cands += [data.get("id"), data.get("cid"), data.get("file_id")]
+    cands += [resp.get("id"), resp.get("cid"), resp.get("file_id")]
+    for cand in cands:
+        if cand is None or cand == "":
+            continue
+        try:
+            return int(cand)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def resolve_upload_target(file_path: str, source_path: str, target_root: str,
                           mapping: list | None = None) -> str:
     """本地相对目录结构 → 115 目标目录。
@@ -135,12 +165,7 @@ class P115:
             if path in self._cid_mem:
                 return self._cid_mem[path]
             resp = await self.client.fs_makedirs(path, async_=True)
-            data = resp.get("data") or []
-            cid = None
-            if isinstance(data, list) and data:
-                last = data[-1]                              # 路径段列表，最后一段是目标目录
-                if isinstance(last, dict):
-                    cid = last.get("id") or last.get("cid")
+            cid = parse_dir_cid(resp)
             if cid is None:
                 raise RuntimeError(f"fs_makedirs 无法解析 cid：{path} / {str(resp)[:200]}")
             cid = int(cid)
