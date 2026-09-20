@@ -5,11 +5,10 @@ p115:
   # 115 账号 cookie，形如 "UID=...; CID=...; SEID=...; KID=..."
   # 留空则可用环境变量 P115_COOKIE 覆盖，或进容器跑：python /app/app/main.py login
   cookie: ""
-  # 登录槽位：扫码登录与上传都用它当身份。挑一个自己平时不用的端，
-  # 扫码就不会把手机上正在用的 115 / 网页版挤下线。可选值（面板里是中文下拉）：
-  #   qandroid 115管理(Android端) | qios 115管理(iOS端) | qipad 115管理(iPad端)
-  #   android/ios/ipad 115(Android/iOS/iPad端) | bandroid 115生活(Android端)
-  #   wechatmini/alipaymini 115生活(微信/支付宝小程序) | tv 115网盘(电视端)
+  # 115 客户端身份：所有 115 请求（目录/秒传/上传）都用它。挑一个自己平时不用的端即可。
+  # 可选值（面板里是中文下拉）：
+  #   115ipad/ipad 115(iPad端) | 115android/115ios 115(Android/iOS端·旧版)
+  #   wechatmini/alipaymini 115生活(微信/支付宝小程序) | tv/apple_tv 115网盘(电视端)
   #   web 网页版 | windows/mac/linux 电脑端 | harmony 鸿蒙端
   app: "115ipad"
 

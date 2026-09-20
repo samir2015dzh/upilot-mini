@@ -394,12 +394,11 @@ def case_settings_map_and_slots():
 
     appf = cfgmod.find_field("p115.app")
     assert appf["type"] == "select" and appf["options"][0]["value"] == "115ipad", appf
-    assert cfgmod.app_label("qandroid") == "115管理(Android端)"
     assert cfgmod.app_label("ipad") == "115(iPad端)"
-    assert "qandroid" in cfgmod.QR_UNSUPPORTED and "115ipad" not in cfgmod.QR_UNSUPPORTED
-    assert all(x["qr"] is True for x in cfgmod.APP_OPTIONS), "下拉里只留能扫码的槽位"
-    assert not (set(cfgmod.APP_VALUES) & cfgmod.QR_UNSUPPORTED), "已停用的槽位不该出现在下拉里"
-    assert cfgmod.app_label("qandroid") == "115管理(Android端)", "老配置里的槽位仍要能读出中文名"
+    assert cfgmod.app_label("qandroid") == "115管理(Android端)", "老配置里的历史槽位仍要能读出中文名"
+    assert all("qr" not in x for x in cfgmod.APP_OPTIONS), "扫码已删除，槽位里不该再有 qr 标记"
+    assert not hasattr(cfgmod, "QR_UNSUPPORTED"), "扫码槽位白名单已随扫码功能一起删除"
+    assert not hasattr(cfgmod, "QR_SUPPORTED"), "扫码槽位白名单已随扫码功能一起删除"
     assert len(cfgmod.APP_OPTIONS) == 13, len(cfgmod.APP_OPTIONS)
     try:
         cfgmod.coerce(appf, "不存在的端")
@@ -407,110 +406,24 @@ def case_settings_map_and_slots():
         pass
     else:
         raise AssertionError("未知登录槽位应被拒")
-    PASS.append("[10] 设置页：映射多行解析/回填、坏行拒绝；登录槽位中文下拉 + 未知值拒绝")
+    PASS.append("[10] 设置页：映射多行解析/回填、坏行拒绝；115 客户端身份中文下拉 + 未知值拒绝")
 
 
 
-async def case_qr_prompt_confirm_flow():
-    """扫码流程：轮询到「已扫码」时要先接应急 prompt.php + slogin.php，再接 status=2 取 cookie。
-
-    115 现行流程少了「网页端接应」这一步，手机 App 就会报「扫描失败」。这条用例把它钉住：
-    调用顺序必须是 token → 二维码图 → status(1) → 建客户端 → prompt → confirm → status(2) → result。
-    """
-    import json
-    import pathlib
-    import types
-
-    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
-    srv = None
-    calls = []
-    box = {"n": 0}
-
-    def token(app="web", **kw):
-        calls.append(("token", app))
-        return {"state": True, "data": {"uid": "U" * 40, "time": "1789000000", "sign": "S" * 32}}
-
-    def qrcode(payload, app="web", **kw):
-        calls.append(("img", app))
-        return b"\x89PNG\r\n\x1a\n" + b"0" * 40
-
-    def scan_status(payload, **kw):
-        box["n"] += 1
-        calls.append(("status", box["n"], str(payload.get("uid"))[:1]))
-        return {"state": True, "data": {"status": 1 if box["n"] == 1 else 2}}
-
-    def scan_result(uid, app="web", **kw):
-        calls.append(("result", app))
-        return {"state": True, "data": {"cookie": {"UID": "u", "CID": "c", "SEID": "s", "KID": "k"}}}
-
-    def fake_qr_api(path, params, timeout=10.0):
-        """替掉真实 HTTP：只记录接应调用，断言 prompt 必须先于 confirm。"""
-        if path.endswith("prompt.php"):
-            calls.append(("prompt", str(params.get("uid"))[:1]))
-            return {"state": True, "data": {"key": "KEY123"}}
-        calls.append(("confirm", params.get("key"), params.get("client")))
-        return {"state": True}
-
-    fake = types.ModuleType("p115client")
-    fake.P115Client = type("P115Client", (), {
-        "login_qrcode_token": staticmethod(token),
-        "login_qrcode": staticmethod(qrcode),
-        "login_qrcode_scan_status": staticmethod(scan_status),
-        "login_qrcode_scan_result": staticmethod(scan_result),
-    })
-
-    def post_json(url, payload):
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-
-    def get_json(url):
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-
-    old_mod = sys.modules.get("p115client")
-    old_path = cfgmod.CONFIG_PATH
-    old_api = webui._qr_api
-    webui._qr_api = fake_qr_api
-    sys.modules["p115client"] = fake
-    try:
-        cfgmod.CONFIG_PATH = pathlib.Path(tmp) / "config.yaml"
-        cfgmod.CONFIG_PATH.write_text('p115:\n  cookie: ""\n  app: "115ipad"\n', encoding="utf-8")
-        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0, "auth": {"enabled": False}}
-        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
-
-        code, body = post_json(base + "/api/p115/qrcode", {})
-        assert code == 200 and b"waiting" in body, (code, body[:120])
-        code, body = get_json(base + "/api/p115/qrcode/status")     # 状态是 GET
-        assert code == 200 and b"scanned" in body, (code, body[:160])
-        code, body = get_json(base + "/api/p115/qrcode/status")
-        assert code == 200 and b"done" in body, (code, body[:160])
-
-        kinds = [c[0] for c in calls]
-        assert kinds == ["token", "img", "status", "prompt", "confirm", "status", "result"], kinds
-        assert ("confirm", "KEY123", 0) in calls, calls
-        text = cfgmod.CONFIG_PATH.read_text(encoding="utf-8")
-        assert "UID=u" in text and "KID=k" in text, text[:200]
-        PASS.append("[11] 扫码流程接应：status=1 时先 prompt.php 再 slogin.php → status=2 → 取 cookie；"
-                    "顺序 " + " → ".join(kinds))
-    finally:
-        if srv is not None:
-            srv.shutdown()
-        cfgmod.CONFIG_PATH = old_path
-        webui._qr_api = old_api
-        if old_mod is not None:
-            sys.modules["p115client"] = old_mod
-        else:
-            sys.modules.pop("p115client", None)
-        shutil.rmtree(tmp, ignore_errors=True)
+def case_qr_removed():
+    """扫码登录已删除：相关接口、内存会话、配置常量都不该再存在。"""
+    assert not hasattr(webui, "_qr_api"), "扫码接应函数应已删除"
+    assert not hasattr(webui, "QR_SESSION"), "扫码会话应已删除"
+    assert not hasattr(webui, "QR_TTL"), "扫码会话应已删除"
+    for dead in ("qr_start", "qr_poll", "qrSetState", "qrKick", "qrCancel"):
+        assert dead not in open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read(), dead
+    html = open(os.path.join(APP, "static", "index.html"), encoding="utf-8").read()
+    for dead in ("115 扫码登录", "qr-canvas", "btn-qr-start", "获取二维码"):
+        assert dead not in html, dead
+    css = open(os.path.join(APP, "static", "app.css"), encoding="utf-8").read()
+    assert "#qr-canvas" not in css and ".qrsteps" not in css and ".qrmsg" not in css
+    PASS.append("[11] 扫码登录已删除：/api/p115/qrcode*、QR_SESSION、_qr_api、"
+                "前端卡片与样式全部清掉，只留「填 cookie / 跟别人同步 cookie」两条路")
 
 
 
@@ -653,7 +566,7 @@ async def main():
     await case_scan_suffix_and_dir_filter()
     await case_http_auth()
     await case_form_auth()
-    await case_qr_prompt_confirm_flow()
+    case_qr_removed()
     await case_dir_mapping()
     case_settings_map_and_slots()
     case_cookie_sync_from_file()

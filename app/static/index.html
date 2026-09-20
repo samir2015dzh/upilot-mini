@@ -202,30 +202,6 @@
     </div>
     <div id="settings-msg"></div>
 
-    <div class="card" style="margin-top:14px">
-      <h2>115 扫码登录 <span class="pill" id="qr-state">未开始</span>
-        <span class="pill" id="qr-slot">槽位 –</span></h2>
-      <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
-        <div id="qr-canvas"><span class="dim">点右侧按钮获取二维码</span></div>
-        <div style="flex:1;min-width:280px">
-          <div class="fieldline">
-            <span class="fieldline-label">登录槽位</span>
-            <div id="qr-app" class="dd" data-role="qr-slot" data-value=""></div>
-          </div>
-          <div class="btns" style="margin-bottom:12px">
-            <button id="btn-qr-start" class="primary">获取二维码</button>
-            <button id="btn-qr-cancel" class="mini">取消</button>
-          </div>
-          <div class="qrmsg" id="qr-msg">扫码用的是所选槽位的登录身份，不会顶掉你手机上正在用的那个端；槽位改动会立刻存进配置。</div>
-        </div>
-        <div class="qrsteps" style="flex:none;width:min(320px,100%)">
-          <div><b>1</b>　选好登录槽位（例如 iPad 端 / 电视端 —— 挑自己平时不用的）</div>
-          <div><b>2</b>　用手机 115 官方 App「扫一扫」扫左边的二维码</div>
-          <div><b>3</b>　手机上点确认，状态变「已登录」，cookie 自动写入并重建客户端</div>
-        </div>
-      </div>
-    </div>
-
     <div class="form-grid" id="settings-groups" style="margin-top:14px"></div>
     <div class="settings-bar" style="margin-top:14px;justify-content:flex-end">
       <span style="color:var(--dim);font-size:12px">带「需重建容器」标记的字段要重建容器才生效</span>

@@ -13,35 +13,30 @@ import yaml
 CONFIG_PATH = Path(os.environ.get("UPILOT_CONFIG", "/config/config.yaml"))
 EXAMPLE_PATH = Path("/app/config/config.example.yaml")
 
-# 115 登录槽位（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
-# 用途：扫码/上传都用它当身份，挑一个自己平时不用的端，就不会把手机/网页挤下线。
-# 只列「实测能拿到二维码」的槽位（115 当前对另外 6 个槽位只回一张 HTML 跳转页，已从下拉里去掉）。
-# 排序即推荐度：iPad 端排第一，多数人平时不在 iPad 上用 115，扫码不会挤掉手机/网页版。
+# 115 客户端身份（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
+# 用途：所有 115 请求（目录 / 秒传 / 上传）都用它当身份，挑一个自己平时不用的端。
 APP_OPTIONS: list[dict] = [
-    {"value": "115ipad", "label": "115(iPad端·旧版)", "qr": True},
-    {"value": "ipad", "label": "115(iPad端)", "qr": True},
-    {"value": "115android", "label": "115(Android端·旧版)", "qr": True},
-    {"value": "115ios", "label": "115(iOS端·旧版)", "qr": True},
-    {"value": "tv", "label": "115网盘(Android电视端)", "qr": True},
-    {"value": "apple_tv", "label": "115网盘(Apple电视端)", "qr": True},
-    {"value": "wechatmini", "label": "115生活(微信小程序)", "qr": True},
-    {"value": "alipaymini", "label": "115生活(支付宝小程序)", "qr": True},
-    {"value": "harmony", "label": "115(鸿蒙端)", "qr": True},
-    {"value": "web", "label": "网页版", "qr": True},
-    {"value": "windows", "label": "Windows 电脑端", "qr": True},
-    {"value": "mac", "label": "macOS 电脑端", "qr": True},
-    {"value": "linux", "label": "Linux 电脑端", "qr": True},
+    {"value": "115ipad", "label": "115(iPad端·旧版)"},
+    {"value": "ipad", "label": "115(iPad端)"},
+    {"value": "115android", "label": "115(Android端·旧版)"},
+    {"value": "115ios", "label": "115(iOS端·旧版)"},
+    {"value": "tv", "label": "115网盘(Android电视端)"},
+    {"value": "apple_tv", "label": "115网盘(Apple电视端)"},
+    {"value": "wechatmini", "label": "115生活(微信小程序)"},
+    {"value": "alipaymini", "label": "115生活(支付宝小程序)"},
+    {"value": "harmony", "label": "115(鸿蒙端)"},
+    {"value": "web", "label": "网页版"},
+    {"value": "windows", "label": "Windows 电脑端"},
+    {"value": "mac", "label": "macOS 电脑端"},
+    {"value": "linux", "label": "Linux 电脑端"},
 ]
 APP_VALUES = [x["value"] for x in APP_OPTIONS]
-QR_SUPPORTED = list(APP_OPTIONS)
 
-# 115 已改端点、取不到二维码的槽位：不再出现在下拉里；老 config.yaml 里若还写着它们，
-# 扫码时给一句可读提示（而不是丢一个 500 栈）。
+# 已经是历史值的旧槽位名：只用于界面上把老配置显示成中文（不再作为可选项）。
 REMOVED_APPS = {
     "qandroid": "115管理(Android端)", "qios": "115管理(iOS端)", "qipad": "115管理(iPad端)",
     "android": "115(Android端)", "ios": "115(iOS端)", "bandroid": "115生活(Android端)",
 }
-QR_UNSUPPORTED = set(REMOVED_APPS)
 
 # 上传模式
 # rapid_only：只用秒传 —— 未命中就排队等，隔一段时间再发一次校验请求，永不普通上传。
@@ -197,7 +192,7 @@ def load_cookie_from(path: str) -> str:
 
 
 def save_cookie(cookie: str) -> None:
-    """扫码登录后写回配置（仅替换 p115.cookie 一行，保留注释）。"""
+    """把 cookie 写回配置（仅替换 p115.cookie 一行，保留注释）。"""
     ensure_config()
     text = CONFIG_PATH.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -232,9 +227,9 @@ FIELD_GROUPS: list[dict] = [
         {"key": "p115.cookie_from", "label": "从别的程序同步 cookie（可选）", "type": "text",
          "hint": "填容器内可见的配置文件路径，例如挂进来的 /symedia-config/config.yaml；"
                  "程序每分钟读一次，发现里面的 115 cookie 变了就自动同步过来并重建客户端"},
-        {"key": "p115.app", "label": "115 登录槽位（扫码与上传都用它）", "type": "select",
+        {"key": "p115.app", "label": "115 客户端身份", "type": "select",
          "options": APP_OPTIONS,
-         "hint": "选一个平时不用的端，扫码时就不会把手机/网页版挤下线；改完保存，扫码卡片会同步"},
+         "hint": "所有 115 请求都用它当身份，挑一个平时不用的端即可（改完保存，会自动重建客户端）"},
     ]},
     {"title": "扫描", "fields": [
         {"key": "scan.interval_seconds", "label": "扫描间隔（秒）", "type": "int", "min": 2, "max": 86400},

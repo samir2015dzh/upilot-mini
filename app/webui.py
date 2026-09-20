@@ -69,24 +69,6 @@ def attach_log_buffer(level: str = "INFO") -> None:
 COOKIE_NAME = "upilot_session"
 DEFAULT_SESSION_HOURS = 72
 
-# 115 扫码登录会话（内存）：{token, png, ts, app}
-def _qr_api(path: str, params: dict, timeout: float = 10.0) -> dict:
-    """直接打 115 的扫码接应接口（prompt.php / slogin.php）。
-
-    这两个接口不需要 cookie，也不能借 P115Client 的实例去调 —— 那个对象一构造就会走登录流程
-    （没有 cookie 时直接抛错），所以这里用标准库自己发请求。
-    """
-    import urllib.parse
-    import urllib.request
-
-    url = "https://qrcodeapi.115.com" + path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-QR_SESSION: dict = {}
-QR_TTL = 300            # 二维码有效期（秒）
 MAX_LOGIN_FAILURES = 5          # 同一来源连续失败次数上限
 LOGIN_LOCK_SECONDS = 60         # 触顶后锁定时长
 
@@ -293,108 +275,6 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         return None
     attach_log_buffer(str(cfg.get("log_level", "INFO")))
 
-    # ---------- 115 扫码登录（设置页里的「获取二维码」） ----------
-    def qr_start(app: str = "") -> dict:
-        """申请二维码：token → PNG 字节，存内存等前端轮询。
-
-        app 就是 p115.app 登录槽位：二维码按该端申请，登录出来的 cookie 也归该端，
-        所以挑一个自己平时不用的端，就不会把手机/网页版挤下线。换槽位 = 换一个身份。
-        """
-        app = str(app or (cfg.get("p115") or {}).get("app") or "web").strip()
-        if app in cfgmod.QR_UNSUPPORTED:                  # 老配置里遗留的槽位：115 只回一张 HTML 跳转页
-            ok = "、".join(x["label"] for x in cfgmod.QR_SUPPORTED[:4])
-            raise RuntimeError(f"{cfgmod.app_label(app)} 已经被 115 停用（取不到二维码图片），"
-                               f"去「登录槽位」里换一个：{ok} …")
-        if app not in cfgmod.APP_VALUES:                  # 白名单，别把任意值塞进 URL
-            raise RuntimeError(f"不支持的登录槽位：{app}")
-        from p115client import P115Client
-
-        token = P115Client.login_qrcode_token(app=app)
-        data = token.get("data") if isinstance(token, dict) else None
-        if not data or not data.get("uid"):
-            raise RuntimeError(f"115 未返回二维码：{str(token)[:160]}")
-        png = P115Client.login_qrcode(data, app=app)
-        if not isinstance(png, (bytes, bytearray)) or not bytes(png).startswith(b"\x89PNG\r\n\x1a\n"):
-            raise RuntimeError(f"{cfgmod.app_label(app)} 这个槽位没给出二维码图片，换一个端再试"
-                               f"（115 返回：{str(png)[:80]}）")
-        QR_SESSION.clear()
-        QR_SESSION.update({"token": data, "png": bytes(png), "ts": time.time(), "app": app})
-        return {"status": "waiting", "app": app, "app_label": cfgmod.app_label(app),
-                "message": f"请用 115 官方 App 扫码（登录槽位：{cfgmod.app_label(app)}）"}
-
-    def qr_poll() -> dict:
-        """查扫码状态；确认后取 cookie 写配置，并请求重建 115 客户端。"""
-        from p115client import P115Client
-
-        if not QR_SESSION:
-            return {"status": "idle", "message": "还没有二维码，点「获取二维码」开始"}
-        if time.time() - float(QR_SESSION.get("ts") or 0) > QR_TTL:
-            QR_SESSION.clear()
-            return {"status": "expired", "message": "二维码已过期，请重新获取"}
-        token = QR_SESSION["token"]
-        app = str(QR_SESSION.get("app") or "web")
-        try:
-            # 115 的 /get/status/ 是长轮询：有状态变化会立刻返回，空闲时才会一直挂着。
-            # 给 5 秒读超时（底层默认还会重试，总耗时约 15 秒），超时按“还没扫”处理，
-            # 这样扫码后最多十几秒就能看到状态变化，前端也不会被拖住。
-            resp = P115Client.login_qrcode_scan_status(token, timeout=12)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("扫码状态长轮询超时，按未扫描处理：%s", exc)
-            return {"status": "waiting", "message": "等待扫码…"}
-        rdata = (resp.get("data") or {}) if isinstance(resp, dict) else {}
-        resp_state = resp.get("state") if isinstance(resp, dict) else None
-        if resp_state in (0, False, "0"):
-            return {"status": "expired",
-                    "message": str(resp.get("message") or "二维码已失效，请重新获取")}
-        try:
-            status = int(rdata.get("status"))
-        except (TypeError, ValueError):
-            status = -1
-        if status == 0:
-            return {"status": "waiting", "message": "请用 115 官方 App 扫码"}
-        if status == 1:
-            # 115 现行扫码流程：手机扫完后，网页端要主动接应 —— 先 GET /api/2.0/prompt.php
-            # 登记这次扫码（拿到 key），再 GET /api/2.0/slogin.php 让手机弹出「确认登录」。
-            # 少了这两步，App 提交后服务端找不到对应的待确认会话，手机上就会报「扫描失败」。
-            # 只接应一次；接应失败也不影响继续轮询（老流程仍可能自己走到 status=2）。
-            uid_hint = str((token or {}).get("uid") or "")
-            note = ""
-            if not QR_SESSION.get("scanned"):
-                QR_SESSION["scanned"] = True
-                try:
-                    scan = _qr_api("/api/2.0/prompt.php", {"uid": uid_hint})
-                    sdata = (scan.get("data") or {}) if isinstance(scan, dict) else {}
-                    key = str(sdata.get("key") or (scan or {}).get("key") or "")
-                    QR_SESSION["key"] = key
-                    if key:
-                        _qr_api("/api/2.0/slogin.php", {"key": key, "uid": uid_hint, "client": 0})
-                        QR_SESSION["confirmed"] = True
-                        logger.info("已接应扫码：prompt.php + slogin.php 都发出（uid 长度 %d）", len(uid_hint))
-                    else:
-                        logger.warning("prompt.php 没返回 key，按老流程继续轮询")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("接应扫码失败（继续按老流程轮询）：%s", exc)
-            if QR_SESSION.get("confirmed"):
-                note = "，手机上应该已经弹出「确认登录」"
-            return {"status": "scanned", "message": "已扫码，请在手机上点确认" + note}
-        if status != 2:
-            return {"status": "waiting", "message": "等待扫码…"}
-        uid = str(rdata.get("uid") or (token or {}).get("uid") or "")
-        result = P115Client.login_qrcode_scan_result(uid, app=app)
-        cookie = ((result.get("data") or {}) if isinstance(result, dict) else {}).get("cookie")
-        if isinstance(cookie, dict):
-            cookie = "; ".join(f"{k}={v}" for k, v in cookie.items())
-        if not cookie:
-            return {"status": "error", "message": f"取 cookie 失败：{str(result)[:200]}"}
-        cfg.setdefault("p115", {})["cookie"] = str(cookie)
-        cfg.setdefault("p115", {})["app"] = app            # cookie 与登录槽位保持一致
-        cfgmod.save(cfg)
-        QR_SESSION.clear()
-        state["reload"] = True
-        state["scan_now"] = True
-        logger.info("界面扫码登录 115 成功（槽位 %s）：cookie 已写入配置并重建客户端", app)
-        return {"status": "done", "app": app, "app_label": cfgmod.app_label(app),
-                "message": f"登录成功（{cfgmod.app_label(app)}），cookie 已写入配置；115 客户端正在重建"}
     index_file = os.path.join(STATIC_DIR, "index.html")
     login_file = os.path.join(STATIC_DIR, "login.html")
 
@@ -453,12 +333,6 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                               extra={"WWW-Authenticate": 'Basic realm="UPilot-mini"'})
 
         # ---- 页面 ----
-        def _qr_png(self) -> bool:
-            png = QR_SESSION.get("png") or b""
-            if not png:
-                return self._send(404, b"no qrcode", "text/plain")
-            return self._send(200, png, "image/png")
-
         def _static(self, name: str) -> bool:
             """只放行白名单里的静态资源，避免目录穿越。"""
             if name not in ("app.css", "app.js", "index.html", "login.html"):
@@ -536,15 +410,6 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 except ValueError:
                     n = 200
                 return self._json({"ok": True, "logs": list(LOG_BUFFER)[-max(1, min(400, n)):]})
-            if path == "/api/p115/qrcode.png":
-                return self._qr_png()
-            if path == "/api/p115/qrcode/status":
-                try:
-                    return self._json({"ok": True, **qr_poll()})
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("扫码状态查询失败：%s", exc)
-                    return self._json({"ok": False, "status": "error",
-                                       "message": f"{type(exc).__name__}: {exc}"[:200]})
             self._send(404, b"not found", "text/plain")
 
         def _body_fields(self) -> dict:
@@ -651,16 +516,6 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     return self._json({"ok": False, "error": f"不认识的动作：{action}"}, 400)
                 logger.info("界面操作 %s → %s", action, target)
                 return self._json({"ok": True, "affected": n, "message": msg})
-            if path == "/api/p115/qrcode":
-                try:
-                    fields = self._body_fields()
-                    info = qr_start(str(fields.get("app") or ""))
-                    logger.info("界面申请 115 扫码登录二维码（槽位 %s）", info.get("app"))
-                    return self._json({"ok": True, **info})
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("申请 115 二维码失败：%s", exc)
-                    return self._json({"ok": False,
-                                       "message": f"{type(exc).__name__}: {exc}"[:200]}, 500)
             if path == "/api/scan":
                 state["scan_now"] = True
                 return self._json({"ok": True, "action": "scan", "message": "已触发扫描"})

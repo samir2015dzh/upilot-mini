@@ -337,29 +337,6 @@ function renderSettings(payload) {
     </div>`).join("");
   $("#cfg-path").textContent = payload.path || "/config/config.yaml";
   $("#settings-msg").innerHTML = "";
-  fillQrApps(groups);
-}
-
-function fillQrApps(groups) {
-  const wrap = $("#qr-app");
-  if (!wrap) return;
-  let f = null;
-  (groups || []).forEach(g => (g.fields || []).forEach(x => { if (x.key === "p115.app") f = x; }));
-  if (!f) return;
-  wrap.dataset.value = f.value ?? "";
-  wrap.innerHTML = ddInner(f.options, f.value);
-  const pill = $("#qr-slot");
-  if (pill) pill.textContent = "槽位 " + ddLabel(f.options, f.value);
-}
-
-async function onSlotChanged(value, label) {
-  const pill = $("#qr-slot");
-  if (pill) pill.textContent = "槽位 " + label;
-  try {
-    await post("/api/config", { values: { "p115.app": value } });
-    toast("登录槽位已改为 " + label + "（点「获取二维码」即用）");
-    loadConfig();                     // 同步「115 账号」里同一个字段
-  } catch (e) { toast("槽位保存失败：" + e.message); }
 }
 
 /* 自定义下拉：原生 <select> 的弹层由系统绘制（Windows 上是白底），配上深色主题的浅色文字就看不清，
@@ -403,9 +380,8 @@ function ddInner(options, value) {
   const items = (options || []).map(o => {
     const v = (o && typeof o === "object") ? o.value : o;
     const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
-    const note = (o && typeof o === "object" && o.qr === false) ? '<span class="note">115 已不支持扫码</span>' : "";
     const on = String(value ?? "") === String(v) ? " on" : "";
-    return `<button type="button" class="dd-opt${on}" data-value="${esc(v)}" data-label="${esc(lb)}"><span class="lb">${esc(lb)}</span>${note}</button>`;
+    return `<button type="button" class="dd-opt${on}" data-value="${esc(v)}" data-label="${esc(lb)}"><span class="lb">${esc(lb)}</span></button>`;
   }).join("");
   return `<button type="button" class="dd-btn"><span class="lb">${esc(ddLabel(options, value))}</span>${DD_CHEV}</button>
     <div class="dd-panel">${items}</div>`;
@@ -481,70 +457,6 @@ async function refreshLogs() {
   } catch (e) { $("#logbox").textContent = "读取日志失败：" + e.message; }
 }
 
-/* ---------------- 115 扫码登录 ---------------- */
-let qrTimer = null;
-const QR_TEXT = { idle: "未开始", waiting: "等待扫码", scanned: "待确认", done: "已登录",
-                  expired: "已过期", error: "出错" };
-const QR_CLASS = { idle: "", waiting: "amber", scanned: "amber", done: "ok", expired: "err", error: "err" };
-
-function qrSetState(st, msg) {
-  const pill = $("#qr-state");
-  pill.textContent = QR_TEXT[st] || st;
-  pill.className = "pill" + (QR_CLASS[st] ? " " + QR_CLASS[st] : "");
-  if (msg) $("#qr-msg").textContent = msg;
-  $("#btn-qr-start").textContent = (st === "waiting" || st === "scanned") ? "刷新二维码" : "获取二维码";
-}
-
-async function qrStart() {
-  clearTimeout(qrTimer);
-  const sel = $("#qr-app");
-  const app = sel ? sel.dataset.value : "";
-  $("#qr-state").textContent = "申请中…";
-  $("#qr-msg").textContent = "正在按所选登录槽位申请二维码…";
-  try {
-    const j = await post("/api/p115/qrcode", { app });
-    $("#qr-canvas").innerHTML = `<img src="/api/p115/qrcode.png?t=${Date.now()}" alt="115 登录二维码" />`;
-    qrSetState("waiting", (j && j.message ? j.message : "请用 115 官方 App 扫码") + "；二维码约 5 分钟内有效");
-    qrKick();
-  } catch (e) {
-    $("#qr-state").textContent = "出错";
-    $("#qr-msg").textContent = "申请二维码失败：" + e.message;
-  }
-}
-
-async function qrPoll() {
-  try {
-    const j = await api("/api/p115/qrcode/status");
-    const st = j.status || "idle";
-    qrSetState(st, j.message || "");
-    if (st === "done") {
-      clearTimeout(qrTimer);
-      $("#qr-canvas").innerHTML = '<span class="ok">已登录 115</span>';
-      toast(j.message || "115 登录成功");
-      loadConfig(); refreshOverview();
-      return false;
-    }
-    if (st === "expired" || st === "error") { clearTimeout(qrTimer); return false; }
-    return true;
-  } catch (e) {
-    clearTimeout(qrTimer);
-    $("#qr-msg").textContent = "状态查询失败：" + e.message;
-    return false;
-  }
-}
-
-function qrKick() {
-  // 串行轮询：上一次请求回来后再等 2.5 秒发下一次（115 的状态接口是长轮询，不能并发压）
-  clearTimeout(qrTimer);
-  qrTimer = setTimeout(async () => { if (await qrPoll()) qrKick(); }, 2500);
-}
-
-function qrCancel() {
-  clearTimeout(qrTimer);
-  qrSetState("idle", "已取消。需要时点「获取二维码」重新开始。");
-  $("#qr-canvas").innerHTML = '<span class="dim">点右侧按钮获取二维码</span>';
-}
-
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
   $("#tab-overview").onclick = () => switchTab("overview");
@@ -586,8 +498,6 @@ function bind() {
   // 设置页
   $("#btn-save-settings").onclick = saveSettings;
   $("#btn-save-settings-bottom").onclick = saveSettings;
-  $("#btn-qr-start").onclick = qrStart;
-  $("#btn-qr-cancel").onclick = qrCancel;
   $("#btn-reload-config").onclick = () => { loadConfig(); toast("已重新读取配置"); };
   $("#btn-refresh-logs").onclick = refreshLogs;
   document.addEventListener("click", (e) => {
@@ -599,8 +509,7 @@ function bind() {
       const lb = dd.querySelector(".dd-btn .lb");
       if (lb) lb.textContent = opt.dataset.label || "";
       dd.classList.remove("on");
-      if (dd.id === "qr-app") onSlotChanged(opt.dataset.value, opt.dataset.label || "");
-      else if (dd.id === "t-limit") { S.tasks.limit = Number(opt.dataset.value); S.tasks.page = 1; loadTasks(); }
+      if (dd.id === "t-limit") { S.tasks.limit = Number(opt.dataset.value); S.tasks.page = 1; loadTasks(); }
       return;
     }
     const ddBtn = e.target.closest(".dd-btn");          // 开/关面板
