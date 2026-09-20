@@ -73,9 +73,24 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                 max(2, int(cfg["scan"]["interval_seconds"])),
                 int(cfg["upload"]["concurrency"]))
 
+    last_cookie_sync = 0.0
     try:
         while not stop.is_set():
             try:
+                # 从外部程序（symedia 之类）同步 115 cookie：最多 60 秒看一次，变了才写盘重建
+                src = str((cfg.get("p115") or {}).get("cookie_from") or "").strip()
+                if src and time.monotonic() - last_cookie_sync >= 60:
+                    last_cookie_sync = time.monotonic()
+                    try:
+                        fresh = cfgmod.load_cookie_from(src)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("读取 cookie 来源失败（%s）：%s", src, exc)
+                        fresh = ""
+                    if fresh and fresh != (cfg["p115"].get("cookie") or ""):
+                        cfg["p115"]["cookie"] = fresh
+                        cfgmod.save(cfg)
+                        state["reload"] = True
+                        logger.info("已从 %s 同步 115 cookie（长度 %d），115 客户端将重建", src, len(fresh))
                 if state.pop("scan_now", False):
                     logger.info("收到界面指令：立即扫描")
                 if state.pop("reload", False):

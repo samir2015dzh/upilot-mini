@@ -190,6 +190,25 @@ paths:
 | `/media/source/Something/杂物/a.bin` | `/something/杂物/a.bin` |
 | `/media/source/Movies/某电影/a.mkv`（未命中） | `/UPILOT-mini/Movies/某电影/a.mkv` |
 
+### 115 cookie 跟着别的程序走（自动同步，可选）
+
+机器上如果还有别的 115 工具在维护 cookie（比如 symedia），可以让 upilot-mini 直接跟着它，
+省得两边各填一次：
+
+```yaml
+# docker-compose.yml
+    volumes:
+      - /home/<user>/symedia/config:/symedia-config:ro     # 把对方的配置目录只读挂进来
+```
+
+然后在设置页「115 账号」组的「从别的程序同步 cookie」里填 `/symedia-config/config.yaml`
+（或直接写进 `config.yaml` 的 `p115.cookie_from`）。之后程序每 60 秒读一次那个文件，发现里面的
+115 cookie 与自己的不一样就自动写进配置并重建 115 客户端，日志会打「已从 … 同步 115 cookie」。
+
+- 支持 yaml / json：会递归找 `UID=…; CID=…; SEID=…; KID=…` 这种字符串，也认 `{UID:…, CID:…}` 这种字典写法。
+- **挂目录而不是单个文件** —— 对方保存配置时往往是整文件替换，挂单文件会跟丢。
+- 找不到 cookie 时什么都不做（不会把配置写坏）；留空 `p115.cookie_from` 就关掉这个功能。
+
 ### 115 扫码登录（面板里直接扫）
 
 设置页顶部有「115 扫码登录」卡片：**先选「登录槽位」**（就是 `p115.app`）→ 点「获取二维码」→

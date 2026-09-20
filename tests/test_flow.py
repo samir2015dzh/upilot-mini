@@ -510,6 +510,33 @@ async def case_qr_prompt_confirm_flow():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def case_cookie_sync_from_file():
+    """从外部程序配置同步 cookie：嵌套 yaml / 字典形式 / JSON 都能抠出来，无关文件返回空。"""
+    tmp = tempfile.mkdtemp(prefix="upilot-ck-")
+    try:
+        p1 = os.path.join(tmp, "a.yaml")
+        with open(p1, "w", encoding="utf-8") as f:
+            f.write('settings_115:\n  - name: x\n    cookies: "UID=1_A; CID=2_B; SEID=3_C; KID=4_D"\n')
+        ck = cfgmod.load_cookie_from(p1)
+        assert ck == "UID=1_A; CID=2_B; SEID=3_C; KID=4_D", ck
+
+        p2 = os.path.join(tmp, "b.json")
+        with open(p2, "w", encoding="utf-8") as f:
+            f.write('{"a": {"cookies": {"UID": "u", "CID": "c", "SEID": "s"}}}')
+        ck2 = cfgmod.load_cookie_from(p2)
+        assert "UID=u" in ck2 and "CID=c" in ck2 and "SEID=s" in ck2, ck2
+
+        p3 = os.path.join(tmp, "c.yaml")
+        with open(p3, "w", encoding="utf-8") as f:
+            f.write("nothing: here\n")
+        assert cfgmod.load_cookie_from(p3) == ""
+        assert cfgmod.find_field("p115.cookie_from") is not None
+        PASS.append("[12] cookie 同步：外部 yaml（嵌套 list/dict）与 json 都能抠出 115 cookie，无关文件返回空")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -522,6 +549,7 @@ async def main():
     await case_qr_prompt_confirm_flow()
     await case_dir_mapping()
     case_settings_map_and_slots()
+    case_cookie_sync_from_file()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

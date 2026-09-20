@@ -6,6 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
+import json
+
 import yaml
 
 CONFIG_PATH = Path(os.environ.get("UPILOT_CONFIG", "/config/config.yaml"))
@@ -50,7 +52,7 @@ def app_label(value: str) -> str:
 
 
 DEFAULTS: dict = {
-    "p115": {"cookie": "", "app": "115ipad"},
+    "p115": {"cookie": "", "app": "115ipad", "cookie_from": ""},
     "paths": {"source": "/media/source", "target_root": "/UPILOT-mini", "map": []},
     "scan": {
         "interval_seconds": 30,
@@ -127,6 +129,59 @@ def load() -> dict:
     return cfg
 
 
+def load_cookie_from(path: str) -> str:
+    """从别的程序的配置文件里抠出 115 cookie（例如 symedia 的 config.yaml）。
+
+    支持 yaml / json；递归找「看起来是 115 cookie」的内容：字符串里同时含 UID= 和 CID=
+    （或含 SEID=），或者是形如 {UID:…, CID:…, SEID:…} 的字典 —— 后者会拼成 cookie 串。
+    找不到返回空串（调用方据此跳过，不会把配置写坏）。
+    """
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    data = None
+    try:
+        data = yaml.safe_load(text)
+    except Exception:  # noqa: BLE001
+        try:
+            data = json.loads(text)
+        except Exception:  # noqa: BLE001
+            data = None
+    hits: list[str] = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif isinstance(o, str) and "UID=" in o and ("CID=" in o or "SEID=" in o):
+            hits.append(o.strip())
+
+    def walk_dict(o):
+        if isinstance(o, dict):
+            keys = {str(k) for k in o}
+            if {"UID", "CID"} <= keys or "SEID" in keys:
+                parts = [f"{k}={o[k]}" for k in ("UID", "CID", "SEID", "KID") if k in o]
+                if parts:
+                    hits.append("; ".join(parts))
+                    return
+            for v in o.values():
+                walk_dict(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk_dict(v)
+
+    if data is not None:
+        walk(data)
+        if not hits:
+            walk_dict(data)
+    if not hits:      # 兜底：直接在文本里找（配置文件语法怪时也能救）
+        m = re.search(r"UID=[^\s\"']{2,}?(?:;\s*(?:CID|KID|SEID)=[^\"']+)+", text)
+        if m:
+            hits.append(m.group(0).strip())
+    return hits[0] if hits else ""
+
+
 def save_cookie(cookie: str) -> None:
     """扫码登录后写回配置（仅替换 p115.cookie 一行，保留注释）。"""
     ensure_config()
@@ -160,6 +215,9 @@ FIELD_GROUPS: list[dict] = [
     {"title": "115 账号", "fields": [
         {"key": "p115.cookie", "label": "115 Cookie", "type": "secret",
          "hint": "留空 = 不改；粘贴完整 cookie 保存即生效（会自动重建 115 客户端）"},
+        {"key": "p115.cookie_from", "label": "从别的程序同步 cookie（可选）", "type": "text",
+         "hint": "填容器内可见的配置文件路径，例如挂进来的 /symedia-config/config.yaml；"
+                 "程序每分钟读一次，发现里面的 115 cookie 变了就自动同步过来并重建客户端"},
         {"key": "p115.app", "label": "115 登录槽位（扫码与上传都用它）", "type": "select",
          "options": APP_OPTIONS,
          "hint": "选一个平时不用的端，扫码时就不会把手机/网页版挤下线；改完保存，扫码卡片会同步"},
