@@ -334,7 +334,34 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         if status == 0:
             return {"status": "waiting", "message": "请用 115 官方 App 扫码"}
         if status == 1:
-            return {"status": "scanned", "message": "已扫码，请在手机上点确认"}
+            # 115 现行扫码流程：手机扫完后，网页端要主动接应 —— 先 GET /api/2.0/prompt.php
+            # 登记这次扫码（拿到 key），再 GET /api/2.0/slogin.php 让手机弹出「确认登录」。
+            # 少了这两步，App 提交后服务端找不到对应的待确认会话，手机上就会报「扫描失败」。
+            # 只接应一次；接应失败也不影响继续轮询（老流程仍可能自己走到 status=2）。
+            uid_hint = str((token or {}).get("uid") or "")
+            note = ""
+            if not QR_SESSION.get("scanned"):
+                QR_SESSION["scanned"] = True
+                try:
+                    # 注意：prompt.php / slogin.php 是实例方法（token/status/result 是静态方法），
+                    # 用类名直接调会把 payload 当成 self，所以这里建一个轻量客户端。
+                    cli = P115Client(app=app)
+                    scan = cli.login_qrcode_scan({"uid": uid_hint}, timeout=8)
+                    sdata = (scan.get("data") or {}) if isinstance(scan, dict) else {}
+                    key = str(sdata.get("key") or (scan or {}).get("key") or "")
+                    QR_SESSION["key"] = key
+                    if key:
+                        cli.login_qrcode_scan_confirm(
+                            {"key": key, "uid": uid_hint, "client": 0}, timeout=8)
+                        QR_SESSION["confirmed"] = True
+                        logger.info("已接应扫码：prompt.php + slogin.php 都发出（uid 长度 %d）", len(uid_hint))
+                    else:
+                        logger.warning("prompt.php 没返回 key，按老流程继续轮询")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("接应扫码失败（继续按老流程轮询）：%s", exc)
+            if QR_SESSION.get("confirmed"):
+                note = "，手机上应该已经弹出「确认登录」"
+            return {"status": "scanned", "message": "已扫码，请在手机上点确认" + note}
         if status != 2:
             return {"status": "waiting", "message": "等待扫码…"}
         uid = str(rdata.get("uid") or (token or {}).get("uid") or "")
