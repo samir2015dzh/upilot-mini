@@ -177,9 +177,12 @@ function renderOverview(d) {
     ["扫描间隔", c.scan_interval + " 秒"],
     ["稳定判定", c.stable_rounds + " 轮"],
     ["并发", c.concurrency + " 个文件"],
+    ["上传模式", c.upload_mode_label || c.upload_mode],
     ["小文件阈值", c.small_file_mb + " MB"],
     ["分块大小", c.partsize_mb + " MB"],
-    ["秒传重试", `${c.retry_interval} 秒 / ${c.retry_max_count} 次 / ${c.retry_max_hours} 小时`],
+    ["秒传重试", c.upload_mode === "rapid_only"
+      ? `${c.retry_interval} 秒 ×${c.retry_max_count} 次 → 之后每 ${c.retry_long_interval} 秒，一直等`
+      : `${c.retry_interval} 秒 / ${c.retry_max_count} 次 / ${c.retry_max_hours} 小时`],
     ["初始化节流", c.init_min_interval + " 秒"],
   ];
   $("#cfg-list").innerHTML = kv.map(([k, v]) =>

@@ -43,6 +43,16 @@ REMOVED_APPS = {
 }
 QR_UNSUPPORTED = set(REMOVED_APPS)
 
+# 上传模式
+# rapid_only：只用秒传 —— 未命中就排队等，隔一段时间再发一次校验请求，永不普通上传。
+#             115 的秒传是全站 hash 索引，热门片源通常过一阵就有人传上云，届时直接命中、零上行。
+# rapid_then_upload：秒传优先，重试耗尽后转普通上传（分块 + 断点续传）。
+UPLOAD_MODES: list[dict] = [
+    {"value": "rapid_only", "label": "纯秒传（只用秒传，绝不普通上传）"},
+    {"value": "rapid_then_upload", "label": "秒传优先（重试耗尽后转普通上传）"},
+]
+UPLOAD_MODE_LABELS = {x["value"]: x["label"] for x in UPLOAD_MODES}
+
 
 def app_label(value: str) -> str:
     for item in APP_OPTIONS:
@@ -68,6 +78,9 @@ DEFAULTS: dict = {
         "ignore_suffixes": [".!qb", ".part", ".tmp", ".downloading", ".crdownload", ".aria2"],
     },
     "upload": {
+        # rapid_only = 只用秒传（云端有同 hash 才收，永不普通上传）
+        # rapid_then_upload = 秒传优先，重试耗尽后转普通上传（断点续传）
+        "mode": "rapid_only",
         "small_file_mb": 10,
         "partsize_mb": 10,
         "concurrency": 2,
@@ -75,7 +88,8 @@ DEFAULTS: dict = {
         "transient_retries": 2,
         "conflict_strategy": "overwrite",
     },
-    "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12},
+    "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
+              "long_interval_seconds": 900},
     "state": {"db": "/config/state.db"},
     "http": {
         "enabled": True,
@@ -235,9 +249,12 @@ FIELD_GROUPS: list[dict] = [
          "hint": "下载中的临时后缀，逗号分隔"},
     ]},
     {"title": "上传", "fields": [
+        {"key": "upload.mode", "label": "上传模式", "type": "select", "options": UPLOAD_MODES,
+         "hint": "纯秒传 = 云端有同 hash 才收，永不普通上传；未命中就排队等，隔一段时间再发一次校验请求。"
+                 "秒传优先 = 重试耗尽后转分块上传"},
         {"key": "upload.concurrency", "label": "并发文件数", "type": "int", "min": 1, "max": 8},
         {"key": "upload.small_file_mb", "label": "小文件阈值（MB）", "type": "float", "min": 0,
-         "hint": "小于它：秒传未命中就直接分块上传，不排队重试"},
+         "hint": "仅「秒传优先」模式生效：小于它，秒传未命中就直接分块上传，不排队重试"},
         {"key": "upload.partsize_mb", "label": "分块大小（MB）", "type": "int", "min": 1, "max": 512},
         {"key": "upload.init_min_interval", "label": "秒传请求最小间隔（秒）", "type": "float", "min": 0},
         {"key": "upload.conflict_strategy", "label": "同名冲突处理", "type": "select",
@@ -245,9 +262,16 @@ FIELD_GROUPS: list[dict] = [
         {"key": "upload.transient_retries", "label": "分块瞬时重试次数", "type": "int", "min": 0, "max": 10},
     ]},
     {"title": "秒传重试", "fields": [
-        {"key": "retry.interval_seconds", "label": "重试间隔（秒）", "type": "int", "min": 1, "max": 86400},
-        {"key": "retry.max_count", "label": "最多重试次数", "type": "int", "min": 0, "max": 100},
-        {"key": "retry.max_hours", "label": "重试最长等待（小时）", "type": "float", "min": 0},
+        {"key": "retry.interval_seconds", "label": "重试间隔（秒）", "type": "int", "min": 1, "max": 86400,
+         "hint": "每轮只重发校验请求，不传任何数据"},
+        {"key": "retry.max_count", "label": "短间隔重试次数", "type": "int", "min": 0, "max": 100,
+         "hint": "纯秒传：前这么多轮用上面的短间隔，之后改用下面的长间隔一直等；"
+                 "秒传优先：超过这个次数即算重试耗尽"},
+        {"key": "retry.long_interval_seconds", "label": "长间隔（秒 · 仅纯秒传）", "type": "int",
+         "min": 1, "max": 86400,
+         "hint": "短间隔用完后改成这个节奏继续等云端出现同 hash，默认 900（15 分钟）"},
+        {"key": "retry.max_hours", "label": "重试最长等待（小时）", "type": "float", "min": 0,
+         "hint": "仅「秒传优先」模式生效：累计超过这么多小时就放弃重试，转普通上传"},
     ]},
     {"title": "界面与鉴权", "fields": [
         {"key": "http.enabled", "label": "启用 Web 界面", "type": "bool"},

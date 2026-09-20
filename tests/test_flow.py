@@ -33,7 +33,8 @@ PASS: list[str] = []
 
 
 def make_env(stable_rounds: int = 1, small_file_mb: float = 10.0, retry_max_count: int = 5,
-             retry_interval: int = 0, fail_first: int = 2):
+             retry_interval: int = 0, fail_first: int = 2, mode: str = "rapid_then_upload",
+             long_interval: int = 0):
     tmp = tempfile.mkdtemp(prefix="upilot-test-")
     src = os.path.join(tmp, "source")
     os.makedirs(src, exist_ok=True)
@@ -45,6 +46,8 @@ def make_env(stable_rounds: int = 1, small_file_mb: float = 10.0, retry_max_coun
     cfg["upload"]["small_file_mb"] = small_file_mb
     cfg["retry"]["interval_seconds"] = retry_interval
     cfg["retry"]["max_count"] = retry_max_count
+    cfg["retry"]["long_interval_seconds"] = long_interval
+    cfg["upload"]["mode"] = mode
     cfg["http"]["enabled"] = False
     store = Store(cfg["state"]["db"])
     mgr = StubP115(cfg, store, fail_first=fail_first)
@@ -594,6 +597,53 @@ async def case_cid_parse_and_ensure_pid():
     PASS.append("[13] fs_makedirs「目录已存在」响应（dict/file_id）也能解析出 cid，且第二次走缓存")
 
 
+async def case_rapid_only_mode():
+    """纯秒传：未命中就排队等，绝不普通上传（小文件也一样）；等云端有同 hash 后零上行命中。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, small_file_mb=10.0,
+                                             retry_interval=60, fail_first=99,
+                                             mode="rapid_only", long_interval=300)
+    try:
+        assert up.rapid_only and up.long_interval == 300, (up.mode, up.long_interval)
+
+        # 1) 小文件（小于 small_file_mb）也不走普通上传，进重试队列等
+        small = write_file(src, "小文件/cover.jpg", 200 * 1024)
+        scanner.scan_once(store, cfg)
+        rec = await drive(up, store, small, rounds=1)
+        assert rec["status"] == "待重试", rec
+        assert rec["retry_count"] == 1 and "纯秒传" in (rec["message"] or ""), rec
+        assert rec["next_retry_at"] > time.time() + 30, rec        # 真在等 60 秒，不是马上重来
+        assert rec["upload_mode"] is None, rec                    # 一次普通上传都没发生过
+
+        # 2) 大文件：短间隔次数用完后转长间隔，继续等（仍然不普通上传）
+        big = write_file(src, "大文件/movie.mkv", 12 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        for _ in range(6):                                        # max_count 默认 5
+            store.set(big, next_retry_at=0)
+            await up._process(big)
+        rb = store.get(big)
+        assert rb["status"] == "待重试" and rb["retry_count"] >= 6, rb
+        assert "300s" in (rb["message"] or ""), rb["message"]     # 已切到长间隔
+        assert rb["upload_mode"] is None, rb
+
+        # 3) 调度器不派发「待上传」；一旦被处理也拉回重试队列
+        store.set(big, status="待上传")
+        up.dispatch()
+        await asyncio.sleep(0.05)
+        assert store.get(big)["status"] == "待上传", store.get(big)   # 纯秒传下不碰它
+        await up._process(big)
+        assert store.get(big)["status"] == "待重试", store.get(big)
+
+        # 4) 云端后来有了同 hash → 零上行命中
+        mgr.fail_first = 0
+        store.set(big, next_retry_at=0, retry_count=0)
+        rec = await drive(up, store, big, rounds=4)
+        assert rec["status"] == "已上传" and rec["upload_mode"] == "rapid", rec
+        PASS.append("[14] 纯秒传：小文件也不普通上传；短间隔用完转长间隔一直等；"
+                    "云端有同 hash 后零上行命中")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -608,6 +658,7 @@ async def main():
     case_settings_map_and_slots()
     case_cookie_sync_from_file()
     await case_cid_parse_and_ensure_pid()
+    await case_rapid_only_mode()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

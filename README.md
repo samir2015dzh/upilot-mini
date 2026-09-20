@@ -91,9 +91,12 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
    ↓
 秒传 upload_file_init(filename/size/sha1/pid)  ← 只发元数据 + 服务端要求的 range 片段
    ├─ 命中（reuse & state 都为真）→ 已上传（不消耗上行流量）
-   ├─ 未命中 & 文件 < small_file_mb → 直接分块上传
+   ├─ upload.mode=rapid_only（默认）→ 未命中一律进「待重试」排队等：
+   │     前 max_count 轮每 interval_seconds 一次，之后每 long_interval_seconds 一次，
+   │     永远只发校验请求，不普通上传、不消耗上行
+   ├─ 未命中 & 文件 < small_file_mb → 直接分块上传      ← 仅 rapid_then_upload
    └─ 未命中 & 大文件 → 待重试（默认 60s 后，最多 max_count 次 / max_hours 小时）
-          每次重试只重发校验请求，不重传数据
+          每次重试只重发校验请求，不重传数据            ← 仅 rapid_then_upload
    ↓
 分块上传（10MB 分块，OSS 多段上传；upload_id / callback / oss_url 落库 → 暂停或重启后从已传分块继续）
 ```
@@ -115,12 +118,23 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `scan.ignore_suffixes` | 见示例 | 下载中的临时后缀 |
 | `scan.include_suffixes` | 见示例（视频扩展名） | 只处理这些扩展名；留空 `[]` 表示不过滤。默认只传视频本体，整库挂进来也不会把 `.strm`/`.nfo`/图片传上去 |
 | `scan.exclude_dirs` | `[]` | 相对监控根目录的路径片段（如 `["Sample","extras"]`），命中则整棵子树跳过 |
-| `upload.small_file_mb` | 10 | 秒传未命中时，小于该值直接上传；大于则先重试秒传 |
+| `upload.mode` | `rapid_only` | `rapid_only` = 只用秒传，未命中就排队等，**永不普通上传**；`rapid_then_upload` = 秒传优先，重试耗尽后转分块上传 |
+| `upload.small_file_mb` | 10 | 仅 `rapid_then_upload`：秒传未命中且小于该值直接上传 |
 | `upload.concurrency` | 2 | 同时在处理的文件数 |
 | `upload.init_min_interval` | 0.5 | 两次初始化请求的最小间隔（防 115 限流 401） |
-| `retry.interval_seconds` | 60 | 秒传重试间隔 |
-| `retry.max_count` / `max_hours` | 5 / 12 | 重试上限，超过转分块上传 |
+| `retry.interval_seconds` | 60 | 秒传重试间隔（每轮只发校验请求） |
+| `retry.max_count` | 5 | `rapid_only`：前 N 轮用短间隔；`rapid_then_upload`：超过即算重试耗尽 |
+| `retry.long_interval_seconds` | 900 | 仅 `rapid_only`：短间隔用完后改成这个节奏继续等 |
+| `retry.max_hours` | 12 | 仅 `rapid_then_upload`：累计超过这么多小时就放弃重试，转分块上传 |
 | `http.enabled` / `port` | true / 9844 | Web 仪表盘与 JSON API |
+
+### 只走秒传（纯秒传模式，默认）
+
+`upload.mode: rapid_only` 时，这条链路**根本没有普通上传**：秒传不命中就把文件放回「待重试」，前 `retry.max_count` 轮每 60 秒发一次校验请求，之后每 15 分钟发一次，一直到云端出现同 hash 为止 —— 全程零上行，一分钱流量不花。
+
+为什么这招管用：115 的秒传是**全站 hash 索引**，不只看你自己的盘。新剧集刚出时云端没有，过一阵别人传上去，你这边下一次校验就直接命中（实测：`甲剧 S01E27 2160p` 1290 MB 秒传命中，零上行）。想手动催一下就在面板点「提前重试秒传」或 `POST /api/retry-now`。
+
+代价：云端一辈子没出现同 hash 的文件，它就一直躺在「待重试」里（不占带宽、不占硬盘，只占一条记录）。想让它最终落地上传，把 `upload.mode` 换回 `rapid_then_upload`。
 
 ## 5. 界面（Web 仪表盘）
 

@@ -254,11 +254,15 @@ def _payload(cfg: dict, store, state: dict) -> dict:
             "stable_rounds": sc["stable_rounds"],
             "concurrency": up["concurrency"],
             "small_file_mb": up["small_file_mb"],
+            "upload_mode": up.get("mode") or "rapid_then_upload",
+            "upload_mode_label": cfgmod.UPLOAD_MODE_LABELS.get(
+                up.get("mode") or "rapid_then_upload", up.get("mode") or ""),
             "partsize_mb": up["partsize_mb"],
             "init_min_interval": up["init_min_interval"],
             "retry_interval": rt["interval_seconds"],
             "retry_max_count": rt["max_count"],
             "retry_max_hours": rt["max_hours"],
+            "retry_long_interval": rt.get("long_interval_seconds") or 900,
             "db": cfg["state"]["db"],
         },
     }
@@ -633,9 +637,13 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     n, msg = 1, "已提前到期，马上重试秒传"
                     state["scan_now"] = True
                 elif action == "upload-now":
-                    n = store.mark_ready(target)
+                    if (cfg["upload"].get("mode") or "") == "rapid_only":
+                        store.set(target, next_retry_at=0)
+                        n, msg = 1, "纯秒传模式：立即重试秒传（不会普通上传）"
+                    else:
+                        n = store.mark_ready(target)
+                        msg = "已跳过等待，立即处理"
                     state["process_one"] = target
-                    msg = "已跳过等待，立即处理"
                 elif action == "delete":
                     n = store.forget(target)
                     msg = "记录已删除（文件本体没动，下次扫描会重新入队）"

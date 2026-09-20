@@ -40,7 +40,10 @@ scan:
   ignore_suffixes: [".!qb", ".part", ".tmp", ".downloading", ".crdownload", ".aria2"]
 
 upload:
-  small_file_mb: 10             # 秒传未命中：小于它直接普通上传；大于它先反复重试秒传
+  # rapid_only        = 只用秒传：云端有同 hash 才收，永不普通上传；未命中就排队等下一轮
+  # rapid_then_upload = 秒传优先：重试耗尽后转普通上传（分块 + 断点续传）
+  mode: rapid_only
+  small_file_mb: 10             # 仅 rapid_then_upload：秒传未命中且小于它 → 直接普通上传
   partsize_mb: 10               # 分块上传分块大小
   concurrency: 2                # 同时处理的文件数
   init_min_interval: 0.5        # 两次秒传/上传初始化之间的最小间隔（防 115 限流）
@@ -48,9 +51,10 @@ upload:
   conflict_strategy: overwrite  # 同名文件：skip / overwrite / overwrite_if_larger
 
 retry:
-  interval_seconds: 60          # 秒传重试间隔（重试只发校验请求，不重传数据）
-  max_count: 5                  # 最多重试次数
-  max_hours: 12                 # 或累计超过这么多小时就放弃重试，转普通上传
+  interval_seconds: 60          # 秒传重试间隔（每轮只发校验请求，不重传数据）
+  max_count: 5                  # rapid_only：前 N 轮用短间隔；rapid_then_upload：超过即算重试耗尽
+  max_hours: 12                 # 仅 rapid_then_upload：累计超过这么多小时就放弃重试，转普通上传
+  long_interval_seconds: 900    # 仅 rapid_only：短间隔用完后改成这个节奏继续等（默认 15 分钟）
 
 state:
   db: "/config/state.db"        # SQLite：SHA1 缓存、断点、状态

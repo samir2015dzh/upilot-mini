@@ -58,6 +58,10 @@ class Uploader:
         self.retry_max_count = int(rt["max_count"])
         self.retry_max_hours = float(rt["max_hours"])
         self.stable_rounds = int(cfg["scan"]["stable_rounds"])
+        # 纯秒传：只发校验请求，命中与否取决于云端 hash 索引；未命中就等下一轮，永不普通上传
+        self.mode = str(up.get("mode") or "rapid_then_upload")
+        self.rapid_only = self.mode == "rapid_only"
+        self.long_interval = int(rt.get("long_interval_seconds") or 900)
 
     # ---------- 调度 ----------
 
@@ -79,7 +83,10 @@ class Uploader:
         asyncio.create_task(run())
 
     def dispatch(self) -> None:
-        for status, due in (("待处理", False), ("待秒传", False), ("待重试", True), ("待上传", False)):
+        todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
+        if not self.rapid_only:
+            todo.append(("待上传", False))            # 纯秒传模式不派发普通上传
+        for status, due in todo:
             for rec in self.store.by_status(status, limit=100, due=due):
                 self.spawn(rec["path"])
 
@@ -91,6 +98,12 @@ class Uploader:
             return
         if not os.path.exists(path):
             self.store.set(path, status="错误", message="源文件已不存在")
+            return
+        if self.rapid_only and rec["status"] == "待上传":
+            # 纯秒传下没有普通上传这条路：历史遗留/手动标记的「待上传」拉回重试队列
+            self.store.set(path, status="待重试", next_retry_at=time.time(),
+                           message="纯秒传模式：不走普通上传，回到秒传重试队列")
+            logger.info("纯秒传：把「待上传」拉回重试队列：%s", os.path.basename(path))
             return
 
         # 1) 预处理：等稳定 + 算 SHA1
@@ -128,7 +141,7 @@ class Uploader:
                             os.path.basename(path), cloud_dir)
                 return
 
-            if rec["size"] < self.small_bytes:
+            if not self.rapid_only and rec["size"] < self.small_bytes:
                 store.set(path, status="待上传",
                           message=f"秒传未命中（{info.get('reason', '')}），小文件直接上传")
                 logger.info("秒传未命中，小文件直接上传：%s", os.path.basename(path))
@@ -138,6 +151,19 @@ class Uploader:
             rc = (cur["retry_count"] or 0) + 1
             first = cur["first_failed_at"] or time.time()
             aged = (time.time() - first) / 3600.0
+
+            if self.rapid_only:
+                # 纯秒传：不设上限、不转普通上传。前 max_count 轮按短间隔试，之后放长间隔一直等
+                # （115 秒传是全站 hash 索引，等别人把同 hash 的片源传上云，这里就能零上行命中）
+                interval = self.retry_interval if rc <= self.retry_max_count else self.long_interval
+                store.set(path, status="待重试", retry_count=rc, first_failed_at=first,
+                          next_retry_at=time.time() + interval,
+                          message=f"纯秒传：未命中（{info.get('reason', '')}），"
+                                  f"{interval}s 后第 {rc} 次校验（只发校验请求）")
+                logger.info("纯秒传：未命中，%ds 后第 %d 次校验：%s",
+                            interval, rc, os.path.basename(path))
+                return
+
             if rc > self.retry_max_count or aged >= self.retry_max_hours:
                 store.set(path, status="待上传", retry_count=rc, first_failed_at=first,
                           message=f"秒传重试耗尽（{rc - 1} 次 / {aged:.1f}h），转普通上传")
