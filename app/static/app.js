@@ -399,7 +399,8 @@ function ddInner(options, value) {
 function fieldHtml(f) {
   const key = esc(f.key), label = esc(f.label || f.key);
   const hint = (f.hint ? `<div class="hintline">${esc(f.hint)}</div>` : "")
-    + (f.note ? `<div class="hintline note">${esc(f.note)}</div>` : "");
+    + (f.note ? `<div class="hintline note">${esc(f.note)}</div>` : "")
+    + (f.danger_note ? `<div class="hintline danger">⚠ ${esc(f.danger_note)}</div>` : "");
   const tag = f.restart ? ' <span class="tag">需重建容器</span>' : "";
   if (f.type === "bool") {
     return `<div class="f">

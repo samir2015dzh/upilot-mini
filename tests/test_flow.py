@@ -34,7 +34,7 @@ PASS: list[str] = []
 
 def make_env(stable_rounds: int = 1, small_file_mb: float = 10.0, retry_max_count: int = 5,
              retry_interval: int = 0, fail_first: int = 2, mode: str = "rapid_then_upload",
-             long_interval: int = 0):
+             long_interval: int = 0, delete_after: bool = False):
     tmp = tempfile.mkdtemp(prefix="upilot-test-")
     src = os.path.join(tmp, "source")
     os.makedirs(src, exist_ok=True)
@@ -48,6 +48,7 @@ def make_env(stable_rounds: int = 1, small_file_mb: float = 10.0, retry_max_coun
     cfg["retry"]["max_count"] = retry_max_count
     cfg["retry"]["long_interval_seconds"] = long_interval
     cfg["upload"]["mode"] = mode
+    cfg["upload"]["delete_after_upload"] = delete_after
     cfg["http"]["enabled"] = False
     store = Store(cfg["state"]["db"])
     mgr = StubP115(cfg, store, fail_first=fail_first)
@@ -668,6 +669,55 @@ async def case_notify_webhook():
             shutil.rmtree(d, ignore_errors=True)
 
 
+async def case_delete_after_upload():
+    """[16] 秒传成功后删掉本地源文件（越界和大小不符两道护栏都要拦住）。"""
+    print("[16] 秒传成功后删除本地源文件")
+    tmps = []
+    try:
+        # 1) 开关打开：秒传命中 → 源文件被清掉，并在记录里留痕
+        cfg, store, mgr, up, tmp, src = make_env(mode="rapid_only", fail_first=0,
+                                                 delete_after=True)
+        tmps.append(tmp)
+        p = write_file(src, "TVs/Show/S01E01.mkv", 3 * 1024 * 1024)
+        scanner.scan_once(store, cfg)      # 第 1 轮：入队
+        scanner.scan_once(store, cfg)      # 第 2 轮：稳定计数到 1
+        rec = await drive(up, store, p)
+        assert rec["status"] == "已上传" and rec["upload_mode"] == "rapid", rec
+        assert not os.path.exists(p), "秒传命中后源文件应该被删掉"
+        assert "已删除本地源文件" in (store.get(p)["message"] or ""), store.get(p)["message"]
+
+        # 2) 开关关着：一个字节都不动
+        cfg2, store2, mgr2, up2, tmp2, src2 = make_env(mode="rapid_only", fail_first=0)
+        tmps.append(tmp2)
+        p2 = write_file(src2, "TVs/Show/S01E02.mkv", 3 * 1024 * 1024)
+        scanner.scan_once(store2, cfg2)
+        scanner.scan_once(store2, cfg2)
+        rec2 = await drive(up2, store2, p2)
+        assert rec2["status"] == "已上传", rec2
+        assert os.path.exists(p2), "开关关着时不该动源文件"
+
+        # 3) 护栏一：监控目录外面的路径一律不删
+        outsider = os.path.join(tmp, "outside.mkv")
+        with open(outsider, "wb") as f:
+            f.write(b"x" * 2048)
+        up._delete_source(outsider, {"size": 2048})
+        assert os.path.exists(outsider), "监控目录外的文件不许动"
+
+        # 4) 护栏二：大小与入库记录不符（说明文件被换过）不删
+        swapped = write_file(src, "TVs/Show/S01E03.mkv", 2048)
+        up._delete_source(swapped, {"size": 999999})
+        assert os.path.exists(swapped), "大小对不上时不许删"
+
+        # 5) 只删文件，不删目录
+        assert os.path.isdir(os.path.join(src, "TVs", "Show")), "目录必须留着"
+
+        PASS.append("[16] 传完删源文件：命中即清、开关关着不动、"
+                    "越界与大小不符都拦住、目录保留")
+    finally:
+        for t in tmps:
+            shutil.rmtree(t, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -684,6 +734,7 @@ async def main():
     await case_cid_parse_and_ensure_pid()
     await case_rapid_only_mode()
     await case_notify_webhook()
+    await case_delete_after_upload()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

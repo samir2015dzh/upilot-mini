@@ -48,6 +48,9 @@ upload:
   init_min_interval: 0.5        # 两次秒传/上传初始化之间的最小间隔（防 115 限流）
   transient_retries: 2          # 401/403/429/5xx 的额外重试次数
   conflict_strategy: overwrite  # 同名文件：skip / overwrite / overwrite_if_larger
+  # 传完就删掉监控目录里的本地源文件（破坏性，默认 false）。
+  # 播放不受影响：symedia 建好 strm 后直接从云端读。只删文件，不删目录。
+  delete_after_upload: false
 
 retry:
   interval_seconds: 60          # 秒传重试间隔（每轮只发校验请求，不重传数据）

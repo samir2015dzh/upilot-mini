@@ -114,6 +114,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `scan.ignore_suffixes` | 见示例 | 下载中的临时后缀 |
 | `scan.include_suffixes` | 见示例（视频扩展名） | 只处理这些扩展名；留空 `[]` 表示不过滤。默认只传视频本体，整库挂进来也不会把 `.strm`/`.nfo`/图片传上去 |
 | `scan.exclude_dirs` | `[]` | 相对监控根目录的路径片段（如 `["Sample","extras"]`），命中则整棵子树跳过 |
+| `upload.delete_after_upload` | `false` | 传完就删掉监控目录里的源文件本体（破坏性，默认关）。播放不受影响——symedia 建好 strm 后是直接从云端读的；只删文件不删目录 |
 | `upload.mode` | `rapid_only` | `rapid_only` = 只用秒传，未命中就排队等，**永不普通上传**；`rapid_then_upload` = 秒传优先，重试耗尽后转分块上传 |
 | `upload.small_file_mb` | 10 | 仅 `rapid_then_upload`：秒传未命中且小于该值直接上传 |
 | `upload.concurrency` | 2 | 同时在处理的文件数 |
@@ -244,6 +245,21 @@ notify:
 - `on` 默认 `rapid_hit`（只在秒传命中时发）；纯秒传模式下基本都是这条。
 - 通知失败只写日志，**不影响上传本身**；`timeout` / `retries` 可调。
 - 对方要认证就填 `auth`（`Basic xxx` / `Bearer xxx`），会作为 `Authorization` 头带上。
+
+### 传完就删掉本地源文件（可选）
+
+`upload.delete_after_upload: true` 时，秒传命中（或分块上传完成）之后会把监控目录里那个源文件删掉，省地方。
+
+删了照样能播：播放链路是 symedia 建好的 strm，指向云端那套路径，从 115 直接读，跟本地这份源文件没关系。
+
+护栏都写在代码里，不依赖配置：
+
+- 只删 `paths.source` 监控目录**内部**的文件，路径跑到外面一律跳过并记警告
+- 大小和入库记录对不上（说明文件被换过）就跳过
+- 只删文件本体，**不删文件夹**
+- 删除失败只记一条警告，上传结果不受影响；成功则在记录里留一句「已删除本地源文件」，任务明细里能看到
+
+面板上也有同一个开关（设置 → 上传 → 传完就删掉本地源文件），带红色提醒。
 
 ### 鉴权与反代
 

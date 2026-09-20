@@ -147,6 +147,7 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .fg details.adv > summary:hover{color:var(--fg)}
 .fg details.adv .f{margin-top:11px}
 .hintline.note{color:#fbbf24}
+.hintline.danger{color:#f87171}
 .pill.amber{color:#fde68a;border-color:rgba(251,191,36,.42)}
 .pill.ok{color:#bbf7d0;border-color:rgba(52,211,153,.42)}
 .pill.err{color:#fecdd3;border-color:rgba(251,113,133,.42)}

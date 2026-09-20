@@ -63,6 +63,8 @@ class Uploader:
         self.mode = str(up.get("mode") or "rapid_then_upload")
         self.rapid_only = self.mode == "rapid_only"
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
+        # 传完就删本地源文件（破坏性操作，默认关）
+        self.delete_after = bool(up.get("delete_after_upload"))
         self.notifier = Notifier(cfg)
         self._bg: set = set()          # 持有后台通知任务的引用，防止跑到一半被回收
 
@@ -111,6 +113,33 @@ class Uploader:
         t = asyncio.create_task(run())
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
+
+    def _delete_source(self, path: str, rec: dict) -> None:
+        """上传成功后删掉监控目录里的源文件本体（文件夹一律保留）。
+
+        护栏：只删监控目录内部的路径；大小和入库记录对不上就跳过（说明文件被换过）；
+        任何失败只记警告，绝不改状态机——上传已经成功了，删除只是收尾。
+        """
+        if not self.delete_after:
+            return
+        try:
+            root = os.path.realpath(str(self.cfg["paths"]["source"])).rstrip(os.sep)
+            real = os.path.realpath(path)
+            if not real.startswith(root + os.sep):
+                logger.warning("不删（不在监控目录内）：%s", path)
+                return
+            if not os.path.isfile(real):
+                return
+            size = int(rec.get("size") or 0)
+            if size and os.path.getsize(real) != size:
+                logger.warning("不删（大小已变，可能被换过）：%s", path)
+                return
+            os.remove(real)
+            logger.info("已删除本地源文件：%s", path)
+            cur = self.store.get(path) or {}
+            self.store.set(path, message=(cur.get("message") or "") + "｜已删除本地源文件")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除本地源文件失败（不影响上传）：%s：%s", path, exc)
 
     def dispatch(self) -> None:
         todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
@@ -170,6 +199,7 @@ class Uploader:
                 logger.info("秒传命中：%s → %s（未消耗上行流量）",
                             os.path.basename(path), cloud_dir)
                 self._notify(cloud_dir, "rapid_hit", path)
+                self._delete_source(path, rec)
                 return
 
             if not self.rapid_only and rec["size"] < self.small_bytes:
@@ -217,6 +247,7 @@ class Uploader:
                       message=f"分块上传完成 → {cloud_dir}")
             logger.info("分块上传完成：%s → %s", os.path.basename(path), cloud_dir)
             self._notify(cloud_dir, "uploaded", path)
+            self._delete_source(path, rec)
         except Exception as exc:  # noqa: BLE001
             store.set(path, status="错误", message=f"分块上传失败：{exc}")
             logger.error("分块上传失败：%s：%s", path, exc)
