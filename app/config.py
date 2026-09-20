@@ -84,6 +84,11 @@ DEFAULTS: dict = {
         "conflict_strategy": "overwrite",
         # 传完就删掉监控目录里的本地源文件（破坏性，默认关）
         "delete_after_upload": False,
+        # 洗板（重下同集不同版本）后，云端同一集只留最新那个（破坏性，默认关）。
+        # 判「同一集」只看 剧名 + SxxExx + 扩展名，画质标签（DV / HDR / WEB-DL…）不参与比较。
+        "cleanup_previous_versions": False,
+        # 单次最多删几个：同集旧版本超过这个数就不动手（防命名意外导致批量误删）
+        "cleanup_max_delete": 3,
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
               "long_interval_seconds": 900},
@@ -284,6 +289,15 @@ FIELD_GROUPS: list[dict] = [
          "hint": "秒传命中（或分块传完）之后，把监控目录里那个源文件删掉，省地方。"
                  "播放不受影响——symedia 建好 strm 后是直接从云端读的，不碰这个文件。"
                  "只删文件本身，不删文件夹；只删监控目录里面的东西。"},
+        {"key": "upload.cleanup_previous_versions", "label": "洗板时云端只留最新那一版", "type": "bool",
+         "danger_note": "会删除云端文件（进 115 回收站，可恢复）。确认这个目录下不会出现同剧不同季/不同作品的同名集号",
+         "hint": "同一集重下（洗板）后，云端会同时留着带 DV 的和不带 DV 的两个文件。"
+                 "打开这个开关，新版传成功时会把同一集的旧版本自动删掉，只留最新的。"
+                 "判「同一集」只看 剧名 + SxxExx + 扩展名：[tmdbid=…]、[2160p … DV …] 这类标签整段不看，"
+                 "所以带不带 DV 都算同一集；.nfo / .strm / .jpg 不参与；认不出季集的文件名一律不动。"},
+        {"key": "upload.cleanup_max_delete", "label": "洗板时一次最多删几个", "type": "int",
+         "min": 1, "max": 50, "advanced": True,
+         "hint": "同一目录里同集旧版本多于这个数就整体跳过并记警告，防止命名意外批量误删。默认 3"},
         {"key": "upload.partsize_mb", "label": "上传切多大一块（MB）", "type": "int", "min": 1, "max": 512,
          "advanced": True, "hint": "一般不用改"},
         {"key": "upload.init_min_interval", "label": "两次请求至少隔几秒", "type": "float", "min": 0,

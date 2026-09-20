@@ -718,6 +718,114 @@ async def case_delete_after_upload():
             shutil.rmtree(t, ignore_errors=True)
 
 
+def case_episode_key():
+    """[17] 同一集归一化：画质标签（DV / HDR / WEB-DL…）不参与比较。"""
+    from p115 import episode_key as K
+
+    dv = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL DV TX DemoWeb].mkv"
+    nov = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"
+    assert K(dv) == K(nov) == "甲剧 (2026)|s01e031|.mkv", (K(dv), K(nov))
+    assert K("Show.S01E31.2160p.DV.mkv") == K("Show.S01E31.2160p.mkv") == "show|s01e031|.mkv"
+    assert K("甲剧 第31集 [1080p].mkv") == K("甲剧 第31集 [2160p].mkv") == "甲剧|e031|.mkv"
+
+    assert K(dv) != K(dv.replace("E31", "E32")), "不同集不该算同一集"
+    assert K(dv) != K(dv.replace("甲剧", "别的剧")), "不同剧不该算同一集"
+    assert K(dv) != K(dv.replace(".mkv", ".mp4")), "不同扩展名不该算同一集"
+
+    assert K("甲剧 (2026) [tmdbid=100001] S01E31 [2160p].nfo") is None, "非视频不参与"
+    assert K("甲剧 (2026) [tmdbid=100001] [2160p WEB-DL].mkv") is None, "认不出季集就一律不动"
+    assert K("") is None
+    PASS.append("[17] 同集归一化：带不带 DV 判成同一集；不同集/剧/扩展名能区分；"
+                "非视频与认不出季集的都不参与")
+
+
+async def case_cleanup_previous_versions():
+    """[18] 洗板清理：新版传成功后云端同集旧版本进回收站；开关关着/不同集/超上限都不动。"""
+    dv_name = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL DV TX DemoWeb].mkv"
+    nov_name = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"
+    rel_dir = "TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
+    cloud_dir = f"/TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
+    tmps: list[str] = []
+    try:
+        async def build(enable: bool, max_delete: int = 3):
+            cfg, store, mgr, _up, tmp, src = make_env(mode="rapid_only", fail_first=0)
+            tmps.append(tmp)
+            cfg["paths"]["map"] = [{"from": "TVs", "to": "/TVs"}]
+            cfg["upload"]["cleanup_previous_versions"] = enable
+            cfg["upload"]["cleanup_max_delete"] = max_delete
+            up = Uploader(cfg, store, mgr)
+            await mgr.ensure_pid(cloud_dir)                 # 让 StubP115 认得这个目录
+            gone: list[str] = []
+
+            async def fake_delete(fid):
+                gone.append(fid)
+                return True
+
+            mgr.delete_file = fake_delete
+            return cfg, store, mgr, up, tmp, src, gone
+
+        def put_cloud(store, tmp, name: str, size: int) -> str:
+            """在「云端」放一条已上传记录（同时是 list_dir 的数据来源）。"""
+            p = os.path.join(tmp, name)
+            store.add(p, size, 1.0)
+            store.set(p, status="已上传", target_dir=cloud_dir, message="秒传命中（旧版）")
+            return p
+
+        async def upload_new(up, store, src, rel_dir, name):
+            p = write_file(src, f"{rel_dir}/{name}", 3 * 1024 * 1024)
+            scanner.scan_once(store, cfg_of[0])
+            scanner.scan_once(store, cfg_of[0])
+            return await drive(up, store, p), p
+
+        # 1) 开关打开：带 DV 的旧版被清，记录里留痕
+        cfg, store, mgr, up, tmp, src, gone = await build(True)
+        cfg_of = [cfg]
+        old = put_cloud(store, tmp, dv_name, 5 * 1024 * 1024)
+        rec, _p = await upload_new(up, store, src, rel_dir, nov_name)
+        assert rec["status"] == "已上传" and rec["target_dir"] == cloud_dir, rec
+        assert gone == [f"stub-{old}"], gone
+        assert "云端同集旧版本已清 1 个" in (rec["message"] or ""), rec["message"]
+
+        # 2) 开关关着：一个字节都不动
+        cfg2, store2, mgr2, up2, tmp2, src2, gone2 = await build(False)
+        cfg_of = [cfg2]
+        put_cloud(store2, tmp2, dv_name, 5 * 1024 * 1024)
+        rec2, _ = await upload_new(up2, store2, src2, rel_dir, nov_name)
+        assert rec2["status"] == "已上传", rec2
+        assert gone2 == [], gone2
+
+        # 3) 不同集 / 非视频不参与：只有同集同扩展名才动手
+        cfg3, store3, mgr3, up3, tmp3, src3, gone3 = await build(True)
+        cfg_of = [cfg3]
+        put_cloud(store3, tmp3, dv_name.replace("S01E31", "S01E30"), 5 * 1024 * 1024)
+        put_cloud(store3, tmp3, dv_name.replace(".mkv", ".nfo"), 2048)
+        put_cloud(store3, tmp3, "别的剧 (2026) [tmdbid=1] S01E31 [1080p].mkv", 5 * 1024 * 1024)
+        rec3, _ = await upload_new(up3, store3, src3, rel_dir, nov_name)
+        assert rec3["status"] == "已上传" and gone3 == [], (rec3["status"], gone3)
+
+        # 4) 超过上限：整体跳过并记警告，一条都不删
+        cfg4, store4, mgr4, up4, tmp4, src4, gone4 = await build(True, max_delete=1)
+        cfg_of = [cfg4]
+        put_cloud(store4, tmp4, dv_name, 5 * 1024 * 1024)
+        put_cloud(store4, tmp4, dv_name.replace("DV ", "HDR "), 4 * 1024 * 1024)
+        rec4, _ = await upload_new(up4, store4, src4, rel_dir, nov_name)
+        assert gone4 == [], gone4
+        assert "超过上限 1" in (rec4["message"] or ""), rec4["message"]
+
+        # 5) 认不出季集的新版：跳过，不去猜
+        cfg5, store5, mgr5, up5, tmp5, src5, gone5 = await build(True)
+        cfg_of = [cfg5]
+        put_cloud(store5, tmp5, dv_name, 5 * 1024 * 1024)
+        rec5, _ = await upload_new(up5, store5, src5, rel_dir, "花絮合集.mkv")
+        assert gone5 == [], gone5
+
+        PASS.append("[18] 洗板清理：带 DV 的旧版进回收站并留痕；开关关着/不同集/非视频/"
+                    "别的剧都不动；同集旧版超过上限整体跳过；新版认不出季集也不猜")
+    finally:
+        for t in tmps:
+            shutil.rmtree(t, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -735,6 +843,8 @@ async def main():
     await case_rapid_only_mode()
     await case_notify_webhook()
     await case_delete_after_upload()
+    case_episode_key()
+    await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

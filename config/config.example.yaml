@@ -52,6 +52,16 @@ upload:
   # 播放不受影响：symedia 建好 strm 后直接从云端读。只删文件，不删目录。
   delete_after_upload: false
 
+  # 洗板（重下同集不同版本）后，云端的同一集只留最新那个（破坏性，默认 false）。
+  # 典型场景：先传了带 DV 的 S01E31，洗板后重下不带 DV 的 S01E31，两个都秒传上去了，
+  # 云端就有了两个第 31 集 —— 打开这个开关后，新版传成功时会自动把旧版移进 115 回收站。
+  # 判「同一集」只看 剧名 + SxxExx + 扩展名：[tmdbid=…]、[2160p … DV …] 这类中括号标签
+  # 整段忽略，点分命名（Show.S01E31.2160p.DV.mkv）同样认；
+  # 同一目录里只看视频本体，.nfo / .strm / .jpg 不参与；认不出季集的文件名一律不动。
+  cleanup_previous_versions: false
+  # 单次最多删几个：同一目录里同集旧版本多于这个数就整体跳过并记警告（防命名意外批量误删）
+  cleanup_max_delete: 3
+
 retry:
   interval_seconds: 60          # 秒传重试间隔（每轮只发校验请求，不重传数据）
   max_count: 5                  # rapid_only：前 N 轮用短间隔；rapid_then_upload：超过即算重试耗尽

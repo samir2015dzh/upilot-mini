@@ -65,6 +65,9 @@ class Uploader:
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
         # 传完就删本地源文件（破坏性操作，默认关）
         self.delete_after = bool(up.get("delete_after_upload"))
+        # 洗板：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
+        self.cleanup_prev = bool(up.get("cleanup_previous_versions"))
+        self.cleanup_max = int(up.get("cleanup_max_delete") or 3)
         self.notifier = Notifier(cfg)
         self._bg: set = set()          # 持有后台通知任务的引用，防止跑到一半被回收
 
@@ -141,6 +144,40 @@ class Uploader:
         except Exception as exc:  # noqa: BLE001
             logger.warning("删除本地源文件失败（不影响上传）：%s：%s", path, exc)
 
+    async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
+        """洗板（重下同集不同版本）后，把云端同一集的旧版本移进 115 回收站。
+
+        只认「剧名 + SxxExx + 扩展名」这个键：画质标签（DV / HDR / WEB-DL / 站点名…）
+        与集号之后的内容都不参与比较，所以 [.. DV ..] 与 [.. ..] 会被判成同一集。
+        任何失败都只记警告，绝不影响上传结果本身。
+        """
+        if not self.cleanup_prev:
+            return
+        name = os.path.basename(local_path)
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            size = 0
+        try:
+            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("洗板清理出错（不影响上传）：%s", exc)
+            return
+        deleted = list((res or {}).get("deleted") or [])
+        note = str((res or {}).get("note") or "")
+        if deleted:
+            logger.info("洗板清理：%s 就位，云端同集旧版本已清 %s", name, "、".join(deleted))
+        elif note and note != "没有旧版本":
+            logger.info("洗板清理：%s —— %s", name, note)
+        tail = ""
+        if deleted:
+            tail = f"｜云端同集旧版本已清 {len(deleted)} 个：" + "、".join(deleted)
+        elif note and note != "没有旧版本":
+            tail = f"｜洗板清理：{note}"
+        if tail:
+            cur = self.store.get(local_path) or {}
+            self.store.set(local_path, message=(cur.get("message") or "") + tail)
+
     def dispatch(self) -> None:
         todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
         if not self.rapid_only:
@@ -199,6 +236,7 @@ class Uploader:
                 logger.info("秒传命中：%s → %s（未消耗上行流量）",
                             os.path.basename(path), cloud_dir)
                 self._notify(cloud_dir, "rapid_hit", path)
+                await self._cleanup_prev_versions(cloud_dir, pid, path)
                 self._delete_source(path, rec)
                 return
 
@@ -247,6 +285,7 @@ class Uploader:
                       message=f"分块上传完成 → {cloud_dir}")
             logger.info("分块上传完成：%s → %s", os.path.basename(path), cloud_dir)
             self._notify(cloud_dir, "uploaded", path)
+            await self._cleanup_prev_versions(cloud_dir, pid, path)
             self._delete_source(path, rec)
         except Exception as exc:  # noqa: BLE001
             store.set(path, status="错误", message=f"分块上传失败：{exc}")

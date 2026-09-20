@@ -13,11 +13,47 @@ import json
 import logging
 import os
 import random
+import re
 import time
 
 logger = logging.getLogger("upilot.p115")
 
 TRANSIENT_HTTP_CODES = (401, 403, 429, 500, 502, 503, 504)
+
+# 视频扩展名 + 「同一集」归一化。洗板（重下同集不同版本）后云端会同时留下旧版与
+# 新版，清理时按「剧名 + SxxExx + 扩展名」判同一集 —— 画质标签
+# （DV / HDR / WEB-DL / 站点名…）与集号之后的内容一律不参与比较。
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".ts", ".m2ts", ".mts", ".avi", ".mov", ".wmv",
+                  ".flv", ".rmvb", ".iso", ".vob", ".mpg", ".mpeg", ".divx", ".webm"}
+_EP_RE = re.compile(r"[Ss](\d{1,2})\s*[Ee](\d{1,3})")
+_EP_CN_RE = re.compile(r"第\s*(\d{1,3})\s*[集话話]")
+
+
+def episode_key(name: str) -> str | None:
+    """把文件名归一成「同一集」的键；认不出季集信息就返回 None（不参与清理）。
+
+    '甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL DV TX DemoWeb].mkv'
+    '甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv'
+      → 同一个键 '甲剧 (2026)|s01e031|.mkv'
+
+    点分命名同理：'Show.S01E31.2160p.DV.mkv' → 'show|s01e031|.mkv'
+    """
+    stem, ext = os.path.splitext(name or "")
+    ext = ext.lower()
+    if ext not in VIDEO_SUFFIXES:
+        return None
+    text = re.sub(r"\[[^\]]*\]", " ", stem)       # 剥掉 [tmdbid=…] / [2160p … DV …] 这类标签
+    text = re.sub(r"[._]+", " ", text)            # 点分命名也归一成空格
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    m = _EP_RE.search(text)
+    if m:
+        show = text[:m.start()].strip()
+        return f"{show}|s{int(m.group(1)):02d}e{int(m.group(2)):03d}|{ext}"
+    m = _EP_CN_RE.search(text)
+    if m:
+        show = text[:m.start()].strip()
+        return f"{show}|e{int(m.group(1)):03d}|{ext}"
+    return None
 
 
 def is_transient(exc: Exception) -> bool:
@@ -178,6 +214,85 @@ class P115:
         """秒传报 10014（云端目录不存在）时清缓存。"""
         self._cid_mem.clear()
 
+    # ---------- 目录内容 / 删除（洗板清理用） ----------
+
+    async def list_dir(self, pid: int) -> list[dict]:
+        """列出目录里的文件条目（分页，跳过子目录）。"""
+        out: list[dict] = []
+        offset = 0
+        page = 1150                                     # 115 单页上限
+        while True:
+            resp = await self.client.fs_files(
+                {"cid": str(pid), "offset": offset, "limit": page,
+                 "show_dir": 1, "cur": 1}, async_=True)
+            data = (resp or {}).get("data")
+            if isinstance(data, dict):
+                rows = data.get("list") or []
+                total = int(data.get("count") or (resp or {}).get("count") or len(rows))
+            elif isinstance(data, list):
+                rows = data
+                total = int((resp or {}).get("count") or len(rows))
+            else:
+                rows = (resp or {}).get("list") or []
+                total = int((resp or {}).get("count") or len(rows))
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("ico") or "") != "folder":
+                    out.append(row)
+            offset += page
+            if not rows or offset >= total:
+                break
+        return out
+
+    async def delete_file(self, file_id) -> bool:
+        """把文件移进 115 回收站（可恢复，非物理删除）。"""
+        resp = await self.client.fs_delete({"fid": str(file_id)}, async_=True)
+        return bool(isinstance(resp, dict) and resp.get("state"))
+
+    async def cleanup_previous(self, pid: int, keep_name: str, keep_size: int,
+                               max_delete: int) -> dict:
+        """洗板清理：同一集只留 keep_name 那条，其余同集旧版本移进回收站。
+
+        返回 {"deleted": [文件名…], "note": 说明}。认不出季集、没有旧版本、或多于上限
+        都只回说明、不动手。
+        """
+        key = episode_key(keep_name)
+        if key is None:
+            return {"deleted": [], "note": "认不出季集（文件名里没有 SxxExx），跳过"}
+        rows = await self.list_dir(pid)
+        victims: list[tuple[str, str]] = []
+        for row in rows:
+            name = str(row.get("n") or row.get("name") or "")
+            if not name or name == keep_name:
+                continue                                 # 就是刚传上去那条
+            if episode_key(name) != key:
+                continue
+            try:
+                size = int(row.get("s") or row.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if keep_size and size == keep_size:
+                continue                                 # 大小一模一样：更像是刚传那条（被 115 改过名），别动
+            fid = row.get("fid") or row.get("file_id") or row.get("cid")
+            if fid in (None, ""):
+                continue
+            victims.append((name, str(fid)))
+        if not victims:
+            return {"deleted": [], "note": "没有旧版本"}
+        if max_delete > 0 and len(victims) > max_delete:
+            return {"deleted": [],
+                    "note": f"同集旧版本 {len(victims)} 个，超过上限 {max_delete}，本次不动手"}
+        done: list[str] = []
+        for name, fid in victims:
+            try:
+                if await self.delete_file(fid):
+                    done.append(name)
+                    logger.info("洗板清理：已移入回收站 %s", name)
+                else:
+                    logger.warning("洗板清理：删除失败 %s", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("洗板清理：删除出错 %s：%s", name, exc)
+        return {"deleted": done, "note": f"清掉 {len(done)} 个同集旧版本"}
+
     # ---------- 秒传 ----------
 
     async def rapid(self, file_path: str, size: int, sha1: str, pid: int) -> tuple[bool, dict]:
@@ -295,6 +410,26 @@ class StubP115:
 
     async def forget_pid(self, cloud_dir: str) -> None:
         return None
+
+    # ---------- 洗板清理（dry-run 只打日志，不真删任何东西） ----------
+
+    async def list_dir(self, pid: int) -> list[dict]:
+        """dry-run 的「云端内容」：把已上传、且目标目录是本 pid 的记录还原成条目。"""
+        cloud = next((p for p, c in self._mem.items() if int(c) == int(pid)), None)
+        if cloud is None:
+            return []
+        rows, _ = self.store.list_tasks(limit=1000)
+        return [{"n": os.path.basename(r["path"]), "s": r["size"],
+                 "fid": f"stub-{r['path']}", "ico": ""}
+                for r in rows
+                if r["target_dir"] == cloud and r["status"] == "已上传"]
+
+    async def delete_file(self, file_id) -> bool:
+        logger.info("[dry-run] fs_delete(%s) → 移入 115 回收站", file_id)
+        return True
+
+    # 判断逻辑与真实客户端共用（只依赖 list_dir / delete_file）
+    cleanup_previous = P115.cleanup_previous
 
     async def rapid(self, file_path: str, size: int, sha1: str, pid: int) -> tuple[bool, dict]:
         n = self._rapid_calls.get(file_path, 0) + 1
