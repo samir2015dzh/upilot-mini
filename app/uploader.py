@@ -158,8 +158,13 @@ class Uploader:
             size = os.path.getsize(local_path)
         except OSError:
             size = 0
+        # 刚上传那条的 115 file_id（秒传/分块成功时已落库）——比文件名可靠：
+        # 115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
+        cur = self.store.get(local_path) or {}
+        keep_fid = str(cur.get("file_id") or "")
         try:
-            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max)
+            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                  keep_fid=keep_fid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("洗板清理出错（不影响上传）：%s", exc)
             return
@@ -175,7 +180,6 @@ class Uploader:
         elif note and note != "没有旧版本":
             tail = f"｜洗板清理：{note}"
         if tail:
-            cur = self.store.get(local_path) or {}
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
 
     def dispatch(self) -> None:

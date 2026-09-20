@@ -161,6 +161,10 @@ class P115:
         self._last_init = 0.0
         self._makedirs_lock = asyncio.Lock()
         self._cid_mem: dict[str, int] = {}
+        # 目录内容缓存：{pid: (条目, 取回时间)}。上游实测「同一目录被反复列会触发 115 限流（405）」，
+        # 洗板清理是「一个文件列一次目录」，整季下载会连打，所以加 TTL 复用。
+        self._dir_cache: dict[int, tuple[list, float]] = {}
+        self._dir_cache_ttl = 30.0
 
     # ---------- 节流 + 瞬态重试 ----------
 
@@ -216,8 +220,19 @@ class P115:
 
     # ---------- 目录内容 / 删除（洗板清理用） ----------
 
-    async def list_dir(self, pid: int) -> list[dict]:
-        """列出目录里的文件条目（分页，跳过子目录）。"""
+    async def list_dir(self, pid: int, use_cache: bool = True) -> list[dict]:
+        """列出目录里的**文件**条目（分页，跳过子目录）。
+
+        实测（真 115）：文件条目带 `fid`（自身 id）+ `ico`（扩展名，如 "mkv"）+ `s`（字节数）；
+        文件夹条目**没有** `fid`/`ico`，它的身份 id 在 `cid` 键上。
+        所以判「是文件」只看 `fid` 在不在 —— 拿 `ico == "folder"` 当过滤条件是错的
+        （那个键在文件夹条目上压根不存在，等于没过滤）。
+        """
+        key = int(pid)
+        if use_cache:
+            hit = self._dir_cache.get(key)
+            if hit and time.monotonic() - hit[1] < self._dir_cache_ttl:
+                return list(hit[0])
         out: list[dict] = []
         offset = 0
         page = 1150                                     # 115 单页上限
@@ -236,11 +251,12 @@ class P115:
                 rows = (resp or {}).get("list") or []
                 total = int((resp or {}).get("count") or len(rows))
             for row in rows:
-                if isinstance(row, dict) and str(row.get("ico") or "") != "folder":
+                if isinstance(row, dict) and row.get("fid") not in (None, ""):
                     out.append(row)
             offset += page
             if not rows or offset >= total:
                 break
+        self._dir_cache[key] = (list(out), time.monotonic())
         return out
 
     async def delete_file(self, file_id) -> bool:
@@ -249,21 +265,30 @@ class P115:
         return bool(isinstance(resp, dict) and resp.get("state"))
 
     async def cleanup_previous(self, pid: int, keep_name: str, keep_size: int,
-                               max_delete: int) -> dict:
-        """洗板清理：同一集只留 keep_name 那条，其余同集旧版本移进回收站。
+                               max_delete: int, keep_fid: str = "") -> dict:
+        """洗板清理：同一集只留刚上传那条，其余同集旧版本移进回收站。
 
-        返回 {"deleted": [文件名…], "note": 说明}。认不出季集、没有旧版本、或多于上限
-        都只回说明、不动手。
+        三道「别动它」：file_id 命中（最可靠，115 同名时会给新版改名）、文件名完全相同、
+        大小完全相同（后两道是为改名的情形兜底）。
+        返回 {"deleted": [文件名…], "note": 说明}；认不出季集 / 没有旧版本 / 多于上限都只回说明。
         """
         key = episode_key(keep_name)
         if key is None:
             return {"deleted": [], "note": "认不出季集（文件名里没有 SxxExx），跳过"}
+        keep_fid = str(keep_fid or "").strip()
+        if keep_fid in ("0", "None"):
+            keep_fid = ""
         rows = await self.list_dir(pid)
         victims: list[tuple[str, str]] = []
         for row in rows:
             name = str(row.get("n") or row.get("name") or "")
-            if not name or name == keep_name:
-                continue                                 # 就是刚传上去那条
+            fid = row.get("fid") or row.get("file_id")
+            if not name or fid in (None, ""):
+                continue                                 # list_dir 已滤掉目录，这里再兜一层
+            if keep_fid and str(fid) == keep_fid:
+                continue                                 # 刚上传那条（按 id，最可靠）
+            if name == keep_name:
+                continue                                 # 刚上传那条（按名字）
             if episode_key(name) != key:
                 continue
             try:
@@ -271,10 +296,7 @@ class P115:
             except (TypeError, ValueError):
                 size = 0
             if keep_size and size == keep_size:
-                continue                                 # 大小一模一样：更像是刚传那条（被 115 改过名），别动
-            fid = row.get("fid") or row.get("file_id") or row.get("cid")
-            if fid in (None, ""):
-                continue
+                continue                                 # 大小一模一样：更像刚传那条被改过名，别动
             victims.append((name, str(fid)))
         if not victims:
             return {"deleted": [], "note": "没有旧版本"}
@@ -291,6 +313,10 @@ class P115:
                     logger.warning("洗板清理：删除失败 %s", name)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("洗板清理：删除出错 %s：%s", name, exc)
+        if done:
+            cache = getattr(self, "_dir_cache", None)    # 目录内容变了，缓存作废
+            if isinstance(cache, dict):
+                cache.pop(int(pid), None)
         return {"deleted": done, "note": f"清掉 {len(done)} 个同集旧版本"}
 
     # ---------- 秒传 ----------

@@ -819,8 +819,50 @@ async def case_cleanup_previous_versions():
         rec5, _ = await upload_new(up5, store5, src5, rel_dir, "花絮合集.mkv")
         assert gone5 == [], gone5
 
+        # 6) list_dir 只收文件：115 的文件夹条目没有 fid（身份 id 在 cid 键上），必须被滤掉
+        import p115 as p115mod
+
+        class _FilesClient:
+            """伪造 fs_files：一条目录 + 一条文件（形状照真机实测）。"""
+
+            async def fs_files(self, payload, async_=True):
+                return {"state": True, "errno": 0, "count": 2, "data": [
+                    {"n": "甲剧 (2026) [tmdbid=100001]", "cid": "111", "pid": "0", "ns": "x"},
+                    {"n": "甲剧 (2026) [tmdbid=100001] S01E31 [1080p].mkv",
+                     "fid": "222", "s": 10, "ico": "mkv"},
+                ]}
+
+        probe = p115mod.P115.__new__(p115mod.P115)
+        probe.client = _FilesClient()
+        probe._dir_cache, probe._dir_cache_ttl = {}, 30.0
+        only_files = await probe.list_dir(777)
+        assert [r["n"] for r in only_files] == ["甲剧 (2026) [tmdbid=100001] S01E31 [1080p].mkv"], only_files
+        rows_again = await probe.list_dir(777)                 # 第二次走缓存，不再请求
+        assert rows_again == only_files, rows_again
+
+        # 7) 刚上传那条被 115 改名（且列表里没有 s 字段）时，靠 file_id 排除掉
+        class _RenamedCloud:
+            def __init__(self):
+                self.deleted: list[str] = []
+
+            async def list_dir(self, pid):
+                return [{"n": nov_name.replace(".mkv", " (1).mkv"), "fid": "999",
+                         "ico": "mkv"},                        # 刚传的新版被改名，且没给 s
+                        {"n": dv_name, "fid": "888", "s": 5 * 1024 * 1024, "ico": "mkv"}]
+
+            async def delete_file(self, fid):
+                self.deleted.append(fid)
+                return True
+
+        rc = _RenamedCloud()
+        res = await p115mod.P115.cleanup_previous(rc, 1, nov_name, 3 * 1024 * 1024, 3,
+                                                 keep_fid="999")
+        assert rc.deleted == ["888"], rc.deleted        # 只删旧版，绝不碰刚上传那条
+        assert res["deleted"] == [dv_name], res
+
         PASS.append("[18] 洗板清理：带 DV 的旧版进回收站并留痕；开关关着/不同集/非视频/"
-                    "别的剧都不动；同集旧版超过上限整体跳过；新版认不出季集也不猜")
+                    "别的剧都不动；同集旧版超过上限整体跳过；新版认不出季集也不猜；"
+                    "list_dir 只收文件（文件夹条目滤掉）+ 走缓存；新版被 115 改名也靠 file_id 排除")
     finally:
         for t in tmps:
             shutil.rmtree(t, ignore_errors=True)
