@@ -404,7 +404,7 @@ function fieldHtml(f) {
   const tag = f.restart ? ' <span class="tag">需重建容器</span>' : "";
   if (f.type === "bool") {
     return `<div class="f">
-      <label><span class="switch ${f.value ? "on" : ""}" data-switch><i></i></span>
+      <label data-switch><span class="switch ${f.value ? "on" : ""}"><i></i></span>
         ${label}${tag}<input type="checkbox" data-key="${key}" data-type="bool" ${f.value ? "checked" : ""} hidden></label>${hint}
     </div>`;
   }
@@ -533,11 +533,16 @@ function bind() {
     }
     if (!e.target.closest(".dd")) document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
 
-    const sw = e.target.closest("[data-switch]");
-    if (sw) {
-      const on = sw.classList.toggle("on");
-      const box = sw.closest(".f").querySelector('input[type=checkbox][data-key]');
+    const swLabel = e.target.closest("[data-switch]");
+    if (swLabel) {
+      // label 包着隐藏 checkbox：浏览器点 label 会自动翻一次 checked，
+      // 我们再赋值就是翻两次（视觉开、值却是关）。挡掉原生激活，自己当唯一真相源。
+      e.preventDefault();
+      const sw = swLabel.querySelector(".switch");
+      const box = swLabel.closest(".f").querySelector('input[type=checkbox][data-key]');
+      const on = !(box && box.checked);
       if (box) box.checked = on;
+      if (sw) sw.classList.toggle("on", on);
     }
     const op = e.target.closest("button.primary");
     if (op) op.disabled = false;

@@ -926,6 +926,71 @@ def case_upload_mark():
                 "分块回调给后者），全空或 0 则空串，调用方退回名字+大小护栏")
 
 
+def case_config_roundtrip():
+    """[20] 面板保存往返：开关存得进、读得回，键名不漂移。"""
+    from pathlib import Path
+
+    # 1) schema 里的 upload.* 键必须在 DEFAULTS 里存在（防键名漂移：面板加了键、
+    #    DEFAULTS 没加 → 读取侧拿不到值，表现就是「保存了又变回默认」）
+    up_defaults = set(cfgmod.DEFAULTS["upload"].keys())
+    missing = []
+    for group in cfgmod.FIELD_GROUPS:
+        for f in group["fields"]:
+            if f["key"].startswith("upload."):
+                short = f["key"].split(".", 1)[1]
+                if short not in up_defaults:
+                    missing.append(f["key"])
+    assert not missing, f"面板 schema 里有 DEFAULTS 不认识的键：{missing}"
+
+    # 2) 打开开关 → 内存命中 → form_payload 回 true（面板重新渲染不回弹）
+    cfg = copy.deepcopy(cfgmod.DEFAULTS)
+    res = cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": True,
+                                    "upload.cleanup_max_delete": 5})
+    assert "upload.cleanup_previous_versions" in res["changed"], res
+    assert cfg["upload"]["cleanup_previous_versions"] is True
+    assert cfg["upload"]["cleanup_max_delete"] == 5
+    assert res["reload"] is True, "upload.* 改动应当触发 115 客户端重建"
+
+    def bool_of(payload, key):
+        for g in payload["groups"]:
+            for f in g["fields"]:
+                if f["key"] == key:
+                    return f["value"]
+        raise AssertionError(f"form_payload 里没有 {key}")
+
+    assert bool_of(cfgmod.form_payload(cfg), "upload.cleanup_previous_versions") is True
+    # 开着的时候 UI 送 false 要能关掉（不能被「留空=不改」的逻辑挡住）
+    cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": False})
+    assert cfg["upload"]["cleanup_previous_versions"] is False
+    # 前端送的是真布尔（不是字符串），字符串形式也得认
+    cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": "false"})
+    assert cfg["upload"]["cleanup_previous_versions"] is False
+    cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": "on"})
+    assert cfg["upload"]["cleanup_previous_versions"] is True
+
+    # 3) 落盘 → 重载：值必须还在（save/load 不丢新键）
+    tmp = tempfile.mkdtemp(prefix="upilot-roundtrip-")
+    old_path = cfgmod.CONFIG_PATH
+    try:
+        cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+        try:
+            cfg2 = copy.deepcopy(cfgmod.DEFAULTS)
+            cfgmod.apply_values(cfg2, {"upload.cleanup_previous_versions": True})
+            cfgmod.save(cfg2)
+            text = cfgmod.CONFIG_PATH.read_text(encoding="utf-8")
+            assert "cleanup_previous_versions: true" in text, text
+            back = cfgmod.load()
+            assert back["upload"]["cleanup_previous_versions"] is True, back["upload"]
+        finally:
+            cfgmod.CONFIG_PATH = old_path
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[20] 配置往返：面板 schema 的 upload.* 键与 DEFAULTS 逐字对应；开关写入内存后 "
+                "form_payload 回 true（面板重渲染不回弹）；开着能关、真布尔与字符串都认；"
+                "落盘 yaml 含 cleanup_previous_versions: true 且重载后仍在")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -945,6 +1010,7 @@ async def main():
     await case_delete_after_upload()
     case_episode_key()
     case_upload_mark()
+    case_config_roundtrip()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
