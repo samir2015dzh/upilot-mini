@@ -589,10 +589,19 @@ async def case_notify_webhook():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
+    async def wait_until(pred, timeout: float = 3.0) -> bool:
+        """通知现在是丢到后台发的，断言前先等它跑完。"""
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            await asyncio.sleep(0.05)
+        return pred()
+
     dirs: list[str] = []
     try:
         base = {"enabled": True,
-                "url": f"http://127.0.0.1:{port}/api/v1/webhook/clouddrive2/file_notify",
+                "url": f"http://127.0.0.1:{port}",      # 只填地址，端点路径由程序补全
                 "query": "device_name=upilot-mini&user_name=upilot-mini&type=notify",
                 "path_prefix": "/CloudNAS/CloudDrive/115open",
                 "auth": "Basic dTpw", "on": "both", "timeout": 5, "retries": 0}
@@ -607,7 +616,7 @@ async def case_notify_webhook():
         scanner.scan_once(store, cfg)
         rec = await drive(up, store, path, rounds=6)
         assert rec["status"] == "已上传" and rec["upload_mode"] == "rapid", rec
-        assert len(got) == 1, got
+        assert await wait_until(lambda: len(got) == 1), got
         p_, hdrs, body = got[0]
         assert "file_notify" in p_ and "type=notify" in p_, p_
         assert hdrs.get("Authorization") == "Basic dTpw", hdrs
@@ -627,6 +636,7 @@ async def case_notify_webhook():
         scanner.scan_once(store2, cfg2)
         rec2 = await drive(up2, store2, p2, rounds=4)
         assert rec2["status"] == "已上传", rec2
+        await asyncio.sleep(0.8)                 # 等后台通知跑完（应当失败，但不影响上传结果）
         assert not got, got
 
         # 3) on=rapid_hit 时，走分块上传完成不发通知
@@ -639,6 +649,7 @@ async def case_notify_webhook():
         scanner.scan_once(store3, cfg3)
         rec3 = await drive(up3, store3, p3, rounds=4)
         assert rec3["status"] == "已上传" and rec3["upload_mode"] == "normal", rec3
+        await asyncio.sleep(0.4)
         assert not got, got
 
         # 4) 面板改 notify.* 应当触发重建（否则要重启容器才生效）
@@ -648,9 +659,9 @@ async def case_notify_webhook():
         r5 = cfgmod.apply_values(copy.deepcopy(cfgmod.DEFAULTS), {"upload.mode": "rapid_then_upload"})
         assert r5["reload"] is True, r5
 
-        PASS.append("[15] Webhook 通知：秒传命中按 CD2 file_notify 契约发 create"
-                    "（路径补前缀、带 auth）；对方不通不影响上传；on=rapid_hit 时上传完成不发；"
-                    "面板改 notify./upload./retry. 即时重建")
+        PASS.append("[15] Webhook 通知：只填 symedia 地址也能自动补全端点与参数；秒传命中"
+                    "按 CD2 file_notify 契约发 create（路径补前缀、带 auth）；对方不通不影响"
+                    "上传；on=rapid_hit 时上传完成不发；面板改 notify./upload./retry. 即时重建")
     finally:
         srv.shutdown()
         for d in dirs:

@@ -226,13 +226,17 @@ paths:
 CloudDrive2 的文件变更事件，收到就对该文件做目录树同步、生成 strm。我们按同一份契约发
 （`action=create`、`is_dir=false`、`source_file` 是文件路径），symedia 会当成「CD2 报告多了一个文件」来处理。
 
+面板上只有两项要填：**打开开关**、**symedia 地址**（`http://172.17.0.1:8095` 这种，只写地址，
+后面的接口路径和参数程序自己补）。写成配置文件是这样：
+
 ```yaml
 notify:
   enabled: true
-  url: "http://127.0.0.1:8095/api/v1/webhook/clouddrive2/file_notify"
-  query: "device_name=upilot-mini&user_name=upilot-mini&type=notify"
-  path_prefix: "/CloudNAS/CloudDrive/115open"   # symedia 认 CD2 挂载视图
-  on: rapid_hit                                 # rapid_hit | uploaded | both
+  url: "http://172.17.0.1:8095"   # 只填地址；接口路径与参数自动补全
+  on: rapid_hit                   # 秒传命中就通知（「高级设置」里还有 uploaded / both）
+  # 下面两项都有默认值，一般不用写：
+  # path_prefix: "/CloudNAS/CloudDrive/115open"   对方按 CD2 挂载路径找文件
+  # query: "device_name=upilot-mini&user_name=upilot-mini&type=notify"
 ```
 
 - `path_prefix` 负责把 115 网盘路径换算成对方视角：`/TVs/x.mkv` → `/CloudNAS/CloudDrive/115open/TVs/x.mkv`。

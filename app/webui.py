@@ -245,6 +245,8 @@ def _payload(cfg: dict, store, state: dict) -> dict:
             "retry_max_count": rt["max_count"],
             "retry_max_hours": rt["max_hours"],
             "retry_long_interval": rt.get("long_interval_seconds") or 900,
+            "notify_enabled": bool((cfg.get("notify") or {}).get("enabled")),
+            "notify_url": (cfg.get("notify") or {}).get("url") or "",
             "db": cfg["state"]["db"],
         },
     }

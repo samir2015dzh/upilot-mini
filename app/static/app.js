@@ -180,6 +180,7 @@ function renderOverview(d) {
     ["上传模式", c.upload_mode_label || c.upload_mode],
     ["小文件阈值", c.small_file_mb + " MB"],
     ["分块大小", c.partsize_mb + " MB"],
+    ["完成后通知", c.notify_enabled ? "已开启 · " + (c.notify_url || "还没填地址") : "关闭"],
     ["秒传重试", c.upload_mode === "rapid_only"
       ? `${c.retry_interval} 秒 ×${c.retry_max_count} 次 → 之后每 ${c.retry_long_interval} 秒，一直等`
       : `${c.retry_interval} 秒 / ${c.retry_max_count} 次 / ${c.retry_max_hours} 小时`],
@@ -330,11 +331,19 @@ async function loadConfig() {
 
 function renderSettings(payload) {
   const groups = payload.groups || [];
-  $("#settings-groups").innerHTML = groups.map(g => `
+  $("#settings-groups").innerHTML = groups.map(g => {
+    const fields = g.fields || [];
+    const main = fields.filter(f => !f.advanced);      // 平时只需要看这几项
+    const adv = fields.filter(f => f.advanced);        // 带高级标记的默认折起来
+    return `
     <div class="fg">
       <h3>${esc(g.title)}</h3>
-      ${(g.fields || []).map(f => fieldHtml(f)).join("")}
-    </div>`).join("");
+      ${main.map(f => fieldHtml(f)).join("")}
+      ${adv.length ? `<details class="adv"><summary>高级设置（一般不用改）</summary>
+        ${adv.map(f => fieldHtml(f)).join("")}
+      </details>` : ""}
+    </div>`;
+  }).join("");
   $("#cfg-path").textContent = payload.path || "/config/config.yaml";
   $("#settings-msg").innerHTML = "";
 }
@@ -389,7 +398,8 @@ function ddInner(options, value) {
 
 function fieldHtml(f) {
   const key = esc(f.key), label = esc(f.label || f.key);
-  const hint = f.hint ? `<div class="hintline">${esc(f.hint)}</div>` : "";
+  const hint = (f.hint ? `<div class="hintline">${esc(f.hint)}</div>` : "")
+    + (f.note ? `<div class="hintline note">${esc(f.note)}</div>` : "");
   const tag = f.restart ? ' <span class="tag">需重建容器</span>' : "";
   if (f.type === "bool") {
     return `<div class="f">

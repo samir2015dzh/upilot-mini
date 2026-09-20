@@ -23,13 +23,32 @@ logger = logging.getLogger("upilot.notify")
 
 MODES = ("rapid_hit", "uploaded", "both")
 
+# symedia「链接同步」收事件用的是 CD2 那套固定契约端点。面板上只让用户填
+# http://主机:8095，路径和固定参数在这里补全，省得人人去抄一长串。
+ENDPOINT = "/api/v1/webhook/clouddrive2/file_notify"
+DEFAULT_QUERY = "device_name=upilot-mini&user_name=upilot-mini&type=notify"
+
+
+def normalize_url(raw: str) -> str:
+    """把用户填的地址补成完整端点。
+
+    只填 http://主机:8095 → 补上 /api/v1/webhook/clouddrive2/file_notify；
+    老配置里已经写全端点（带 /api/）的原样保留，两种写法都认。
+    """
+    url = str(raw or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if "://" not in url:                       # 只写了 主机:端口 也认
+        url = "http://" + url
+    return url if "/api/" in url else url + ENDPOINT
+
 
 class Notifier:
     def __init__(self, cfg: dict):
         n = dict(cfg.get("notify") or {})
         self.enabled = bool(n.get("enabled"))
-        self.url = str(n.get("url") or "").strip()
-        self.query = str(n.get("query") or "").strip().lstrip("?")
+        self.url = normalize_url(n.get("url") or "")
+        self.query = str(n.get("query") or "").strip().lstrip("?") or DEFAULT_QUERY
         self.prefix = str(n.get("path_prefix") or "").strip().rstrip("/")
         self.auth = str(n.get("auth") or "").strip()
         self.on = str(n.get("on") or "rapid_hit").strip()
@@ -80,7 +99,12 @@ class Notifier:
         }
 
     def full_url(self) -> str:
-        return self.url + (("?" + self.query) if self.query else "")
+        """最终地址：补好的端点 + 固定参数（地址里自带 ?xxx= 就不再追加）。"""
+        if not self.url:
+            return ""
+        if "?" in self.url or not self.query:
+            return self.url
+        return self.url + "?" + self.query
 
     # ---------- 发送 ----------
 

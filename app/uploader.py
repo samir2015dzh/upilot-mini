@@ -64,6 +64,7 @@ class Uploader:
         self.rapid_only = self.mode == "rapid_only"
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
         self.notifier = Notifier(cfg)
+        self._bg: set = set()          # 持有后台通知任务的引用，防止跑到一半被回收
 
     # ---------- 调度 ----------
 
@@ -82,17 +83,34 @@ class Uploader:
             finally:
                 self._active.discard(path)
 
-        asyncio.create_task(run())
+        t = asyncio.create_task(run())
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
 
-    async def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
-        """秒传命中 / 上传完成后通知别的程序（webhook）。任何异常都不影响上传本身。"""
+    def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
+        """秒传命中 / 上传完成后，把通知丢到后台去发（不等它）。
+
+        对方收到通知后会先干活再回执，慢的时候十几秒；在这里等会把「同时处理几个文件」
+        的名额占住，后面的文件只能干等。通知失败不影响上传结果，所以后台跑就好。
+        """
         if not self.notifier.ready or not self.notifier.should_fire(mode):
             return
         cloud_path = f"{cloud_dir.rstrip('/')}/{os.path.basename(local_path)}"
-        try:
-            await asyncio.to_thread(self.notifier.send, cloud_path, mode)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("通知出错（不影响上传）：%s", exc)
+
+        async def run():
+            try:
+                ok, info = await asyncio.to_thread(self.notifier.send, cloud_path, mode)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("通知出错（不影响上传）：%s", exc)
+                ok, info = False, f"{type(exc).__name__}: {exc}"
+            # 结果写回这条记录的说明，「任务明细」里直接能看到通知有没有发出去
+            cur = self.store.get(local_path) or {}
+            tail = f"｜已通知下游（{info}）" if ok else f"｜通知下游失败：{info}"
+            self.store.set(local_path, message=(cur.get("message") or "") + tail)
+
+        t = asyncio.create_task(run())
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
 
     def dispatch(self) -> None:
         todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
@@ -151,7 +169,7 @@ class Uploader:
                           message=f"秒传命中 → {cloud_dir}")
                 logger.info("秒传命中：%s → %s（未消耗上行流量）",
                             os.path.basename(path), cloud_dir)
-                await self._notify(cloud_dir, "rapid_hit", path)
+                self._notify(cloud_dir, "rapid_hit", path)
                 return
 
             if not self.rapid_only and rec["size"] < self.small_bytes:
@@ -198,7 +216,7 @@ class Uploader:
                       file_id=str((result or {}).get("file_id", "")),
                       message=f"分块上传完成 → {cloud_dir}")
             logger.info("分块上传完成：%s → %s", os.path.basename(path), cloud_dir)
-            await self._notify(cloud_dir, "uploaded", path)
+            self._notify(cloud_dir, "uploaded", path)
         except Exception as exc:  # noqa: BLE001
             store.set(path, status="错误", message=f"分块上传失败：{exc}")
             logger.error("分块上传失败：%s：%s", path, exc)

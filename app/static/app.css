@@ -138,6 +138,15 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .bars .track{height:7px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
 .bars .track > i{display:block;height:100%;border-radius:999px;transition:width .4s ease}
 
+.fg details.adv{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}
+.fg details.adv > summary{cursor:pointer;font-size:12.5px;color:var(--muted);list-style:none;
+  display:flex;align-items:center;gap:6px;user-select:none;padding:2px 0}
+.fg details.adv > summary::-webkit-details-marker{display:none}
+.fg details.adv > summary::before{content:"\25B8";color:var(--dim);transition:transform .15s}
+.fg details.adv[open] > summary::before{transform:rotate(90deg)}
+.fg details.adv > summary:hover{color:var(--fg)}
+.fg details.adv .f{margin-top:11px}
+.hintline.note{color:#fbbf24}
 .pill.amber{color:#fde68a;border-color:rgba(251,191,36,.42)}
 .pill.ok{color:#bbf7d0;border-color:rgba(52,211,153,.42)}
 .pill.err{color:#fecdd3;border-color:rgba(251,113,133,.42)}

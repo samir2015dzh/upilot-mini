@@ -43,8 +43,8 @@ REMOVED_APPS = {
 #             115 的秒传是全站 hash 索引，热门片源通常过一阵就有人传上云，届时直接命中、零上行。
 # rapid_then_upload：秒传优先，重试耗尽后转普通上传（分块 + 断点续传）。
 UPLOAD_MODES: list[dict] = [
-    {"value": "rapid_only", "label": "纯秒传（只用秒传，绝不普通上传）"},
-    {"value": "rapid_then_upload", "label": "秒传优先（重试耗尽后转普通上传）"},
+    {"value": "rapid_only", "label": "只秒传：云端有就秒完成，没有就一直等（不费流量）"},
+    {"value": "rapid_then_upload", "label": "先试秒传，等不到就真上传（会费流量）"},
 ]
 UPLOAD_MODE_LABELS = {x["value"]: x["label"] for x in UPLOAD_MODES}
 
@@ -95,9 +95,9 @@ DEFAULTS: dict = {
         "enabled": False,
         "url": "",
         "query": "",
-        # 115 网盘路径 → 对方视角：symedia 认 CD2 挂载路径，例如
-        # /CloudNAS/CloudDrive/115open（那么 /TVs/x.mkv → /CloudNAS/CloudDrive/115open/TVs/x.mkv）
-        "path_prefix": "",
+        # 115 网盘路径 → 对方视角：symedia 认 CD2 挂载路径（它的标准挂载就是这个），
+        # 一般不用改。填好后 /TVs/x.mkv → /CloudNAS/CloudDrive/115open/TVs/x.mkv
+        "path_prefix": "/CloudNAS/CloudDrive/115open",
         "auth": "",                  # 可选：Basic xxx / Bearer xxx
         "on": "rapid_hit",           # rapid_hit | uploaded | both
         "timeout": 20,               # symedia 收到后会先建 strm 再回执，给宽一点
@@ -231,97 +231,117 @@ def save_cookie(cookie: str) -> None:
 MASK = "••••••••"
 
 FIELD_GROUPS: list[dict] = [
-    {"title": "目录", "fields": [
-        {"key": "paths.source", "label": "监控目录（容器内路径）", "type": "text",
-         "hint": "只读挂载进容器的目录，改这里要跟 compose 的冒号左边保持一致"},
-        {"key": "paths.target_root", "label": "115 目标根目录", "type": "text",
-         "hint": "没被下面映射命中的文件，云端结构 = 它 + 本地相对路径"},
-        {"key": "paths.map", "label": "本机 → 115 目录映射", "type": "map", "rows": 9,
-         "hint": "每行一条：本机相对路径 => 115 目录。例 TVs => /TVs｜Movies/Others => /Movies/Others｜Anime => /OtherAnime（可改名、大小写照写）。命中时取最长前缀，其下结构原样保留"},
+    {"title": "文件夹", "fields": [
+        {"key": "paths.source", "label": "盯住哪个文件夹", "type": "text",
+         "hint": "就是装的时候挂进来的那个目录。要改的话，得同时改 compose 文件里冒号左边那一段"},
+        {"key": "paths.target_root", "label": "放到 115 的哪个目录下", "type": "text",
+         "hint": "下面「文件夹对应关系」没提到的文件，就按原来的文件夹结构放进这里；目录不存在会自动建"},
+        {"key": "paths.map", "label": "文件夹对应关系", "type": "map", "rows": 9,
+         "hint": "一行一条，写法：本地文件夹 => 115 上的文件夹。左边写你硬盘上的相对位置，右边写 115 里的目录。"
+                 "例：TVs => /TVs　｜　Anime => /OtherAnime（相当于改名）"},
     ]},
     {"title": "115 账号", "fields": [
-        {"key": "p115.cookie", "label": "115 Cookie", "type": "secret",
-         "hint": "留空 = 不改；粘贴完整 cookie 保存即生效（会自动重建 115 客户端）"},
-        {"key": "p115.cookie_from", "label": "从别的程序同步 cookie（可选）", "type": "text",
-         "hint": "填容器内可见的配置文件路径，例如挂进来的 /symedia-config/config.yaml；"
-                 "程序每分钟读一次，发现里面的 115 cookie 变了就自动同步过来并重建客户端"},
-        {"key": "p115.app", "label": "115 客户端身份", "type": "select",
+        {"key": "p115.cookie", "label": "115 登录凭证", "type": "secret",
+         "hint": "从浏览器或别的程序里复制过来，粘上保存就行；留空表示不修改。保存后立刻生效，不用重启"},
+        {"key": "p115.cookie_from", "label": "自动跟着别的程序换凭证（可选）", "type": "text",
+         "hint": "填一个配置文件路径，比如 /symedia-config/config.yaml。程序每分钟看一眼，"
+                 "那边换了登录凭证，这边自动跟着换；不用就留空"},
+        {"key": "p115.app", "label": "用哪个 115 客户端身份", "type": "select",
          "options": APP_OPTIONS,
-         "hint": "所有 115 请求都用它当身份，挑一个平时不用的端即可（改完保存，会自动重建客户端）"},
+         "hint": "随便挑一个自己平时不用的（比如 iPad 端）就行，只是换个身份，不影响功能"},
     ]},
     {"title": "扫描", "fields": [
-        {"key": "scan.interval_seconds", "label": "扫描间隔（秒）", "type": "int", "min": 2, "max": 86400},
-        {"key": "scan.stable_rounds", "label": "稳定判定轮数", "type": "int", "min": 1, "max": 20,
-         "hint": "连续几轮大小与修改时间不变才算“传完了”"},
-        {"key": "scan.min_size_mb", "label": "最小文件体积（MB）", "type": "float", "min": 0},
-        {"key": "scan.include_suffixes", "label": "只收这些扩展名", "type": "list",
-         "hint": "逗号分隔；留空 = 全都要"},
-        {"key": "scan.exclude_dirs", "label": "跳过这些目录", "type": "list",
-         "hint": "相对监控根目录的路径片段，命中整棵子树跳过"},
-        {"key": "scan.ignore_suffixes", "label": "忽略这些扩展名", "type": "list",
-         "hint": "下载中的临时后缀，逗号分隔"},
+        {"key": "scan.interval_seconds", "label": "多久看一眼文件夹（秒）", "type": "int",
+         "min": 2, "max": 86400,
+         "hint": "默认 30 秒。调小反应更快，稍微费一点性能"},
+        {"key": "scan.stable_rounds", "label": "连续几次没变化才算传完", "type": "int", "min": 1, "max": 20,
+         "hint": "正在下载的文件大小一直在变，等它不动了再动手，免得传半个文件。默认 2"},
+        {"key": "scan.min_size_mb", "label": "小到这个程度就不管（MB）", "type": "float", "min": 0,
+         "hint": "0 = 多小都处理"},
+        {"key": "scan.include_suffixes", "label": "只处理这些类型", "type": "list",
+         "hint": "用逗号分开，比如 .mkv, .mp4。留空 = 什么文件都要"},
+        {"key": "scan.exclude_dirs", "label": "跳过这些文件夹", "type": "list",
+         "hint": "写文件夹名，命中的整个跳过。比如 Sample, @eaDir"},
+        {"key": "scan.ignore_suffixes", "label": "这些是没下完的文件", "type": "list",
+         "hint": "用逗号分开，一般不用改"},
     ]},
     {"title": "上传", "fields": [
-        {"key": "upload.mode", "label": "上传模式", "type": "select", "options": UPLOAD_MODES,
-         "hint": "纯秒传 = 云端有同 hash 才收，永不普通上传；未命中就排队等，隔一段时间再发一次校验请求。"
-                 "秒传优先 = 重试耗尽后转分块上传"},
-        {"key": "upload.concurrency", "label": "并发文件数", "type": "int", "min": 1, "max": 8},
-        {"key": "upload.small_file_mb", "label": "小文件阈值（MB）", "type": "float", "min": 0,
-         "hint": "仅「秒传优先」模式生效：小于它，秒传未命中就直接分块上传，不排队重试"},
-        {"key": "upload.partsize_mb", "label": "分块大小（MB）", "type": "int", "min": 1, "max": 512},
-        {"key": "upload.init_min_interval", "label": "秒传请求最小间隔（秒）", "type": "float", "min": 0},
-        {"key": "upload.conflict_strategy", "label": "同名冲突处理", "type": "select",
-         "options": ["overwrite", "rename", "skip"]},
-        {"key": "upload.transient_retries", "label": "分块瞬时重试次数", "type": "int", "min": 0, "max": 10},
+        {"key": "upload.mode", "label": "上传方式", "type": "select", "options": UPLOAD_MODES,
+         "hint": "「只秒传」最省流量：云端已经有同样的文件就瞬间完成，一个字节都不用传；"
+                 "没有就排队等，隔一会儿再问一次，绝不真上传"},
+        {"key": "upload.concurrency", "label": "同时处理几个文件", "type": "int", "min": 1, "max": 8,
+         "hint": "默认 2。网络吃紧就改成 1"},
+        {"key": "upload.small_file_mb", "label": "小文件就别等秒传了（MB）", "type": "float", "min": 0,
+         "hint": "只有「先试秒传，等不到就真上传」这种模式用得上；「只秒传」模式下无效"},
+        {"key": "upload.conflict_strategy", "label": "115 上已经有同名文件怎么办", "type": "select",
+         "options": [{"value": "overwrite", "label": "用新的盖掉旧的"},
+                     {"value": "rename", "label": "两个都留，新的改个名"},
+                     {"value": "skip", "label": "旧的留着，新的不要"}]},
+        {"key": "upload.partsize_mb", "label": "上传切多大一块（MB）", "type": "int", "min": 1, "max": 512,
+         "advanced": True, "hint": "一般不用改"},
+        {"key": "upload.init_min_interval", "label": "两次请求至少隔几秒", "type": "float", "min": 0,
+         "advanced": True, "hint": "防止被 115 限流，一般不用改"},
+        {"key": "upload.transient_retries", "label": "网络抽风时多试几次", "type": "int", "min": 0, "max": 10,
+         "advanced": True},
     ]},
-    {"title": "秒传重试", "fields": [
-        {"key": "retry.interval_seconds", "label": "重试间隔（秒）", "type": "int", "min": 1, "max": 86400,
-         "hint": "每轮只重发校验请求，不传任何数据"},
-        {"key": "retry.max_count", "label": "短间隔重试次数", "type": "int", "min": 0, "max": 100,
-         "hint": "纯秒传：前这么多轮用上面的短间隔，之后改用下面的长间隔一直等；"
-                 "秒传优先：超过这个次数即算重试耗尽"},
-        {"key": "retry.long_interval_seconds", "label": "长间隔（秒 · 仅纯秒传）", "type": "int",
+    {"title": "秒传没成功时要等多久", "fields": [
+        {"key": "retry.interval_seconds", "label": "先每隔几秒问一次", "type": "int", "min": 1, "max": 86400,
+         "hint": "只是问一句「这个文件现在有了吗」，不传数据、不费流量"},
+        {"key": "retry.max_count", "label": "这样问几次", "type": "int", "min": 0, "max": 100,
+         "hint": "问完这么多次还没等到，就换成下面的慢节奏继续等"},
+        {"key": "retry.long_interval_seconds", "label": "之后每隔几秒问一次", "type": "int",
          "min": 1, "max": 86400,
-         "hint": "短间隔用完后改成这个节奏继续等云端出现同 hash，默认 900（15 分钟）"},
-        {"key": "retry.max_hours", "label": "重试最长等待（小时）", "type": "float", "min": 0,
-         "hint": "仅「秒传优先」模式生效：累计超过这么多小时就放弃重试，转普通上传"},
+         "hint": "默认 900 秒（15 分钟）。「只秒传」模式会一直问下去，不会放弃"},
+        {"key": "retry.max_hours", "label": "最多等多久就放弃（小时）", "type": "float", "min": 0,
+         "hint": "只有「先试秒传，等不到就真上传」这种模式用得上"},
     ]},
-    {"title": "通知别的程序（Webhook）", "fields": [
-        {"key": "notify.enabled", "label": "启用通知", "type": "bool",
-         "hint": "秒传命中 / 分块上传完成后 POST 一个事件给别的程序，让它立刻同步这个文件"},
-        {"key": "notify.url", "label": "通知地址", "type": "text",
-         "hint": "symedia「链接同步」收事件用的端点：http://127.0.0.1:8095/api/v1/webhook/clouddrive2/file_notify"},
-        {"key": "notify.query", "label": "URL 查询串", "type": "text",
-         "hint": "例：device_name=upilot-mini&user_name=upilot-mini&type=notify"},
-        {"key": "notify.path_prefix", "label": "路径前缀（115 → 对方视角）", "type": "text",
-         "hint": "通知里的路径会在 115 网盘路径前面补上它。symedia 认的是 CD2 挂载路径，例 /CloudNAS/CloudDrive/115open"},
-        {"key": "notify.auth", "label": "Authorization 头（可选）", "type": "secret",
-         "hint": "对方要认证时填，如 Basic xxx / Bearer xxx；留空 = 不带"},
-        {"key": "notify.on", "label": "通知时机", "type": "select",
-         "options": [{"value": "rapid_hit", "label": "只在秒传命中时"},
-                     {"value": "uploaded", "label": "只在分块上传完成后"},
-                     {"value": "both", "label": "两者都通知"}],
-         "hint": "纯秒传模式下几乎都是「秒传命中」"},
-        {"key": "notify.timeout", "label": "超时（秒）", "type": "float", "min": 1, "max": 120},
-        {"key": "notify.retries", "label": "失败重试次数", "type": "int", "min": 0, "max": 5},
+    {"title": "传完了告诉别的程序（可选）", "fields": [
+        {"key": "notify.enabled", "label": "开启", "type": "bool",
+         "hint": "文件传好之后通知别人一声。比如让 symedia 马上把播放用的文件建好，不用等它自己慢慢扫"},
+        {"key": "notify.on", "label": "什么时候告诉它", "type": "select",
+         "options": [{"value": "rapid_hit", "label": "秒传一成功就告诉（推荐）"},
+                     {"value": "uploaded", "label": "真上传完了才告诉"},
+                     {"value": "both", "label": "两种情况都告诉"}],
+         "hint": "「只秒传」模式下基本都是秒传成功，选第一个就行"},
+        {"key": "notify.url", "label": "告诉谁 · symedia 地址", "type": "text",
+         "hint": "只填地址就行，例：http://172.17.0.1:8095（172.17.0.1 表示「这台机器」）。"
+                 "后面的接口路径和固定参数会自动补上"},
+        {"key": "notify.path_prefix", "label": "对方看到的路径开头", "type": "text", "advanced": True,
+         "hint": "对方按 CD2 挂载路径找文件。默认值就是 symedia 的标准挂载，不用改"},
+        {"key": "notify.query", "label": "地址后面固定带的参数", "type": "text", "advanced": True,
+         "hint": "留空即可，程序会带默认值（device_name=upilot-mini&user_name=upilot-mini&type=notify）"},
+        {"key": "notify.auth", "label": "对方要求密码时填这里", "type": "secret", "advanced": True,
+         "hint": "比如 Basic xxxxx；对方没要求就留空"},
+        {"key": "notify.timeout", "label": "最多等对方几秒", "type": "float", "min": 1, "max": 120,
+         "advanced": True, "hint": "对方忙着处理、来不及回话也算成功，不会重复发"},
+        {"key": "notify.retries", "label": "没送到就再试几次", "type": "int", "min": 0, "max": 5,
+         "advanced": True},
     ]},
-    {"title": "界面与鉴权", "fields": [
-        {"key": "http.enabled", "label": "启用 Web 界面", "type": "bool"},
-        {"key": "http.host", "label": "监听地址", "type": "text", "restart": True},
-        {"key": "http.port", "label": "监听端口", "type": "int", "min": 1, "max": 65535, "restart": True},
-        {"key": "http.public_url", "label": "对外地址（可选）", "type": "text",
-         "hint": "登录页底部显示用，例如 https://up.example.com"},
-        {"key": "http.auth.enabled", "label": "开启登录鉴权", "type": "bool"},
-        {"key": "http.auth.mode", "label": "鉴权方式", "type": "select", "options": ["form", "basic"],
-         "hint": "form = 站内登录页；basic = 浏览器原生弹框"},
-        {"key": "http.auth.username", "label": "登录用户名", "type": "text"},
-        {"key": "http.auth.password", "label": "登录密码", "type": "secret",
-         "hint": "留空 = 不改；改了等于换签名密钥，已登录的浏览器会全部失效"},
-        {"key": "http.auth.session_hours", "label": "登录状态保持（小时）", "type": "int", "min": 1, "max": 8760},
+    {"title": "网页面板", "fields": [
+        {"key": "http.enabled", "label": "打开网页面板", "type": "bool"},
+        {"key": "http.auth.enabled", "label": "打开时要输密码", "type": "bool"},
+        {"key": "http.auth.mode", "label": "怎么登录", "type": "select",
+         "options": [{"value": "form", "label": "站内登录页（和面板同一个风格）"},
+                     {"value": "basic", "label": "浏览器自带的账号密码小弹窗"}],
+         "hint": "选第一个就行；弹窗那个是浏览器原生的白底框，比较丑"},
+        {"key": "http.auth.username", "label": "用户名", "type": "text"},
+        {"key": "http.auth.password", "label": "密码", "type": "secret",
+         "hint": "留空 = 不改。改了之后，已登录的浏览器都要重新登一次"},
+        {"key": "http.auth.session_hours", "label": "登录一次管多久（小时）", "type": "int",
+         "min": 1, "max": 8760},
+        {"key": "http.port", "label": "面板端口", "type": "int", "min": 1, "max": 65535, "restart": True,
+         "hint": "默认 9844，一般不用改"},
+        {"key": "http.public_url", "label": "对外网址（可选）", "type": "text", "advanced": True,
+         "hint": "填了会显示在登录页底部，比如 https://up.example.com"},
+        {"key": "http.host", "label": "监听地址", "type": "text", "restart": True, "advanced": True,
+         "hint": "0.0.0.0 = 所有网卡都能访问，一般不用改"},
     ]},
-    {"title": "日志", "fields": [
-        {"key": "log_level", "label": "日志级别", "type": "select",
-         "options": ["DEBUG", "INFO", "WARNING", "ERROR"], "restart": True},
+    {"title": "运行日志", "fields": [
+        {"key": "log_level", "label": "记多详细", "type": "select", "restart": True,
+         "options": [{"value": "DEBUG", "label": "最详细（排查问题时才用）"},
+                     {"value": "INFO", "label": "正常（推荐）"},
+                     {"value": "WARNING", "label": "只看警告和错误"},
+                     {"value": "ERROR", "label": "只看错误"}]},
     ]},
 ]
 
@@ -471,6 +491,16 @@ def form_payload(cfg: dict) -> dict:
                     for m in (value or []) if isinstance(m, dict))
             else:
                 item["value"] = value
+            # 按当前配置补一句提示，免得在「只秒传」模式下白折腾用不到的项
+            if cfg["upload"].get("mode") == "rapid_only":
+                if field["key"] in ("upload.small_file_mb", "retry.max_hours"):
+                    item["note"] = "当前是「只秒传」模式，这一项用不到"
+            nt = cfg.get("notify") or {}
+            if (field["key"] == "notify.on" and nt.get("on") == "uploaded"
+                    and cfg["upload"].get("mode") == "rapid_only"):
+                item["note"] = "「只秒传」模式下永远不会真上传，选这项就收不到通知"
+            if field["key"] == "notify.url" and nt.get("enabled") and not nt.get("url"):
+                item["note"] = "已经开启但还没填地址，现在是不会发通知的"
             fields.append(item)
         groups.append({"title": group["title"], "fields": fields})
     return {"groups": groups, "path": str(CONFIG_PATH)}
