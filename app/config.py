@@ -100,7 +100,7 @@ DEFAULTS: dict = {
         "path_prefix": "",
         "auth": "",                  # 可选：Basic xxx / Bearer xxx
         "on": "rapid_hit",           # rapid_hit | uploaded | both
-        "timeout": 10,
+        "timeout": 20,               # symedia 收到后会先建 strm 再回执，给宽一点
         "retries": 2,
     },
     "state": {"db": "/config/state.db"},

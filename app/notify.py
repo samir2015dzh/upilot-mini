@@ -116,6 +116,14 @@ class Notifier:
                     detail = ""
                 last = f"HTTP {exc.code} {detail}".strip()
             except Exception as exc:  # noqa: BLE001
+                # 读超时说明请求已经送到了、只是对方忙着处理没及时回执（symedia 收到后
+                # 会立刻建 strm + 刮削，回得比较慢）—— 这种情况既不算失败也不重发，
+                # 否则它会为同一个文件白跑一遍。
+                if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+                    target = urllib.parse.urlsplit(url).netloc or url
+                    logger.info("已通知 %s：%s（%s，对方未及时回执）",
+                                target, self.map_path(cloud_path), mode)
+                    return True, "sent(no ack)"
                 last = f"{type(exc).__name__}: {exc}"
             if attempt < self.retries:
                 time.sleep(1.5 * (attempt + 1))
