@@ -70,6 +70,21 @@ COOKIE_NAME = "upilot_session"
 DEFAULT_SESSION_HOURS = 72
 
 # 115 扫码登录会话（内存）：{token, png, ts, app}
+def _qr_api(path: str, params: dict, timeout: float = 10.0) -> dict:
+    """直接打 115 的扫码接应接口（prompt.php / slogin.php）。
+
+    这两个接口不需要 cookie，也不能借 P115Client 的实例去调 —— 那个对象一构造就会走登录流程
+    （没有 cookie 时直接抛错），所以这里用标准库自己发请求。
+    """
+    import urllib.parse
+    import urllib.request
+
+    url = "https://qrcodeapi.115.com" + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 QR_SESSION: dict = {}
 QR_TTL = 300            # 二维码有效期（秒）
 MAX_LOGIN_FAILURES = 5          # 同一来源连续失败次数上限
@@ -318,7 +333,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             # 115 的 /get/status/ 是长轮询：有状态变化会立刻返回，空闲时才会一直挂着。
             # 给 5 秒读超时（底层默认还会重试，总耗时约 15 秒），超时按“还没扫”处理，
             # 这样扫码后最多十几秒就能看到状态变化，前端也不会被拖住。
-            resp = P115Client.login_qrcode_scan_status(token, timeout=5)
+            resp = P115Client.login_qrcode_scan_status(token, timeout=12)
         except Exception as exc:  # noqa: BLE001
             logger.debug("扫码状态长轮询超时，按未扫描处理：%s", exc)
             return {"status": "waiting", "message": "等待扫码…"}
@@ -343,16 +358,12 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             if not QR_SESSION.get("scanned"):
                 QR_SESSION["scanned"] = True
                 try:
-                    # 注意：prompt.php / slogin.php 是实例方法（token/status/result 是静态方法），
-                    # 用类名直接调会把 payload 当成 self，所以这里建一个轻量客户端。
-                    cli = P115Client(app=app)
-                    scan = cli.login_qrcode_scan({"uid": uid_hint}, timeout=8)
+                    scan = _qr_api("/api/2.0/prompt.php", {"uid": uid_hint})
                     sdata = (scan.get("data") or {}) if isinstance(scan, dict) else {}
                     key = str(sdata.get("key") or (scan or {}).get("key") or "")
                     QR_SESSION["key"] = key
                     if key:
-                        cli.login_qrcode_scan_confirm(
-                            {"key": key, "uid": uid_hint, "client": 0}, timeout=8)
+                        _qr_api("/api/2.0/slogin.php", {"key": key, "uid": uid_hint, "client": 0})
                         QR_SESSION["confirmed"] = True
                         logger.info("已接应扫码：prompt.php + slogin.php 都发出（uid 长度 %d）", len(uid_hint))
                     else:

@@ -440,27 +440,20 @@ async def case_qr_prompt_confirm_flow():
         calls.append(("result", app))
         return {"state": True, "data": {"cookie": {"UID": "u", "CID": "c", "SEID": "s", "KID": "k"}}}
 
-    class _Cli:
-        def __init__(self, *a, **k):
-            calls.append(("cli",))
-
-        def login_qrcode_scan(self, payload, **kw):
-            calls.append(("prompt", str(payload.get("uid"))[:1]))
+    def fake_qr_api(path, params, timeout=10.0):
+        """替掉真实 HTTP：只记录接应调用，断言 prompt 必须先于 confirm。"""
+        if path.endswith("prompt.php"):
+            calls.append(("prompt", str(params.get("uid"))[:1]))
             return {"state": True, "data": {"key": "KEY123"}}
-
-        def login_qrcode_scan_confirm(self, payload, **kw):
-            calls.append(("confirm", payload.get("key"), payload.get("client")))
-            return {"state": True}
+        calls.append(("confirm", params.get("key"), params.get("client")))
+        return {"state": True}
 
     fake = types.ModuleType("p115client")
     fake.P115Client = type("P115Client", (), {
-        "__init__": _Cli.__init__,
         "login_qrcode_token": staticmethod(token),
         "login_qrcode": staticmethod(qrcode),
         "login_qrcode_scan_status": staticmethod(scan_status),
         "login_qrcode_scan_result": staticmethod(scan_result),
-        "login_qrcode_scan": _Cli.login_qrcode_scan,
-        "login_qrcode_scan_confirm": _Cli.login_qrcode_scan_confirm,
     })
 
     def post_json(url, payload):
@@ -481,6 +474,8 @@ async def case_qr_prompt_confirm_flow():
 
     old_mod = sys.modules.get("p115client")
     old_path = cfgmod.CONFIG_PATH
+    old_api = webui._qr_api
+    webui._qr_api = fake_qr_api
     sys.modules["p115client"] = fake
     try:
         cfgmod.CONFIG_PATH = pathlib.Path(tmp) / "config.yaml"
@@ -497,16 +492,17 @@ async def case_qr_prompt_confirm_flow():
         assert code == 200 and b"done" in body, (code, body[:160])
 
         kinds = [c[0] for c in calls]
-        assert kinds == ["token", "img", "status", "cli", "prompt", "confirm", "status", "result"], kinds
+        assert kinds == ["token", "img", "status", "prompt", "confirm", "status", "result"], kinds
         assert ("confirm", "KEY123", 0) in calls, calls
         text = cfgmod.CONFIG_PATH.read_text(encoding="utf-8")
         assert "UID=u" in text and "KID=k" in text, text[:200]
-        PASS.append("[11] 扫码流程接应：status=1 时 prompt.php + slogin.php（实例调用）→ status=2 → 取 cookie；"
+        PASS.append("[11] 扫码流程接应：status=1 时先 prompt.php 再 slogin.php → status=2 → 取 cookie；"
                     "顺序 " + " → ".join(kinds))
     finally:
         if srv is not None:
             srv.shutdown()
         cfgmod.CONFIG_PATH = old_path
+        webui._qr_api = old_api
         if old_mod is not None:
             sys.modules["p115client"] = old_mod
         else:
