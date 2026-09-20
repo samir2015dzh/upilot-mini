@@ -229,7 +229,7 @@ function renderTasks() {
   $("#t-status").querySelectorAll("button").forEach(b => {
     b.onclick = () => { t.status = b.dataset.status; t.page = 1; loadTasks(); };
   });
-  $("#t-limit").value = String(t.limit);
+  renderLimitDd(t.limit);
   $("#t-q").value = t.q;
 
   const rows = t.rows.map(f => {
@@ -338,19 +338,56 @@ function renderSettings(payload) {
 }
 
 function fillQrApps(groups) {
-  const sel = $("#qr-app");
-  if (!sel) return;
+  const wrap = $("#qr-app");
+  if (!wrap) return;
   let f = null;
   (groups || []).forEach(g => (g.fields || []).forEach(x => { if (x.key === "p115.app") f = x; }));
   if (!f) return;
-  sel.innerHTML = (f.options || []).map(o => {
+  wrap.dataset.value = f.value ?? "";
+  wrap.innerHTML = ddInner(f.options, f.value);
+  const pill = $("#qr-slot");
+  if (pill) pill.textContent = "槽位 " + ddLabel(f.options, f.value);
+}
+
+async function onSlotChanged(value, label) {
+  const pill = $("#qr-slot");
+  if (pill) pill.textContent = "槽位 " + label;
+  try {
+    await post("/api/config", { values: { "p115.app": value } });
+    toast("登录槽位已改为 " + label + "（点「获取二维码」即用）");
+    loadConfig();                     // 同步「115 账号」里同一个字段
+  } catch (e) { toast("槽位保存失败：" + e.message); }
+}
+
+/* 自定义下拉：原生 <select> 的弹层由系统绘制（Windows 上是白底），配上深色主题的浅色文字就看不清，
+   所以整个换成自己的按钮 + 面板，颜色完全可控。 */
+const DD_CHEV = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+
+function limitOptions() { return [20, 50, 100, 200].map(n => ({ value: String(n), label: n + " 条/页" })); }
+
+function renderLimitDd(value) {
+  const wrap = $("#t-limit");
+  if (!wrap) return;
+  wrap.dataset.value = String(value);
+  wrap.innerHTML = ddInner(limitOptions(), String(value));
+}
+
+function ddLabel(options, value) {
+  const cur = (options || []).find(o => String((o && typeof o === "object") ? o.value : o) === String(value ?? ""));
+  if (!cur) return value || "–";
+  return (typeof cur === "object") ? (cur.label || cur.value) : cur;
+}
+
+function ddInner(options, value) {
+  const items = (options || []).map(o => {
     const v = (o && typeof o === "object") ? o.value : o;
     const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
-    const note = (o && typeof o === "object" && o.qr === false) ? "（115 已不支持扫码）" : "";
-    return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}${note}</option>`;
+    const note = (o && typeof o === "object" && o.qr === false) ? '<span class="note">115 已不支持扫码</span>' : "";
+    const on = String(value ?? "") === String(v) ? " on" : "";
+    return `<button type="button" class="dd-opt${on}" data-value="${esc(v)}" data-label="${esc(lb)}"><span class="lb">${esc(lb)}</span>${note}</button>`;
   }).join("");
-  const pill = $("#qr-slot");
-  if (pill) pill.textContent = "槽位 " + (sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "–");
+  return `<button type="button" class="dd-btn"><span class="lb">${esc(ddLabel(options, value))}</span>${DD_CHEV}</button>
+    <div class="dd-panel">${items}</div>`;
 }
 
 function fieldHtml(f) {
@@ -364,14 +401,8 @@ function fieldHtml(f) {
     </div>`;
   }
   if (f.type === "select") {
-    const opts = (f.options || []).map(o => {
-      const v = (o && typeof o === "object") ? o.value : o;
-      const lb = (o && typeof o === "object") ? (o.label || o.value) : o;
-      const note = (o && typeof o === "object" && o.qr === false) ? "（115 已不支持扫码）" : "";
-      return `<option value="${esc(v)}" ${String(f.value) === String(v) ? "selected" : ""}>${esc(lb)}${note}</option>`;
-    }).join("");
     return `<div class="f"><label>${label}${tag}</label>
-      <select data-key="${key}" data-type="select">${opts}</select>${hint}</div>`;
+      <div class="dd" data-key="${key}" data-type="select" data-value="${esc(f.value ?? "")}">${ddInner(f.options, f.value)}</div>${hint}</div>`;
   }
   if (f.type === "map") {
     const rows = f.rows || 5;
@@ -399,6 +430,7 @@ async function saveSettings() {
   $("#settings-groups").querySelectorAll("[data-key]").forEach(el => {
     const key = el.dataset.key, type = el.dataset.type;
     if (type === "bool") values[key] = el.checked;
+    else if (el.classList.contains("dd")) values[key] = el.dataset.value;
     else values[key] = el.value;
   });
   $("#settings-groups").querySelectorAll("[data-clear]").forEach(el => {
@@ -445,7 +477,7 @@ function qrSetState(st, msg) {
 async function qrStart() {
   clearTimeout(qrTimer);
   const sel = $("#qr-app");
-  const app = sel ? sel.value : "";
+  const app = sel ? sel.dataset.value : "";
   $("#qr-state").textContent = "申请中…";
   $("#qr-msg").textContent = "正在按所选登录槽位申请二维码…";
   try {
@@ -494,16 +526,6 @@ function qrCancel() {
 
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
-  if ($("#qr-app")) $("#qr-app").onchange = async () => {
-    const sel = $("#qr-app");
-    const lb = sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : sel.value;
-    if ($("#qr-slot")) $("#qr-slot").textContent = "槽位 " + lb;
-    try {
-      await post("/api/config", { values: { "p115.app": sel.value } });
-      toast("登录槽位已改为 " + lb + "（点「获取二维码」即用）");
-    } catch (e) { toast("槽位保存失败：" + e.message); }
-  };
-
   $("#tab-overview").onclick = () => switchTab("overview");
   $("#tab-tasks").onclick = () => switchTab("tasks");
   $("#tab-settings").onclick = () => switchTab("settings");
@@ -528,7 +550,6 @@ function bind() {
   $("#t-refresh").onclick = () => { loadTasks(); refreshOverview(); toast("已刷新任务"); };
   $("#t-q").addEventListener("keydown", (e) => { if (e.key === "Enter") { S.tasks.q = e.target.value.trim(); S.tasks.page = 1; loadTasks(); } });
   $("#t-q").addEventListener("input", (e) => { S.tasks.q = e.target.value.trim(); });
-  $("#t-limit").onchange = (e) => { S.tasks.limit = Number(e.target.value); S.tasks.page = 1; loadTasks(); };
   $("#t-prev").onclick = () => { if (S.tasks.page > 1) { S.tasks.page--; loadTasks(); } };
   $("#t-next").onclick = () => { S.tasks.page++; loadTasks(); };
   $("#d-close").onclick = closeDrawer;
@@ -549,6 +570,28 @@ function bind() {
   $("#btn-reload-config").onclick = () => { loadConfig(); toast("已重新读取配置"); };
   $("#btn-refresh-logs").onclick = refreshLogs;
   document.addEventListener("click", (e) => {
+    const opt = e.target.closest(".dd-opt");            // 选一项
+    if (opt) {
+      const dd = opt.closest(".dd");
+      dd.dataset.value = opt.dataset.value;
+      dd.querySelectorAll(".dd-opt").forEach(x => x.classList.toggle("on", x === opt));
+      const lb = dd.querySelector(".dd-btn .lb");
+      if (lb) lb.textContent = opt.dataset.label || "";
+      dd.classList.remove("on");
+      if (dd.id === "qr-app") onSlotChanged(opt.dataset.value, opt.dataset.label || "");
+      else if (dd.id === "t-limit") { S.tasks.limit = Number(opt.dataset.value); S.tasks.page = 1; loadTasks(); }
+      return;
+    }
+    const ddBtn = e.target.closest(".dd-btn");          // 开/关面板
+    if (ddBtn) {
+      const dd = ddBtn.closest(".dd");
+      const wasOn = dd.classList.contains("on");
+      document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
+      if (!wasOn) dd.classList.add("on");
+      return;
+    }
+    if (!e.target.closest(".dd")) document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
+
     const sw = e.target.closest("[data-switch]");
     if (sw) {
       const on = sw.classList.toggle("on");
@@ -562,6 +605,12 @@ function bind() {
 
 /* ---------------- 启动 ---------------- */
 bind();
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
+});
+
+renderLimitDd(S.tasks.limit);
+
 const _startTab = (location.hash || "").replace("#", "");
 switchTab(["overview", "tasks", "settings"].includes(_startTab) ? _startTab : "overview");
 window.addEventListener("hashchange", () => {

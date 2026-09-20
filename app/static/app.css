@@ -152,7 +152,7 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 .pill.err{color:#fecdd3;border-color:rgba(251,113,133,.42)}
 #qr-canvas img{width:100%;height:100%;object-fit:contain;display:block}
 #qr-canvas .ok{color:#059669;font-size:13px}
-#qr-canvas .dim{color:#98a1b2;font-size:12px;text-align:center;padding:0 10px}
+#qr-canvas .dim{color:#454e5f;font-size:12.5px;text-align:center;padding:0 10px;font-weight:500}
 @media (max-width:520px){#qr-canvas{width:160px;height:160px;padding:12px}}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:40;
   background:rgba(17,19,26,.95);border:1px solid var(--line-2);color:var(--fg);
@@ -160,7 +160,8 @@ tbody tr:hover td{background:rgba(255,255,255,.025)}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 footer{color:var(--muted);opacity:.8;font-size:11.5px;margin-top:20px;text-align:center}
 .live{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
-.switch{position:relative;width:36px;height:21px;border-radius:999px;background:rgba(255,255,255,.13);cursor:pointer;transition:.2s;flex:none}
+.switch{position:relative;width:36px;height:21px;border-radius:999px;background:rgba(255,255,255,.13);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.16);cursor:pointer;transition:.2s;flex:none}
 .switch.on{background:rgba(52,211,153,.55)}
 .switch i{position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:#fff;transition:.2s}
 .switch.on i{left:18px}
@@ -171,7 +172,7 @@ footer{color:var(--muted);opacity:.8;font-size:11.5px;margin-top:20px;text-align
 input[type=text],input[type=number],input[type=password],select{font:inherit;color:var(--fg);
   background:rgba(255,255,255,.05);border:1px solid var(--line-2);border-radius:11px;
   padding:9px 12px;outline:none;transition:.16s ease}
-input::placeholder{color:rgba(255,255,255,.26)}
+input::placeholder{color:rgba(255,255,255,.38)}
 input[type=text]:hover,input[type=number]:hover,input[type=password]:hover,select:hover{border-color:rgba(255,255,255,.24)}
 input[type=text]:focus,input[type=number]:focus,input[type=password]:focus,select:focus{
   border-color:rgba(99,102,241,.85);box-shadow:0 0 0 3px rgba(99,102,241,.18);background:rgba(255,255,255,.06)}
@@ -249,3 +250,30 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
 .fieldline{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .fieldline label{color:var(--muted);font-size:12.5px;flex:none}
 .fieldline select{flex:1;min-width:0}
+
+/* ---------- 自定义下拉（原生 <select> 弹层是系统白底，深色主题下看不清字） ---------- */
+.dd{position:relative;width:100%}
+.dd-btn{width:100%;justify-content:space-between;gap:10px;text-align:left;
+  background:rgba(255,255,255,.05);border:1px solid var(--line-2);border-radius:11px;
+  padding:9px 12px;color:var(--fg);font:inherit}
+.dd-btn .lb{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dd-btn .chev{width:13px;height:13px;flex:none;opacity:.75;transition:transform .18s ease}
+.dd.on .dd-btn{border-color:rgba(99,102,241,.85);box-shadow:0 0 0 3px rgba(99,102,241,.18);background:rgba(255,255,255,.06)}
+.dd.on .dd-btn .chev{transform:rotate(180deg)}
+.dd-panel{position:absolute;z-index:25;left:0;top:calc(100% + 6px);min-width:100%;
+  width:max-content;max-width:min(460px,92vw);max-height:300px;overflow:auto;
+  display:none;padding:6px;border-radius:12px;border:1px solid var(--line-2);background:#171a24;
+  box-shadow:0 28px 60px -22px #000,0 0 0 1px rgba(0,0,0,.55)}
+.dd.on .dd-panel{display:block}
+.dd-opt{display:flex;align-items:center;gap:10px;width:100%;
+  background:transparent;border:1px solid transparent;border-radius:9px;padding:8px 10px;
+  color:var(--muted);font:inherit;text-align:left;cursor:pointer}
+.dd-opt .lb{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dd-opt .note{flex:none;margin-left:auto;font-size:10.5px;line-height:1.55;color:#fde68a;
+  border:1px solid rgba(251,191,36,.32);background:rgba(251,191,36,.1);border-radius:999px;padding:0 7px}
+.dd-opt:hover{background:rgba(255,255,255,.07);color:var(--fg);transform:none}
+.dd-opt.on{color:#e6e9f5;background:linear-gradient(180deg,rgba(99,102,241,.26),rgba(99,102,241,.12));
+  border-color:rgba(129,140,248,.5)}
+.dd-opt.on .lb::before{content:"✓ ";color:#a5b4fc}
+.fieldline .dd{flex:1;min-width:0}
+.fieldline-label{color:var(--muted);font-size:12.5px;flex:none}
