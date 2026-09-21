@@ -524,9 +524,17 @@ def case_a2a_token_resolution():
     """
     import importlib.util
 
-    repo_root = os.path.dirname(os.path.dirname(APP))
-    path = os.path.join(repo_root, "a2a_send.py")
-    assert os.path.isfile(path), f"仓库根应存在 a2a_send.py：{path}"
+    # 脚本的正式位置在仓库内 `tools/a2a_send.py`（随仓库分发，CI 检出也有）；
+    # 兼容历史位置（仓库根、以及仓库的上一级目录 —— 早先临时放在那里）。
+    # 注意 APP 已经指向 `<仓库根>/app`，所以仓库根是 dirname(APP)，不是 dirname(dirname())。
+    repo_root = os.path.dirname(APP)
+    candidates = [
+        os.path.join(repo_root, "tools", "a2a_send.py"),
+        os.path.join(repo_root, "a2a_send.py"),
+        os.path.join(os.path.dirname(repo_root), "a2a_send.py"),
+    ]
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    assert path, f"应能找到 a2a_send.py，找过：{candidates}"
     spec = importlib.util.spec_from_file_location("a2a_send_probe", path)
     assert spec is not None and spec.loader is not None, path
     mod = importlib.util.module_from_spec(spec)
@@ -556,7 +564,35 @@ def case_a2a_token_resolution():
     assert mod.resolve_token({"a2a_agents": {"peer": {"token": "X9"}}}) == "X9"
     assert mod.resolve_token({"a2a_agents": {"server": {"token": "X8"}}}) == "X8"
 
-    # ⑤ 取不到时明确失败，而不是静默给出空 Authorization 头
+    # ⑤ 端点解析：环境变量 > 配置里的 a2a_agents.server.url；都没有则明确失败。
+    #    （仓库是公开的，所以实现里不写死任何内网地址作默认值。）
+    saved_env = os.environ.get(mod.ENDPOINT_ENV)
+    try:
+        os.environ.pop(mod.ENDPOINT_ENV, None)
+        assert mod.resolve_endpoint({"a2a_agents": {"server": {"url": "https://example.invalid/"}}}) \
+            == "https://example.invalid/", "未按 a2a_agents.server.url 解析端点"
+        os.environ[mod.ENDPOINT_ENV] = "https://env.invalid/"
+        assert mod.resolve_endpoint({"a2a_agents": {"server": {"url": "https://example.invalid/"}}}) \
+            == "https://env.invalid/", "环境变量应优先于配置"
+        os.environ.pop(mod.ENDPOINT_ENV, None)
+        try:
+            mod.resolve_endpoint({})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("无端点时应明确失败")
+        # 端点不该被硬编码在源码里。断言字符串用拼接写，免得断言自身
+        # 把这个地址留在公开仓库里（否则"搜不到残留"永远搜得到自己）。
+        hardcoded = "her" + ".ding" + ".cab"
+        src = open(path, encoding="utf-8").read()
+        assert hardcoded not in src, "公开仓库里不该写死内部 A2A 地址"
+    finally:
+        if saved_env is None:
+            os.environ.pop(mod.ENDPOINT_ENV, None)
+        else:
+            os.environ[mod.ENDPOINT_ENV] = saved_env
+
+    # ⑥ 取不到 token 时明确失败，而不是静默给出空 Authorization 头
     try:
         mod.resolve_token({})
     except SystemExit:
@@ -564,7 +600,17 @@ def case_a2a_token_resolution():
     else:
         raise AssertionError("无 token 时应明确失败，不能静默返回空")
 
-    # ⑥ 本机真实配置里确实能解析出生效 token（只断言形状，不打印值）
+    # ⑦ `send()` 必须能从配置解析出端点（防"改了常量名但 send 还在用旧名"这类
+    #    只在运行期炸、py_compile 抓不到的回归）。
+    import inspect as _insp
+    send_src = _insp.getsource(mod.send)
+    assert "resolve_endpoint(" in send_src, "send() 没走 resolve_endpoint（改了名字没同步）"
+    assert "ENDPOINT," not in send_src, "send() 还在用已删除的裸常量 ENDPOINT"
+    if os.path.isfile(mod.CFG):
+        live_cfg = mod.load_config()
+        assert mod.resolve_endpoint(live_cfg).startswith("http"), "本机配置应能解析出端点"
+
+    # ⑧ 本机真实配置里确实能解析出生效 token（只断言形状，不打印值）
     if os.path.isfile(mod.CFG):
         live = mod.load_token()
         assert isinstance(live, str) and len(live) >= 20, "本机配置应能解析出 token"
