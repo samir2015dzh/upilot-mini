@@ -58,7 +58,10 @@ class Uploader:
         self.retry_interval = int(rt["interval_seconds"])
         self.retry_max_count = int(rt["max_count"])
         self.retry_max_hours = float(rt["max_hours"])
-        self.stable_rounds = int(cfg["scan"]["stable_rounds"])
+        # scan.* 不在 RELOAD_PREFIXES 里（改扫描参数没必要重建 115 客户端），
+        # 所以这里绝不能缓存 scan 段的值：面板把它调小之后，扫描器会按新值把
+        # stable_count 停在 2，而上传器还拿着旧的 5 比较，文件会永远卡在「待处理」。
+        # 一律现读，与 scanner.py 保持一致。
         # 纯秒传：只发校验请求，命中与否取决于云端 hash 索引；未命中就等下一轮，永不普通上传
         self.mode = str(up.get("mode") or "rapid_then_upload")
         self.rapid_only = self.mode == "rapid_only"
@@ -183,9 +186,14 @@ class Uploader:
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
 
     def dispatch(self) -> None:
-        todo = [("待处理", False), ("待秒传", False), ("待重试", True)]
-        if not self.rapid_only:
-            todo.append(("待上传", False))            # 纯秒传模式不派发普通上传
+        # 「待上传」两种模式都得派发：非纯秒传时 _process 走分块上传；纯秒传时
+        # _process 开头那段兜底会把它拉回「待重试」。这里若按模式筛掉，库里残留的
+        # 「待上传」（切换模式前入队的、或 rapid_then_upload 时期转过来的）就永远不会
+        # 被自动派发 —— 只有人在界面点「立即处理」才救得回来，无人值守时一直卡着。
+        # 「处理中」同理必须捞：容器重启时若有文件正卡在算 SHA1，没人派发它就永远
+        # 停在「处理中」；派发后 _process 接着算完（已算好的直接复用）。
+        todo = [("待处理", False), ("处理中", False), ("待秒传", False),
+                ("待上传", False), ("待重试", True)]
         for status, due in todo:
             for rec in self.store.by_status(status, limit=100, due=due):
                 self.spawn(rec["path"])
@@ -208,8 +216,17 @@ class Uploader:
 
         # 1) 预处理：等稳定 + 算 SHA1
         if rec["status"] == "待处理":
-            if rec["stable_count"] < self.stable_rounds:
+            if rec["stable_count"] < int(self.cfg["scan"]["stable_rounds"]):
                 return                                   # 还没稳定，等下一轮扫描
+            # 大文件算 SHA1 要几十秒到几分钟，这段必须让它在界面上「看得见」：
+            # 置成「处理中」（active() 会捞它、前端渲染「计算 SHA1 xx%」，sha1_of
+            # 每秒回写 progress）。否则它一直是「待处理」，既不进「正在处理」区、
+            # 也不计入概览的正在处理数，看起来像卡死。
+            self.store.set(path, status="处理中")
+            rec = self.store.get(path)
+        if rec["status"] == "处理中":
+            # 已算过就秒回（sha1_of 复用落库的 sha1）；容器重启后残留的「处理中」
+            # 也落到这里，被 dispatch 捞起来接着算完，不会永久悬着。
             sha1 = await sha1_of(path, rec, self.store)
             self.store.set(path, status="待秒传", sha1=sha1)
             rec = self.store.get(path)

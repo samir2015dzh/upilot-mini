@@ -35,6 +35,18 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
 
+def _ddl_columns() -> list[tuple[str, str]]:
+    """从 DDL 里解析出 files 表的 (列名, 定义串)，供 _migrate 对齐老库。"""
+    body = DDL.split("CREATE TABLE IF NOT EXISTS files(", 1)[1].split(");", 1)[0]
+    out: list[tuple[str, str]] = []
+    for chunk in body.split(","):
+        decl = chunk.strip()
+        if not decl or decl.upper().startswith(("PRIMARY KEY", "CONSTRAINT", "UNIQUE", "FOREIGN")):
+            continue
+        out.append((decl.split()[0], decl))
+    return out
+
+
 class Store:
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -49,11 +61,23 @@ class Store:
             self.db.commit()
 
     def _migrate(self) -> None:
-        """老库补列（新增字段时用）。"""
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(files)").fetchall()}
-        for name, ddl in (("upload_mode", "ALTER TABLE files ADD COLUMN upload_mode TEXT"),):
-            if name not in cols:
-                self.db.execute(ddl)
+        """老库补列：按 DDL 全量对齐，以后新增字段不用再手工登记一条 ALTER。
+
+        原来只硬编码补 upload_mode 一列 —— 下次再往 DDL 加列、忘了同步这里，
+        老库就会缺列，而 store.set 写该列时 sqlite 直接报 "no such column"，
+        那条文件的上传状态就再也写不进去（报错被 spawn 的 try 兜住，只在日志里
+        留一行，界面上看不到，很难查）。
+        """
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(files)").fetchall()}
+        for name, decl in _ddl_columns():
+            if name in have or "PRIMARY KEY" in decl.upper():
+                continue
+            # sqlite 的 ALTER TABLE 不允许新增「NOT NULL 且无默认值」的列。
+            # 这类列只可能是最初建表就有的，老库不可能缺，跳过即可。
+            up = decl.upper()
+            if "NOT NULL" in up and "DEFAULT" not in up:
+                continue
+            self.db.execute(f"ALTER TABLE files ADD COLUMN {decl}")
 
     # ---------- 队列 ----------
 

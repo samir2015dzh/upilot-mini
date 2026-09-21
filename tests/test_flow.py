@@ -539,13 +539,18 @@ async def case_rapid_only_mode():
         assert "300s" in (rb["message"] or ""), rb["message"]     # 已切到长间隔
         assert rb["upload_mode"] is None, rb
 
-        # 3) 调度器不派发「待上传」；一旦被处理也拉回重试队列
+        # 3) 纯秒传下「待上传」不允许停在原地：会被派发，且 _process 立刻把它拉回重试队列。
+        #    绝不能因此发生一次普通上传（下面那条 upload_mode 断言才是核心保证）。
+        #    这正是「先按 rapid_then_upload 跑出一批待上传、之后切到只秒传」的自愈路径 ——
+        #    dispatch 若漏掉这个状态，那些文件会永久卡在「待上传」，无人值守时没人会发现。
         store.set(big, status="待上传")
         up.dispatch()
-        await asyncio.sleep(0.05)
-        assert store.get(big)["status"] == "待上传", store.get(big)   # 纯秒传下不碰它
-        await up._process(big)
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if store.get(big)["status"] != "待上传":
+                break
         assert store.get(big)["status"] == "待重试", store.get(big)
+        assert store.get(big)["upload_mode"] is None, store.get(big)   # 一次普通上传都没有
 
         # 4) 云端后来有了同 hash → 零上行命中
         mgr.fail_first = 0
@@ -991,6 +996,68 @@ def case_config_roundtrip():
                 "落盘 yaml 含 cleanup_previous_versions: true 且重载后仍在")
 
 
+async def case_status_selfheal():
+    """[21] 状态自愈：稳定阈值热改、算 SHA1 期间的「处理中」、残留状态能被捞起。
+
+    这几条都是「配置改了/重启了，文件却永久卡在某个中间状态」的同类问题：
+    代码里有兜底，但调度器压根不派发那个状态，兜底永远跑不到。
+    """
+    import uploader as upmod
+
+    # 1) scan.stable_rounds 调小：Uploader 必须现读配置，否则旧值更大 → 永久卡「待处理」
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=5, fail_first=0)
+    try:
+        path = write_file(src, "热改/s01e01.mkv", 2 * 1024 * 1024)
+        scanner.scan_once(store, cfg)                    # 入队，stable_count=0
+        cfg["scan"]["stable_rounds"] = 2                 # 面板调小；scan.* 不触发 Uploader 重建
+        for _ in range(4):
+            scanner.scan_once(store, cfg)                # scanner 按新值涨到 2 就停
+        rec = store.get(path)
+        assert rec["stable_count"] == 2 and rec["status"] == "待处理", rec
+        done = await drive(up, store, path)
+        assert done["status"] == "已上传", f"阈值热改后不该卡住：{done}"
+        assert not hasattr(up, "stable_rounds"), "Uploader 不应缓存 scan 段的值"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 2) 算 SHA1 期间状态是「处理中」（active() 能捞到 → 界面看得到进度）
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+    try:
+        path = write_file(src, "进度/s01e01.mkv", 3 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        seen: list[str] = []
+        real = upmod.sha1_of
+
+        async def spy(p, record, st):
+            seen.append(st.get(p)["status"])             # 记下「算 SHA1 那一刻」的状态
+            return await real(p, record, st)
+
+        upmod.sha1_of = spy
+        try:
+            await up._process(path)
+        finally:
+            upmod.sha1_of = real
+        assert seen == ["处理中"], f"算 SHA1 时应处于「处理中」，实得 {seen}"
+        # 这个用例只关心「算 SHA1 那一刻的状态」；_process 是完整状态机，
+        # 在 fail_first=0 的 stub 下会一路秒传命中走到「已上传」。
+        assert store.get(path)["status"] == "已上传", store.get(path)
+
+        # 3) 残留「处理中」（容器重启时卡住的那条）要被 dispatch 捞起来接着跑完
+        store.set(path, status="处理中", sha1=None)
+        up.dispatch()
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if store.get(path)["status"] != "处理中":
+                break
+        assert store.get(path)["status"] != "处理中", f"残留的「处理中」没被救回：{store.get(path)}"
+        assert store.get(path)["status"] not in ("处理中", "待处理"), store.get(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[21] 状态自愈：stable_rounds 热改后不再卡「待处理」（Uploader 不缓存 scan 段）；"
+                "算 SHA1 期间状态为「处理中」且 active() 可见；重启残留的「处理中」被 dispatch 捞回")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1011,6 +1078,7 @@ async def main():
     case_episode_key()
     case_upload_mark()
     case_config_roundtrip()
+    await case_status_selfheal()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

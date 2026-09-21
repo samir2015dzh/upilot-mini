@@ -115,6 +115,9 @@ DEFAULTS: dict = {
         "enabled": True,
         "host": "0.0.0.0",
         "port": 9844,
+        # 登录页底部显示的对外地址（可选，空 = 不显示）。面板上有这一项，
+        # DEFAULTS 里补上，免得 form_payload 每次都要靠 _dig 兜底读空串。
+        "public_url": "",
         # 反代/暴露到内网时打开：页面与 /api/* 需要 HTTP Basic 或 ?token=…
         # /health 始终放行（容器 HEALTHCHECK 在容器内直连）
         "auth": {"enabled": False, "mode": "basic", "username": "admin",
@@ -283,7 +286,10 @@ FIELD_GROUPS: list[dict] = [
         {"key": "upload.conflict_strategy", "label": "115 上已经有同名文件怎么办", "type": "select",
          "options": [{"value": "overwrite", "label": "用新的盖掉旧的"},
                      {"value": "rename", "label": "两个都留，新的改个名"},
-                     {"value": "skip", "label": "旧的留着，新的不要"}]},
+                     {"value": "skip", "label": "旧的留着，新的不要"}],
+         "hint": "注意：当前版本这一项还不生效，改它不会改变实际行为。"
+                 "115 自己的规则是同名自动改名（在扩展名前加 (1)）；上游上传接口没有提供"
+                 "冲突策略参数，所以先留着键位，等上游支持了再接上。"},
         {"key": "upload.delete_after_upload", "label": "传完就删掉本地源文件", "type": "bool",
          "danger_note": "删掉就找不回来了，确认 MoviePilot 那边不需要再留着它",
          "hint": "秒传命中（或分块传完）之后，把监控目录里那个源文件删掉，省地方。"
@@ -339,7 +345,8 @@ FIELD_GROUPS: list[dict] = [
          "advanced": True},
     ]},
     {"title": "网页面板", "fields": [
-        {"key": "http.enabled", "label": "打开网页面板", "type": "bool"},
+        {"key": "http.enabled", "label": "打开网页面板", "type": "bool", "restart": True,
+         "hint": "关掉之后这个页面就打不开了，要改回 compose 或配置文件再重建容器才行"},
         {"key": "http.auth.enabled", "label": "打开时要输密码", "type": "bool"},
         {"key": "http.auth.mode", "label": "怎么登录", "type": "select",
          "options": [{"value": "form", "label": "站内登录页（和面板同一个风格）"},
@@ -369,7 +376,8 @@ FIELD_GROUPS: list[dict] = [
 RELOAD_KEYS = {"p115.cookie", "p115.app"}          # 改了要重建 115 客户端
 # 这几段是 Uploader / Notifier 构造时读的：改了就顺手重建，免得非要重启容器才生效
 RELOAD_PREFIXES = ("notify.", "upload.", "retry.")
-RESTART_KEYS = {"http.host", "http.port", "log_level"}   # 改了要重建容器
+# http.enabled 只在 serve() 启动时读一次，改了必须重建容器（和 host/port 同类）
+RESTART_KEYS = {"http.enabled", "http.host", "http.port", "log_level"}
 
 
 def _dig(data: dict, key: str, default=None):
@@ -461,15 +469,18 @@ def coerce(field: dict, raw) -> object:
 def apply_values(cfg: dict, values: dict, clear_secrets: list | None = None) -> dict:
     """把界面提交的值写进内存 cfg。密钥类字段留空表示保持原值。
 
+    两阶段：先把所有值校验/规整完，再统一落进 cfg。任一字段非法（coerce 抛
+    ValueError）时内存 cfg 保持原样 —— 否则界面会提示「保存失败」，而排在它前面
+    的字段其实已经改了内存：磁盘没写、内存变了，容器重启前一直生效，最难排查。
+
     返回 {"changed": [...], "reload": bool, "restart": bool}
     """
     clear = {str(k) for k in (clear_secrets or [])}
-    changed: list[str] = []
+    staged: list[tuple[str, object]] = []
     for key, raw in (values or {}).items():
         field = find_field(key)
         if field is None:
             continue                                    # 白名单之外一律忽略
-        old = _dig(cfg, key)
         if field["type"] == "secret":
             text = str(raw or "").strip()
             if key in clear:
@@ -479,8 +490,11 @@ def apply_values(cfg: dict, values: dict, clear_secrets: list | None = None) -> 
             else:
                 continue                                # 留空 = 不改
         else:
-            new = coerce(field, raw)
-        if new != old:
+            new = coerce(field, raw)                    # 非法就在这里抛，此时还没动 cfg
+        staged.append((key, new))
+    changed: list[str] = []
+    for key, new in staged:
+        if new != _dig(cfg, key):
             _plant(cfg, key, new)
             changed.append(key)
     return {
