@@ -329,6 +329,256 @@ async def case_form_auth():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_login_limiter_source():
+    """[29] 登录限速的「来源」必须不可伪造。
+
+    `_client_ip()` 原来无条件信任 `X-Real-IP` / `X-Forwarded-For` —— 这两个头客户端
+    随便写，每换一个值就换一个限速 key，失败计数永远攒不到上限，登录限速形同虚设
+    （真机复现：同一来源换 12 次头、一次都没被锁）。而限速是本项目唯一的登录爆破防护。
+
+    修法：只有 `http.auth.trust_forwarded_ip = true`（确实挂在反代后面）才读这两个头，
+    默认直接 TCP 对端地址 —— 伪造头完全无效。本用例把开关两面都跑一遍，
+    并验证「换头」只在开关打开时才算不同来源（打开≠关掉限速）。
+    """
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+    webui._FAILURES.clear()                     # 限速表是模块级全局，先隔离
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):   # 保留 302，便于断言放行
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def login(pwd: str, fwd_ip: str = "") -> int:
+        data = urllib.parse.urlencode({"username": "upilot", "password": pwd}).encode()
+        req = urllib.request.Request(f"{base}/login", data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if fwd_ip:
+            req.add_header("X-Real-IP", fwd_ip)
+        try:
+            return opener.open(req, timeout=5).status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "mode": "form", "username": "upilot",
+                                "password": "s3cret-token", "session_hours": 72}}
+        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        # ① 默认（开关关）：换头无效 —— 同一来源连错必然被锁
+        cfg["http"]["auth"]["trust_forwarded_ip"] = False
+        webui._FAILURES.clear()
+        codes = [login("wrong", f"10.0.0.{i}") for i in range(1, 7)]
+        assert codes[:5] == [401] * 5, f"前 5 次错密码应 401，实际 {codes}"
+        assert codes[5] == 429, f"第 6 次应被限速锁住（换头不该换 key），实际 {codes}"
+
+        # ② 开关打开：头即来源，换头 ⇒ 换 key（真反代场景，各来源互不牵连）
+        cfg["http"]["auth"]["trust_forwarded_ip"] = True
+        webui._FAILURES.clear()
+        codes = [login("wrong", f"10.0.1.{i}") for i in range(1, 13)]
+        assert set(codes) == {401}, f"每个头都是新 key，不该被锁，实际 {codes}"
+
+        # ③ 开关打开后，同一个头连错仍会被锁（换的是来源，不是关掉限速）
+        webui._FAILURES.clear()
+        codes = [login("wrong", "10.0.2.7") for _ in range(6)]
+        assert codes[:5] == [401] * 5 and codes[5] == 429, f"同一来源仍应被锁，实际 {codes}"
+
+        # ④ X-Forwarded-For 的链路只取第一个（代理会往后追加，不能整串当 key）
+        webui._FAILURES.clear()
+        req = urllib.request.Request(f"{base}/login", data=b"username=upilot&password=wrong",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded",
+                                              "X-Forwarded-For": "10.0.3.9, 10.0.3.10"})
+        chain_codes = []
+        for _ in range(6):
+            try:
+                chain_codes.append(opener.open(req, timeout=5).status)
+            except urllib.error.HTTPError as exc:
+                chain_codes.append(exc.code)
+        assert chain_codes[5] == 429, f"同一链首来源应累积被锁，实际 {chain_codes}"
+
+        # ⑤ 关掉开关后，刚才生效的伪造头立刻失效
+        cfg["http"]["auth"]["trust_forwarded_ip"] = False
+        webui._FAILURES.clear()
+        codes = [login("wrong", f"10.0.4.{i}") for i in range(1, 7)]
+        assert codes[5] == 429, f"关掉开关后换头应无效，实际 {codes}"
+
+        # ⑥ 限速不该挡正常登录：锁的是来源，正确密码仍然放行
+        webui._FAILURES.clear()
+        assert login("s3cret-token") == 302, "正确密码应 302 放行"
+
+        PASS.append("[29] 登录限速来源不可伪造：默认关时换 X-Real-IP 仍累积被锁（第 6 次 429）、"
+                    "开关打开后按头区分来源（12 个不同头全 401 不误锁）、同一头仍会锁、"
+                    "X-Forwarded-For 链路只取首段、开关关回即失效、正确密码始终放行")
+    finally:
+        webui._FAILURES.clear()
+        if srv is not None:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_empty_username_session():
+    """[30] 用户名留空时会话必须仍然有效（否则登录成功却无限弹回登录页）。
+
+    `parse_session()` 用「返回用户名」表示通过，而 `check_auth` 原来写的是
+    `if parse_session(...):` —— 用户名是**空串**时 `bool('')` 为 False，签名完全正确的
+    会话被判成「没登录」。面板把「用户名」留空 + 登录页也不填 ⇒ 会话里存的就是空串：
+    POST /login 返回 302 + Set-Cookie（日志还打「登录成功」），浏览器带着这个 cookie
+    再访问又被弹回 /login。
+    """
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+    webui._FAILURES.clear()
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def post_login(fields: dict) -> tuple[int, str]:
+        data = urllib.parse.urlencode(fields).encode()
+        req = urllib.request.Request(f"{base}/login", data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            resp = opener.open(req, timeout=5)
+            return resp.status, resp.headers.get("Set-Cookie", "") or ""
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers.get("Set-Cookie", "") or ""
+
+    def with_cookie(cookie: str) -> int:
+        req = urllib.request.Request(f"{base}/api/status")
+        if cookie:
+            req.add_header("Cookie", cookie)
+        try:
+            return opener.open(req, timeout=5).status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        # 面板只设了密码、用户名留空
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "mode": "form", "username": "",
+                                "password": "s3cret-token", "session_hours": 72}}
+        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        # ① 未登录：API 401
+        assert with_cookie("") == 401, "未登录应 401"
+
+        # ② 登录页不填用户名 + 正确密码 → 应放行并下发会话
+        code, jar = post_login({"username": "", "password": "s3cret-token", "next": "/api/status"})
+        assert code == 302, f"用户名留空时正确密码应放行，实际 {code}"
+        cookie = jar.split(";", 1)[0]
+        assert cookie.startswith("upilot_session="), jar
+
+        # ★ 修复点：带着刚下发的 Cookie 必须放行，而不是又弹回登录页
+        assert with_cookie(cookie) == 200, "刚下发的会话被判未登录（登录循环）"
+
+        # ③ 反面对照：伪造 / 过期 / 错密码签的会话仍必须拒绝
+        assert with_cookie("upilot_session=ZmFrZXxleHA=.deadbeef") == 401, "伪造会话应 401"
+        expired = webui.make_session("", "s3cret-token", -1)
+        assert with_cookie(f"upilot_session={expired}") == 401, "过期会话应 401"
+        wrong_secret = webui.make_session("", "not-the-password", 1)
+        assert with_cookie(f"upilot_session={wrong_secret}") == 401, "错密码签的会话应 401"
+
+        # ④ 单元层面直接锤 bool('') 陷阱
+        a = {"enabled": True, "password": "p", "username": "", "mode": "form"}
+        tok = webui.make_session("", "p", 1)
+        assert webui.parse_session(tok, "p") == "", "空用户名的合法会话应通过签名校验"
+        assert bool(webui.parse_session(tok, "p")) is False, "旧写法把它当 False（这就是 bug）"
+        assert webui.parse_session(tok, "p") is not None, "判定必须用 is not None"
+        c = copy.deepcopy(cfgmod.DEFAULTS)
+        c["http"]["auth"] = a
+        assert webui.check_auth(c, {"Cookie": f"upilot_session={tok}"}, "") is True, \
+            "空用户名的合法会话必须放行"
+
+        # ⑤ 反面：面板填了用户名时，登录页不填用户名仍应被拒（不能修宽了）
+        cfg["http"]["auth"]["username"] = "admin"
+        webui._FAILURES.clear()
+        code, _ = post_login({"username": "", "password": "s3cret-token"})
+        assert code == 401, f"面板填了用户名却不填 → 应拒绝，实际 {code}"
+        code, jar = post_login({"username": "admin", "password": "s3cret-token"})
+        assert code == 302 and jar.startswith("upilot_session="), "填对用户名应放行"
+
+        PASS.append("[30] 用户名留空时会话仍有效：登录 302 下发 Cookie 且该 Cookie 访问 API 得 200"
+                    "（修复前 401 → 无限弹回登录页）；伪造/过期/错密码签仍拒绝；"
+                    "面板填了用户名时留空仍按错处理（未修宽）")
+    finally:
+        webui._FAILURES.clear()
+        if srv is not None:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_a2a_token_resolution():
+    """[31] A2A 凭据解析：嵌套 `a2a_agents.server.auth.token` → Bearer 认证头。
+
+    `a2a_agents` 在 config.yaml 里是**嵌套**结构（a2a_agents → server → auth → token），
+    不是平铺一层。写死取一层时取不到，只能靠字符串扫描，容易在结构与长度上出错
+    （真机第一次发就报 "no a2a token found"）。
+
+    本用例只验证「解析路径」与「header / payload 形状」，不联网、不打印 token 值。
+    """
+    import importlib.util
+
+    repo_root = os.path.dirname(os.path.dirname(APP))
+    path = os.path.join(repo_root, "a2a_send.py")
+    assert os.path.isfile(path), f"仓库根应存在 a2a_send.py：{path}"
+    spec = importlib.util.spec_from_file_location("a2a_send_probe", path)
+    assert spec is not None and spec.loader is not None, path
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    placeholder = "T0KEN_PLACEHOLDER"
+
+    # ① 已知嵌套路径必须命中
+    assert mod.resolve_token({"a2a_agents": {"server": {"auth": {"token": placeholder}}}}) \
+        == placeholder, "嵌套路径 a2a_agents.server.auth.token 未命中"
+
+    # ② header 形状：Bearer + token，且是 JSON
+    headers = mod.build_headers(placeholder)
+    assert headers["Authorization"] == f"Bearer {placeholder}", headers
+    assert headers["Content-Type"] == "application/json", headers
+
+    # ③ payload 结构：JSON-RPC message/send + parts[{kind:text}]
+    payload = mod.build_payload("PING", "ctx-1")
+    assert payload["jsonrpc"] == "2.0" and payload["method"] == "message/send", payload
+    msg = payload["params"]["message"]
+    assert msg["role"] == "user" and msg["parts"] == [{"kind": "text", "text": "PING"}], msg
+    assert msg["contextId"] == "ctx-1" and msg.get("messageId"), msg
+    # 不带 context 时不该凭空造一个
+    assert "contextId" not in mod.build_payload("PING")["params"]["message"]
+
+    # ④ 不绑死第一层：别的嵌套层次也要能兜底取到
+    assert mod.resolve_token({"a2a_agents": {"peer": {"token": "X9"}}}) == "X9"
+    assert mod.resolve_token({"a2a_agents": {"server": {"token": "X8"}}}) == "X8"
+
+    # ⑤ 取不到时明确失败，而不是静默给出空 Authorization 头
+    try:
+        mod.resolve_token({})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("无 token 时应明确失败，不能静默返回空")
+
+    # ⑥ 本机真实配置里确实能解析出生效 token（只断言形状，不打印值）
+    if os.path.isfile(mod.CFG):
+        live = mod.load_token()
+        assert isinstance(live, str) and len(live) >= 20, "本机配置应能解析出 token"
+        assert live == live.strip() and "\n" not in live, "token 不该带空白"
+        assert mod.build_headers(live)["Authorization"].startswith("Bearer ")
+        described = f"本机配置解析成功（长度 {len(live)}）"
+    else:
+        described = "本机无配置文件，仅验证解析逻辑"
+
+    PASS.append(f"[31] A2A 凭据解析：嵌套 a2a_agents.server.auth.token 命中（含多层兜底）、"
+                f"Bearer 头与 JSON-RPC message/send + parts[{{kind:text}}] 形状正确、"
+                f"取不到时明确失败；{described}")
+
+
 async def case_dir_mapping():
     """本机相对路径 → 115 目录：改名（Anime→/OtherAnime）、大小写、最长前缀、未命中兜底。"""
     cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1, fail_first=0, small_file_mb=0.0)
@@ -1703,6 +1953,9 @@ async def main():
     await case_save_cookie_atomic()
     await case_scan_now_wakes_loop()
     await case_ui_actions_wake_loop()
+    await case_login_limiter_source()
+    await case_empty_username_session()
+    case_a2a_token_resolution()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
