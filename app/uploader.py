@@ -392,19 +392,32 @@ class Uploader:
         """
         return _P115.cloud_ts(row)
 
-    async def _cloud_page(self, cid: int) -> list[dict]:
-        """列一个云端目录的**全部条目**（含子目录），分页取全。只读。"""
+    async def _cloud_page(self, cid: int) -> list[dict] | None:
+        """列一个云端目录的**全部条目**（含子目录），分页取全。只读。
+
+        返回 `None` 表示**列目录失败**（与「目录是空的」= `[]` 区分开）——
+        调用方据此不把这目录算进「已扫目录数」，否则 note 里的计数会骗人
+        （真机实测：3 条列目录失败的 warning，却报「扫了 3 个云端目录」）。
+
+        【必须走 `self.mgr.client`】—— `Uploader` 只持有 `self.mgr`（115 客户端在
+        `mgr.client` 上），写 `self.client` 会抛
+        `AttributeError: 'Uploader' object has no attribute 'client'`；
+        而巡检的 `except` 会把它降级成一行 warning、`removed` 恒为 0
+        —— 真机实测正是这个现象。`fs_files` 的 `data` 形状实测是 **list**，
+        不是 dict（写成 `data.get("list")` 会 `AttributeError: 'list' object has no attribute 'get'`），
+        所以下面三种形状都要兼容。
+        """
         out: list[dict] = []
         offset, page = 0, 1150
         prev_sig: tuple | None = None
         for _ in range(MAX_SWEEP_PAGES):
             try:
-                resp = await self.client.fs_files(
+                resp = await self.mgr.client.fs_files(
                     {"cid": str(cid), "offset": offset, "limit": page,
                      "show_dir": 1, "cur": 1}, async_=True)
             except Exception as exc:
                 logger.warning("同集巡检：列云端目录 %s 失败：%s", cid, exc)
-                break
+                return None                                # 失败 ≠ 空目录
             data = (resp or {}).get("data")
             if isinstance(data, dict):
                 rows = data.get("list") or []
@@ -439,6 +452,8 @@ class Uploader:
             return out
         seen.add(key)
         rows = await self._cloud_page(key)
+        if rows is None:
+            return out                                   # 列目录失败 → 不算「已扫」
         out.append((key, rows))
         if depth >= max_depth:
             return out

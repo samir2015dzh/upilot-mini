@@ -11,6 +11,7 @@ import builtins
 import copy
 import gc
 import glob
+import inspect
 import math
 import os
 import shutil
@@ -3284,12 +3285,25 @@ async def case_cloud_only_episode_cleanup():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- K) 巡检的列目录必须走 mgr.client（真机实测踩过：self.client 不存在）----
+    # 真机回贴：`'Uploader' object has no attribute 'client'` × 3，而巡检的 except 把它
+    # 降级成一行 warning、`removed` 恒为 0 —— 表现成「巡检跑了但清不掉」。
+    # `Uploader.__init__(cfg, store, manager)` 只存 `self.mgr`，115 客户端在 `mgr.client` 上。
+    up_src = inspect.getsource(Uploader)
+    assert "self.mgr.client" in up_src, "巡检列目录必须走 self.mgr.client"
+    assert "await self.client." not in up_src, \
+        "★ Uploader 没有 self.client，写成它会 AttributeError 并被 except 静默吞掉"
+    assert "return None                                # 失败 ≠ 空目录" in up_src or \
+           "return None" in inspect.getsource(Uploader._cloud_page), \
+        "列目录失败必须返回 None（与空目录区分），否则「已扫目录数」会骗人"
+
     PASS.append("[43] 同集清理改为**纯云端时间**判据（真机根因）：delete_after_upload=True 时"
                 "每个版本本地都被收尾删掉、source_deleted=1，任何「本地在不在」判据都会把同集"
                 "全部版本保护住 ⇒ 清理永久空转（真机 2 小时日志零行）；"
                 "新判据用 115 条目 `te`/`tp`/`tu` epoch 秒（`t` 字符串兜底），与本地无关；"
                 "用户场景 6 项全通（HDR后传删普通版 / 反向 / 让位护栏 / 无时间字段保守 + 可见 / "
-                "时间并列不动手 / 超上限跳过 / 不同集不碰）；端到端确认本地被删时仍能清理")
+                "时间并列不动手 / 超上限跳过 / 不同集不碰）；端到端确认本地被删时仍能清理；"
+                "巡检列目录走 mgr.client（真机踩过 self.client 不存在 → 静默恒 0）")
 
 
 async def main():
