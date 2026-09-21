@@ -492,8 +492,19 @@ class Uploader:
         removed = 0
         scanned = 0
         for td in roots:
+            # ★ 只查缓存、**不建目录**：巡检对「云端早已不存在的 target_dir」不能
+            # 触发 fs_makedirs（那会凭空建出空目录树）。拿不到 cid 说明这目录从没被
+            # 本程序传过东西，跳过即可。
+            getter = getattr(self.mgr, "cached_pid", None)
             try:
-                cid = await self.mgr.ensure_pid(td)
+                cid = (await getter(td)) if callable(getter) else await self.mgr.ensure_pid(td)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同集巡检：解析目录 %s 失败：%s", td, exc)
+                continue
+            if cid is None:
+                logger.debug("同集巡检：目录 %s 没有 cid 缓存，跳过（不建目录）", td)
+                continue
+            try:
                 tree = await self._cloud_walk(cid, 0, 3)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同集巡检：遍历 %s 失败：%s", td, exc)

@@ -266,6 +266,32 @@ class P115:
             logger.info("目录就绪 %s (cid=%s)", path, cid)
             return cid
 
+    async def cached_pid(self, cloud_dir: str) -> int | None:
+        """**只从缓存**解析目录 cid，绝不调 `fs_makedirs`。拿不到就返回 None。
+
+        巡检（`sweep_cloud_episode_duplicates`）专用。为什么不能直接用 `ensure_pid`：
+        它命中不了缓存时会 `fs_makedirs(path)` —— 对云端**早已不存在**的目录
+        （比如库里留着一条早已被删掉的 `target_dir`）会**凭空建出一整条空目录树**。
+        巡检是只读核对，不该有这种副作用。
+        拿不到 cid 意味着这目录从没被本程序传过东西（传过就会有缓存），跳过是对的。
+        """
+        path = normalize_cloud_path(cloud_dir)
+        if path == "/":
+            return 0
+        mem = getattr(self, "_cid_mem", None)
+        if isinstance(mem, dict) and path in mem:
+            return int(mem[path])
+        try:
+            cached = self.store.cid_get(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("巡检：读 cid 缓存失败 %s：%s", path, exc)
+            return None
+        if cached is not None:
+            if isinstance(mem, dict):
+                mem[path] = int(cached)
+            return int(cached)
+        return None
+
     async def forget_pid(self, cloud_dir: str) -> None:
         """秒传报 10014（云端目录不存在）时清缓存，让下一次 ensure_pid 真正重建目录。
 
@@ -563,7 +589,11 @@ class P115:
         key = episode_key(keep_name)
         if key is None:
             return {"deleted": [], "note": "认不出季集（文件名里没有 SxxExx），跳过"}
-        rows = await self.list_dir(pid)
+        # `use_cache=False`：必须拿**新鲜**的目录内容。
+        # 缓存 TTL 是 30 秒，而同一目录可能刚被另一集的清理/秒传流程列过 —— 那时
+        # 本次刚上传的那条还不在缓存列表里，会出现「刚传完、旧的却没被清掉」的落空
+        # （5 分钟巡检能兜底，但用户预期是传完就清）。删是破坏性动作，宁可多列一次。
+        rows = await self.list_dir(pid, use_cache=False)
         same = [r for r in rows
                 if episode_key(str(r.get("n") or r.get("name") or "")) == key]
         if not same:
@@ -762,8 +792,12 @@ class StubP115:
 
     # ---------- 洗板清理（dry-run 只打日志，不真删任何东西） ----------
 
-    async def list_dir(self, pid: int) -> list[dict]:
-        """dry-run 的「云端内容」：把已上传、且目标目录是本 pid 的记录还原成条目。"""
+    async def list_dir(self, pid: int, use_cache: bool = True) -> list[dict]:
+        """dry-run 的「云端内容」：把已上传、且目标目录是本 pid 的记录还原成条目。
+
+        `use_cache` 只为与真实 `P115.list_dir` 签名一致（dry-run 没有缓存，
+        忽略该参数）—— 调用方现在会传 `use_cache=False` 要求新鲜数据。
+        """
         cloud = next((p for p, c in self._mem.items() if int(c) == int(pid)), None)
         if cloud is None:
             return []
@@ -779,6 +813,10 @@ class StubP115:
 
     # 判断逻辑与真实客户端共用（只依赖 list_dir / delete_file）
     cleanup_previous = P115.cleanup_previous
+    # 纯云端时间判据同样共用（stub 条目无 te/tp/tu/t ⇒ cloud_ts 返回 0 ⇒ 自然「保守不动手」，
+    # 所以 dry-run 仍然安全）。不 alias 的话会走 Uploader 的 except AttributeError 回退老路径，
+    # 于是 dry-run 验证的还是老判据 —— 补上这行让两边判据一致。
+    cleanup_episode_newest = P115.cleanup_episode_newest
 
     async def rapid(self, file_path: str, size: int, sha1: str, pid: int) -> tuple[bool, dict]:
         n = self._rapid_calls.get(file_path, 0) + 1
