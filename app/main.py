@@ -56,8 +56,15 @@ _WAKE_POLL = 0.5
 # 同集巡检的间隔（秒）。用户要的是「上传到 115 以后校验那个文件夹里有没有同集的」，
 # 那就得**主动定期去查**，而不是只在上传完成那一刻顺带做一次 ——
 # 云端已经存在的重复，光等上传事件是永远等不到的。
-# 5 分钟一次：一次巡检只对「库里同集有多条的组」各发一次列目录，开销很小；
-# 关掉 `upload.cleanup_previous_versions` 时巡检内部直接返回 0，不发任何请求。
+#
+# 开销模型（实测，不是估算）：请求数 ≈ **遍历到的云端目录数**，每目录 1 页
+# `fs_files`（limit=1150 足够一页拿全）。真机现状 3 个目录 → 3 次请求；
+# 递归最深 3 层。列的是文件名+元数据，不碰文件内容、零流量；CPU 侧是对条目名做
+# 正则分组，毫秒级。清完之后每集只剩 1 条，分组处 `len < 2` 直接跳过、不发删除请求。
+# 开关 `upload.cleanup_previous_versions` 关着时入口直接返回，一个请求都不发。
+# 5 分钟一次（≈ 每轮 3 次请求）对 115 来说可以忽略；剧集变多后请求数线性增长，
+# 到时候把这里拉长即可（比如 30 分钟）。
+# ★ 巡检**必须 spawn 到后台**（见 `Uploader.spawn_sweep`）：前台 await 会把主循环按住。
 SWEEP_INTERVAL = 300.0
 
 
@@ -174,22 +181,18 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                 # 「本地肯定没有，本地文件在秒传完已经被删掉了」。
                 # 独立于上传事件，每 SWEEP_INTERVAL 秒主动核一次；幂等。
                 # 放在 paused 分支外面：巡检是「把云端已有的重复收敛掉」，不是派发上传任务。
+                # ★ 必须 spawn 到后台：原来这里是 `await`，巡检一跑就把主循环按住
+                # （实测 202 个目录时扫描间隔从 2s 变成 105s），其间不扫新文件、不派发任务。
                 if time.monotonic() - last_sweep >= SWEEP_INTERVAL:
                     last_sweep = time.monotonic()
-                    try:
-                        r = await uploader.sweep_cloud_episode_duplicates()
-                        if r.get("removed"):
-                            logger.info("同集巡检：%s", r.get("note"))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("同集巡检出错（不影响上传）：%s", exc)
+                    uploader.spawn_sweep()
                 # 「界面动作立刻巡检」：点「立即扫描 / 核对同集」也顺手核一遍，
                 # 免得用户刚传完还要等满 5 分钟才看到旧版被清掉。
                 if state.pop("sweep_now", False):
-                    try:
-                        r = await uploader.sweep_cloud_episode_duplicates()
-                        logger.info("同集巡检（界面触发）：%s", r.get("note"))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("同集巡检出错（不影响上传）：%s", exc)
+                    if uploader.spawn_sweep():
+                        logger.info("同集巡检（界面触发）：已开始核对云端同集")
+                    else:
+                        logger.info("同集巡检（界面触发）：上一轮还在跑，本次跳过")
             except Exception as exc:  # noqa: BLE001
                 logger.error("本轮扫描/调度出错：%s", exc)
             # 间隔每轮重读：界面上改了立刻生效。

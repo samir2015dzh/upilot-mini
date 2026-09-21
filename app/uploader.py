@@ -50,7 +50,8 @@ MAX_SWEEP_PAGES = 200
 #   - _bg 为空         → 旧实例被覆盖后，它的后台任务失去强引用，可能被 GC 回收；
 #   - _err_streak 清空 → 连续异常计数作废，退避重试永远到不了阈值。
 # 所以统一放模块级共享。sem 只在并发数真的变了时重建（容量要跟着配置走）。
-_SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None, "sem_n": -1}
+_SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
+                 "sem_n": -1, "sweep_running": False}
 
 
 async def sha1_of(path: str, record: dict, store) -> str:
@@ -625,6 +626,43 @@ class Uploader:
         if tail:
             cur = self.store.get(local_path) or {}
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
+
+    def spawn_sweep(self) -> bool:
+        """把同集巡检丢到**后台**跑，不阻塞主循环。返回是否真的起了任务。
+
+        为什么必须后台（实测数据，不是推测）：`scanner.scan_once()` / `uploader.dispatch()`
+        与巡检原本在**同一个协程**里 `await` —— 巡检一跑就把主循环按住，那期间**不扫新文件、
+        不派发上传任务**。忠实复现主循环调用形态的实测（RTT 0.5s、扫描间隔 2s）：
+          - 巡检 3 个目录（耗时 1.5s）：相邻两轮扫描间隔 `[3.56, 2.0, 2.02, 2.0]`
+            —— 第一轮被拖延 1.56s；
+          - 巡检 202 个目录（耗时 101s）：间隔 `[105.4, 2.0]` —— **被按住 105 秒**。
+        改后台后两种情况间隔都稳定在 2.0s。
+        （真机现状只有 3 个目录、耗时约 1.5s，影响很小；但剧集积累后会线性变差，
+        而「巡检是只读兜底」不该拖慢上传主链路。）
+
+        防重入：上一次巡检还没跑完就直接返回 False（巡检幂等，叠加没意义）。
+        强引用：任务存进 `_SHARED["bg"]`，防止跑到一半被 GC 回收（与 `spawn` 同款）。
+        """
+        if _SHARED.get("sweep_running"):
+            return False
+        _SHARED["sweep_running"] = True
+
+        async def run():
+            try:
+                r = await self.sweep_cloud_episode_duplicates()
+                if (r or {}).get("removed"):
+                    logger.info("同集巡检：%s", (r or {}).get("note"))
+                elif (r or {}).get("note"):
+                    logger.debug("同集巡检：%s", (r or {}).get("note"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同集巡检出错（不影响上传）：%s", exc)
+            finally:
+                _SHARED["sweep_running"] = False
+
+        task = asyncio.get_running_loop().create_task(run())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        return True
 
     def dispatch(self) -> None:
         # 这里必须覆盖**全部**非终态，否则那个状态的文件就永久卡住：
