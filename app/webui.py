@@ -184,7 +184,12 @@ def check_auth(cfg: dict, headers, query: str) -> bool:
     pwd = _password(a)
     if parse_qs(query).get("token", [""])[0] == pwd:
         return True
-    if parse_session(parse_cookie(headers.get("Cookie", "")).get(COOKIE_NAME, ""), pwd):
+    # 必须用 `is not None` 判断：parse_session 用「返回用户名」表示通过，
+    # 而用户名可以是**空串**（面板把「用户名」清空，或用户登录时不填）。
+    # 写成 `if parse_session(...):` 时 bool('') 为 False → 签名完全正确的会话
+    # 被判成「没登录」，浏览器带着刚发的 cookie 又被弹回 /login，无限循环
+    # （POST /login 返回 302 + Set-Cookie，日志还打「登录成功」）。
+    if parse_session(parse_cookie(headers.get("Cookie", "")).get(COOKIE_NAME, ""), pwd) is not None:
         return True
     raw = headers.get("Authorization", "")
     if raw.startswith("Basic "):
@@ -474,7 +479,11 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             pwd = str(fields.get("password") or "")
             if check_credentials(a, user, pwd):
                 _note_success(ip)
-                token = make_session(user or _username(a), _password(a), _session_hours(a))
+                # 会话里的 user 必须**非空**：面板把「用户名」留空时，登录页通常
+                # 也不会填用户名，这里就会把空串写进 token。虽然 check_auth 现在
+                # 用 `is not None` 判定了，存个非空标识更稳（用户名只用来展示，
+                # 鉴权靠签名）。
+                token = make_session(user or _username(a) or "user", _password(a), _session_hours(a))
                 logger.info("登录成功：%s（来源 %s）", user, ip)
                 return self._redirect(nxt, extra={
                     "Set-Cookie": self._cookie_header(token, _session_hours(a) * 3600)})
