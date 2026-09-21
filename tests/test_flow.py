@@ -2990,6 +2990,127 @@ async def case_same_name_duplicate_cleaned():
                 "显式 keep_names 始终保护、同集正当版本仍互不删、不同名旧版照旧清理")
 
 
+async def case_same_episode_time_judgment():
+    """[42] 洗板重下后**两个版本本地文件都在**时，旧版仍必须被清（真机报障第二次）。
+
+    真机现象（用户截图）：云端同集两条都在
+      `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv`（新下）
+      `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv`（旧的）
+    用户「重新下了一遍」后点重新排队，**还是一样没删**。
+
+    根因：第 37 处引入的保护判据是「本地文件还在 ⇒ 正当版本」，而洗板重下后旧版的本地
+    文件**也还在**（用户只是重新下了一份新的）⇒ 旧版被当成正当版本保护住 ⇒
+    `cleanup_previous` 返回「没有旧版本」⇒ 一条都不删。
+    本地已复现：NEW(刚传)/OLD(3 天前) 两条本地都在 → 保护集合含 OLD → deleted=[]。
+
+    修法：判据加**时间维度** —— 只有「内容入队时间与当前文件同批」
+    （差 ≤ `SAME_BATCH_SECONDS`）的才保护；明显更早的是上一轮洗板遗留的老版本，照旧清理。
+    必须用 `created_at` 而不是 `updated_at`：后者被每次状态写入刷新（scanner 推进
+    `stable_count`、秒传命中改 message、用户点「重新排队」都会刷新），用它会让老版本
+    看起来和新的差不多，判据失效。
+    另加护栏 `_newer_episode_sibling()`：同集已有**更新**的版本时本次不动手 ——
+    否则用户点在老版本上触发清理，会把真正的最新版删掉（结果与预期相反）。
+    另把「同集多条但一条都没删」的静默改成可见 note。
+    """
+    cfg, store, mgr, _up0, tmp, src = make_env(stable_rounds=1)
+    try:
+        cloud_dir = "/TVs/Drama"
+        cfg["paths"]["map"] = [{"from": "TVs", "to": "/TVs"}]
+        cfg["upload"]["cleanup_previous_versions"] = True
+        cfg["upload"]["cleanup_max_delete"] = 9
+        up = Uploader(cfg, store, mgr)
+        await mgr.ensure_pid(cloud_dir)
+
+        NEW = "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv"
+        OLD = "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"
+        assert p115.episode_key(NEW) == p115.episode_key(OLD), "构造前提：两条必须同集"
+
+        def stage(p_old: str, p_new: str, old_age_days: float):
+            """造「两条本地都在」的状态；old_age_days>0 ⇒ 旧版是上一轮洗板遗留。"""
+            store.set(p_old, status="已上传", target_dir=cloud_dir, file_id="fid-OLD")
+            store.db.execute("UPDATE files SET created_at=? WHERE path=?",
+                             (time.time() - old_age_days * 86400, p_old))
+            store.db.commit()
+            store.set(p_new, status="已上传", target_dir=cloud_dir, file_id="fid-NEW")
+            return p_old, p_new
+
+        # ═══ A) 洗板场景：OLD 明显更早 ⇒ 不保护，必须能被清 ═══
+        p_new = write_file(src, f"TVs/Drama/{NEW}", 9 * 1024 * 1024)
+        p_old = write_file(src, f"TVs/Drama/{OLD}", 7 * 1024 * 1024)
+        store.add(p_new, 9 * 1024 * 1024, os.path.getmtime(p_new))
+        store.add(p_old, 7 * 1024 * 1024, os.path.getmtime(p_old))
+        stage(p_old, p_new, old_age_days=3)
+        assert os.path.exists(p_old) and os.path.exists(p_new), "构造前提：两条本地都要在"
+        _fids, names = up._same_episode_keeps(cloud_dir, p_new)
+        assert OLD not in names, f"洗板遗留的旧版仍被保护（永远清不掉）：{names}"
+        assert NEW not in names, f"自己不该出现在保护集合里：{names}"
+
+        # ═══ B) 同批场景（第 37 处回归）：两条同一轮入队 ⇒ 必须互相保护 ═══
+        store.db.execute("UPDATE files SET created_at=? WHERE path=?", (time.time(), p_old))
+        store.db.commit()
+        _fids2, names2 = up._same_episode_keeps(cloud_dir, p_new)
+        assert OLD in names2, f"同批正当版本没被保护（互删会重现）：{names2}"
+
+        # ═══ C) 第 38 处回归：本地被程序收尾删掉、且同批 ⇒ 仍保护 ═══
+        os.remove(p_old)
+        store.set(p_old, source_deleted=1)
+        _fids3, names3 = up._same_episode_keeps(cloud_dir, p_new)
+        assert OLD in names3, f"delete_after_upload 收尾删掉的正当版本没被保护：{names3}"
+
+        # ═══ D) 护栏：点在**老版本**上 → 必须识别出更新的版本、让位 ═══
+        # 注意方向：当前文件（p_old）要**更早**、另一条（p_new）要**更新**，
+        # 这样才对应「用户点了老版本那条的重新排队」。C 段把两条都改过时间，这里重设回去。
+        os.remove(p_new)
+        write_file(src, f"TVs/Drama/{NEW}", 9 * 1024 * 1024)
+        store.set(p_new, status="已上传", target_dir=cloud_dir, file_id="fid-NEW")
+        store.set(p_old, source_deleted=0, status="已上传", target_dir=cloud_dir, file_id="fid-OLD")
+        if not os.path.exists(p_old):
+            open(p_old, "wb").write(b"o" * (7 * 1024 * 1024))
+        store.db.execute("UPDATE files SET created_at=? WHERE path=?",
+                         (time.time() - 3 * 86400, p_old))    # 当前 = 老版本
+        store.db.execute("UPDATE files SET created_at=? WHERE path=?",
+                         (time.time(), p_new))                # 另一条 = 更新的版本
+        store.db.commit()
+        newer = up._newer_episode_sibling(cloud_dir, p_old)   # 当前=旧版
+        assert newer == NEW, f"点在老版本上时没识别出更新的版本（会把最新版删掉）：{newer!r}（p_old/created_at={store.get(p_old)['created_at']}, p_new/created_at={store.get(p_new)['created_at']}）"
+        newer2 = up._newer_episode_sibling(cloud_dir, p_new)  # 当前=最新版
+        assert newer2 == "", f"自己是最新时不该有更新的版本：{newer2!r}"
+
+        # ═══ E) 「同集多条但一条都不删」必须可见（不能静默「没有旧版本」）═══
+        class _Cloud:
+            def __init__(self):
+                self.f = {"fid-NEW": {"fid": "fid-NEW", "n": NEW, "s": 9 * 1024 * 1024, "ico": "mkv"},
+                          "fid-OLD": {"fid": "fid-OLD", "n": OLD, "s": 7 * 1024 * 1024, "ico": "mkv"}}
+            def snap(self):
+                return [dict(v) for v in self.f.values()]
+
+        m = p115.P115.__new__(p115.P115)
+        m._dir_cache = {}
+        m._dir_cache_ttl = 30.0
+        m._dir_cache_max = 64
+        m._delete_lock = asyncio.Lock()
+
+        async def list_dir(pid, use_cache=True):
+            rows = _Cloud().snap()
+            m._remember_dir(int(pid), rows)
+            return rows
+
+        m.list_dir = list_dir
+        r = await m.cleanup_previous(700, NEW, 9 * 1024 * 1024, 9,
+                                     keep_fid="fid-NEW", keep_fids=["fid-OLD"], keep_names=[OLD])
+        assert r["deleted"] == [], r
+        assert "同集" in r["note"] and "没有旧版本" != r["note"], \
+            f"同集多条却没动手时必须给出可见说明：{r['note']!r}"
+
+        PASS.append("[42] 洗板重下后两个版本本地文件都在时旧版仍被清：判据加时间维度"
+                    "（created_at 同批才保护，用 updated_at 会被状态写入刷新而失效）；"
+                    "护栏 _newer_episode_sibling 使「点在老版本上」让位给更新的版本而不是删掉它；"
+                    "「同集多条但一条未删」由静默改为可见 note；"
+                    "第 37 处（同批互不删）与第 38 处（收尾删除仍保护）回归通过")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -3029,6 +3150,7 @@ async def main():
     await case_delete_after_upload_no_mutual_delete()
     await case_secure_compare_all_channels()
     await case_same_name_duplicate_cleaned()
+    await case_same_episode_time_judgment()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

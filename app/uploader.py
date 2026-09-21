@@ -19,6 +19,22 @@ from p115 import episode_key, resolve_upload_target
 logger = logging.getLogger("upilot.upload")
 CHUNK = 8 * 1024 * 1024
 
+# 「同一批」容差（秒）：另一个版本与当前版本的**内容入队时间**（`created_at`）
+# 相差在范围内，才认为两者是「同一批新下的正当版本」，需要互相保护。
+#
+# 它是把「洗板重下」与「同批两个版本」分开的那把尺：
+#   - 同批（第 37 处的场景）：A、B 在同一轮扫描里稳定、并发传完，`created_at` 只差
+#     几十秒 ⇒ 两个都是正当版本 ⇒ 都保护（否则互删，云端同集一个不剩）；
+#   - 洗板重下：旧版的本地文件**可能还在**（用户「重新下了一遍」时常见），但它是几天前
+#     入队的 ⇒ 老版本 ⇒ **不保护**，照旧清理。
+#
+# 【坑】必须用 `created_at`，**不能**用 `updated_at`：后者在每次状态写入（scanner 推进
+# `stable_count`、秒传命中改 message、用户点「重新排队」…）时都会被刷新成「现在」，
+# 于是老版本的 updated_at 看起来和新的差不多 ⇒ 判据失效、旧版又被保护住。
+# `created_at` 只在 `store.add()`（scanner 发现新内容 → INSERT OR REPLACE）时写入，
+# 语义正是「这条记录代表的那份内容是什么时候到本地的」。
+SAME_BATCH_SECONDS = 1800.0
+
 # 跨实例共享的调度状态。
 #
 # main.py 在改配置时（upload./retry./notify. 任意一项、或 115 cookie 同步）会重建
@@ -246,20 +262,33 @@ class Uploader:
         就把它当旧版删掉，B 的清理又把 A 删掉 ⇒ **云端同集一个不剩**，而本地两条都是
         「已上传」终态、symedia 的 strm 指向不存在的文件。本地已复现（串行与并发都会中）。
 
-        判据是「这个版本还是不是正当的新版本」：
-          - 本地文件还在 ⇒ 正当新版本 ⇒ 保护；
-          - 本地文件已被**本程序**在上传成功后收尾删掉（`source_deleted=1`）⇒ 同样是正当版本 ⇒ 保护；
-          - 本地文件不在、且不是本程序删的 ⇒ 旧版本地被换掉了 ⇒ **不保护** ⇒ 照旧清理。
+        判据是「这个版本还是不是**这一批**的正当新版本」：
+          - 本地文件还在、**且上传完成时间与当前文件同批**（差 ≤ SAME_BATCH_SECONDS）
+            ⇒ 正当新版本 ⇒ 保护；
+          - 本地文件已被**本程序**在上传成功后收尾删掉（`source_deleted=1`）
+            ⇒ 同样是正当版本 ⇒ 保护；
+          - 本地文件不在、且不是本程序删的 ⇒ 旧版本地被换掉了 ⇒ **不保护**；
+          - **上传完成时间明显更早**（差 > SAME_BATCH_SECONDS）⇒ 上一轮洗板遗留的老版本，
+            即使本地文件还在也**不保护** ⇒ 照旧清理。
 
-        为什么必须加 `source_deleted` 这一条：只看 `os.path.exists()` 分不开
-        「洗板把旧版换掉了」与「`upload.delete_after_upload` 开关把刚传完的版本收尾删了」。
-        后者开着时，先传完的那条本地文件是程序自己删的，后传那条就把它当旧版删掉 ——
-        **互删重现**（本地已复现：A 传完本地消失 → B 视角保护集合空 → B 的清理删 A；
-        同对照把开关关掉则 delete 目标为空）。
+        为什么必须加时间这一条（第 42 处，用户真机报障）：用户洗板重下后**两个版本的本地
+        文件都在**（`HDR` 与无 `HDR` 的两条 S01E33），只按「本地在不在」判定会把旧版当正当
+        版本保护住 ⇒ `cleanup_previous` 返回「没有旧版本」⇒ 云端两条都留着，
+        表现就是「开关开着、点了重新排队、还是一样，没删」。
+        本地已复现：NEW(刚传)/OLD(3 天前) 两条本地都在 → 保护集合含 OLD → deleted=[]。
+
+        为什么必须保留 `source_deleted` 那一条：只看 `os.path.exists()` 分不开
+        「洗板把旧版换掉了」与「`upload.delete_after_upload` 开关把刚传完的版本收尾删了」
+        —— 后者开着时先传完那条本地是程序自己删的，后传那条就把它当旧版删掉（互删重现）。
         """
         key = episode_key(os.path.basename(local_path))
         if key is None:
             return [], []
+        cur = self.store.get(local_path) or {}
+        try:
+            cur_at = float(cur.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            cur_at = 0.0
         fids: list[str] = []
         names: list[str] = []
         try:
@@ -278,11 +307,67 @@ class Uploader:
                 continue
             if not os.path.exists(path) and not int(rec.get("source_deleted") or 0):
                 continue                    # 旧版本地被换掉了（不是程序收尾删的）→ 不保护
+            # 时间判据：明显不是同一批 ⇒ 洗板遗留的老版本，本地还在也不保护。
+            # cur_at 为 0（拿不到当前记录时间）时退化为「全保护」，保守不出错。
+            if cur_at:
+                try:
+                    at = float(rec.get("created_at") or 0.0)
+                except (TypeError, ValueError):
+                    at = 0.0
+                if at and abs(cur_at - at) > SAME_BATCH_SECONDS:
+                    logger.info("同集另有一版本 %s（内容入队于 %.0f 秒前）不是本轮同批，按旧版清理",
+                                base, abs(cur_at - at))
+                    continue
             names.append(base)
             fid = str(rec.get("file_id") or "").strip()
             if fid and fid not in ("0", "None"):
                 fids.append(fid)
         return fids, names
+
+    def _newer_episode_sibling(self, cloud_dir: str, local_path: str) -> str:
+        """同集里是否存在**比当前文件更新**的已上传版本（且本地还在）—— 返回其文件名。
+
+        为什么要这道护栏（第 42 处的另一半）：清理的语义是「同集只留最新版」，由**谁**来
+        裁决「留谁」很关键。如果用户点的是**老版本**那条的「重新排队」，它会重新上传成功
+        （秒传命中），然后以「刚上传那条」的身份去清理 —— 于是**真正的最新版被当旧版删掉**，
+        结果与用户想要的相反（他差点就删错了）。
+
+        有这个更新的版本在时，本次交给它，自己不动手（日志写明原因）。
+        """
+        key = episode_key(os.path.basename(local_path))
+        if key is None:
+            return ""
+        cur = self.store.get(local_path) or {}
+        try:
+            cur_at = float(cur.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if not cur_at:
+            return ""
+        newest_at, newest_name = cur_at, ""
+        try:
+            rows = self.store.by_status("已上传", limit=1000)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取同集已上传记录失败（不影响清理）：%s", exc)
+            return ""
+        for rec in rows or []:
+            path = str(rec.get("path") or "")
+            if not path or path == local_path:
+                continue
+            if rec.get("target_dir") != cloud_dir:
+                continue
+            base = os.path.basename(path)
+            if episode_key(base) != key:
+                continue
+            if not os.path.exists(path) and not int(rec.get("source_deleted") or 0):
+                continue                    # 本地已不在（且非程序删）→ 它自己就是被换掉的旧版
+            try:
+                at = float(rec.get("created_at") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if at - newest_at > SAME_BATCH_SECONDS:
+                newest_at, newest_name = at, base
+        return newest_name
 
     async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
         """洗板（重下同集不同版本）后，把云端同一集的旧版本移进 115 回收站。
@@ -298,6 +383,20 @@ class Uploader:
             size = os.path.getsize(local_path)
         except OSError:
             size = 0
+        # 护栏（第 42 处另一半）：同集里已经有一个**更新**的版本时，本次不动手。
+        #
+        # 场景：用户点的可能是**老版本**那条的「重新排队」。它会重新上传成功（秒传命中），
+        # 然后以「刚上传那条」的身份去清理 —— 于是**真正的最新版被当旧版删掉**，
+        # 结果与用户想要的正好相反。有更新的版本在时交给它（它上传完成时自会清理）。
+        newer = self._newer_episode_sibling(cloud_dir, local_path)
+        if newer:
+            logger.info("洗板清理：%s 同集已有更新的版本 %s，交给它处理，本次不动手",
+                        name, newer)
+            cur0 = self.store.get(local_path) or {}
+            self.store.set(local_path,
+                           message=(cur0.get("message") or "")
+                                   + f"｜洗板清理：同集已有更新的版本 {newer}，本次不动手")
+            return
         # 刚上传那条的标识（秒传/分块成功时已落库；实测是 115 的 pickcode，形如 abcd0demo0pick001）——
         # 比文件名可靠：115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
         cur = self.store.get(local_path) or {}

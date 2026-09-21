@@ -445,6 +445,8 @@ class P115:
                             and not (_marks(r) & keep_ids)] if auto_name else []
 
         victims: list[tuple[str, str]] = []
+        same_episode_all = [r for r in rows
+                            if episode_key(str(r.get("n") or r.get("name") or "")) == key]
         for row in rows:
             name = str(row.get("n") or row.get("name") or "")
             fid = row.get("fid") or row.get("file_id")
@@ -477,6 +479,17 @@ class P115:
                 return {"deleted": [],
                         "note": (f"云端同集有 {len(same_name_others)} 条与本次上传同名的条目，"
                                  f"{why}，本次不动手")}
+            # 同集实际有多条、但一条都没被判成旧版 —— 也要说出来。
+            # 用户真机报障的场景正是这一类：云端 `HDR` 与无 `HDR` 两条同集文件都在，
+            # 调用方把另一条当成「同批正当版本」保护起来 ⇒ 一条都不删。
+            # 原来这里返回静默的「没有旧版本」，而调用方又刻意不打印这个 note
+            # ⇒ 界面上开关开着、日志里连一行都没有，「说生效、实际没生效」。
+            if len(same_episode_all) > 1:
+                kept = [str(r.get("n") or r.get("name") or "") for r in same_episode_all]
+                return {"deleted": [],
+                        "note": (f"云端同集共 {len(same_episode_all)} 条，"
+                                 f"全部判为正当版本（同批保护或本次上传那条），本次不动手："
+                                 + "、".join(kept[:5]))}
             return {"deleted": [], "note": "没有旧版本"}
         if max_delete > 0 and len(victims) > max_delete:
             return {"deleted": [],
