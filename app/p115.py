@@ -20,6 +20,12 @@ logger = logging.getLogger("upilot.p115")
 
 TRANSIENT_HTTP_CODES = (401, 403, 429, 500, 502, 503, 504)
 
+# 翻目录的硬上限（条目数）。
+# 与「页数上限」不同：页数上限会在「服务端单页很小 + 目录很大」时静默截断
+# （实测每页 7 条、200 页上限 ⇒ 只读到 1400/3000 就停了），所以这里按**条目数**兜底，
+# 并在触顶时明确记 warning —— 截断必须是可见的。
+MAX_DIR_ITEMS = 50000
+
 # 视频扩展名 + 「同一集」归一化。洗板（重下同集不同版本）后云端会同时留下旧版与
 # 新版，清理时按「剧名 + SxxExx + 扩展名」判同一集 —— 画质标签
 # （DV / HDR / WEB-DL / 站点名…）与集号之后的内容一律不参与比较。
@@ -294,6 +300,9 @@ class P115:
         out: list[dict] = []
         offset = 0
         page = 1150                                     # 115 单页上限
+        seen_ids: set[str] = set()                      # 按 fid 去重（防服务端忽略 offset）
+        prev_sig: tuple | None = None                   # 上一页的 fid 签名（检测「反复给同一批」）
+        truncated = False
         while True:
             resp = await self.client.fs_files(
                 {"cid": str(pid), "offset": offset, "limit": page,
@@ -308,12 +317,45 @@ class P115:
             else:
                 rows = (resp or {}).get("list") or []
                 total = int((resp or {}).get("count") or len(rows))
-            for row in rows:
-                if isinstance(row, dict) and row.get("fid") not in (None, ""):
-                    out.append(row)
-            offset += page
-            if not rows or offset >= total:
+            if not rows:
+                break                                   # 没有更多了
+
+            # 服务端若忽略 offset、每页给同一批，翻页会永远转下去：用「本页 fid 签名
+            # 与上一页相同」判定卡住，立刻停（这种情况代理/网关坏掉时会出现）。
+            sig = tuple(str(r.get("fid")) for r in rows if isinstance(r, dict))
+            if sig and sig == prev_sig:
+                logger.warning("列目录 pid=%s 时服务端反复返回同一批（第 %d 条起），已停止翻页",
+                               pid, offset)
                 break
+            prev_sig = sig
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                fid = row.get("fid")
+                if fid in (None, ""):
+                    continue                            # 文件夹条目（身份 id 在 cid 上）
+                fid_s = str(fid)
+                if fid_s in seen_ids:
+                    continue                            # 去重：同一文件不重复入列
+                seen_ids.add(fid_s)
+                out.append(row)
+
+            # 游标必须用**实际返回条数**推进，不能固定加 page：服务端有自己的单页上限时
+            # （很常见），固定加 page 会把中间整段数据跳过。实测：2500 个文件、服务端每页
+            # 只给 500 条时，请求序列 (0,1150)(1150,1150)(2300,1150) 只拿回 1200 条，**漏
+            # 1300 条** —— 而 list_dir 正是洗板清理「找同集旧版」的依据，漏掉的旧版永远
+            # 清不掉，且没有任何报错。
+            offset += len(rows)
+            if len(out) >= MAX_DIR_ITEMS:
+                truncated = True
+                break
+            if offset >= total:
+                break
+        if truncated:
+            # 截断必须可见：否则又是「静默少数据」。
+            logger.warning("目录 pid=%s 条目超过 %d，本次只读了前 %d 条（旧版本可能因此漏清）",
+                           pid, MAX_DIR_ITEMS, len(out))
         self._remember_dir(key, out)
         return out
 

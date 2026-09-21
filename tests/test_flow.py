@@ -24,6 +24,7 @@ APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 sys.path.insert(0, APP)
 
 import config as cfgmod          # noqa: E402
+import p115                      # noqa: E402
 import scanner                   # noqa: E402
 import webui                     # noqa: E402
 from p115 import P115, StubP115, normalize_cloud_path, resolve_upload_target   # noqa: E402
@@ -2390,6 +2391,147 @@ def case_cloud_path_dotdot_guard():
                 "正常映射与中文/空格路径一字不变")
 
 
+async def case_dir_paging_cursor():
+    """[36] `list_dir` 的翻页游标必须用「实际返回条数」推进。
+
+    原实现是 `offset += page`（固定加**请求的** limit）。服务端有自己的单页上限时
+    （很常见），这会把中间整段数据整段跳过：实测 2500 个文件、服务端每页只给 500 条时，
+    请求序列 `(0,1150)(1150,1150)(2300,1150)` 只拿回 **1200** 条，**漏 1300 条**。
+    而 `list_dir` 正是洗板清理「找同集旧版」的唯一依据 —— 漏掉的旧版**永远清不掉**，
+    且没有任何报错（判据：代码没抛错、日志干净、界面看不出）。
+
+    本用例覆盖三层：
+      ① 修复前会漏数据的三档（服务端单页 100 / 500 / 7）必须补齐；
+      ② 正常场景（单页 = 请求上限）不许变差，含跨页边界与空目录；
+      ③ 服务端异常（忽略 offset、每页给同一批）必须**终止 + 记 warning + 不重复**；
+         以及大目录触到条目上限时必须**可见地**截断（不能静默少数据）。
+    """
+    import logging as _logging
+
+    class _FakeClient:
+        """模拟 115 的 fs_files：cap = 服务端自己的单页上限。"""
+
+        def __init__(self, n, cap=None, ignore_offset=False, dirs=0):
+            self.items = [{"fid": str(1000000 + i), "n": f"f{i:05d}.mkv",
+                           "ico": "mkv", "s": 1024} for i in range(n)]
+            if dirs:
+                self.items += [{"cid": str(900000 + i), "n": f"d{i}", "ico": "folder"}
+                               for i in range(dirs)]
+            self.cap = cap or 1150
+            self.ignore_offset = ignore_offset
+            self.calls: list[tuple[int, int]] = []
+
+        async def fs_files(self, payload, async_=False):
+            off = int(payload["offset"])
+            lim = int(payload["limit"])
+            self.calls.append((off, lim))
+            take = min(lim, self.cap)
+            rows = (self.items[:take] if self.ignore_offset
+                    else self.items[off:off + take])
+            return {"state": True, "count": len(self.items),
+                    "data": {"count": len(self.items), "list": rows}}
+
+    def mgr_with(client):
+        m = P115.__new__(P115)                  # 不过 __init__（不需要 cookie）
+        m.client = client
+        m._dir_cache = {}
+        m._dir_cache_ttl = 30.0
+        m._dir_cache_max = 64
+        return m
+
+    class _Capture(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.msgs: list[str] = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    logger = _logging.getLogger("upilot.p115")
+    cap = _Capture()
+    old_level = logger.level
+    logger.addHandler(cap)
+    logger.setLevel(_logging.DEBUG)
+
+    async def fetch(client):
+        m = mgr_with(client)
+        before = len(cap.msgs)
+        rows = await asyncio.wait_for(m.list_dir(700, use_cache=False), timeout=30)
+        return rows, len(cap.msgs) - before, client.calls
+
+    try:
+        # ① 修复前漏数据的档位 → 现在必须一条不漏
+        for label, total, srv_cap in (
+                ("300 文件 / 服务端每页 100", 300, 100),
+                ("2500 文件 / 服务端每页 100", 2500, 100),
+                ("2500 文件 / 服务端每页 500", 2500, 500),
+                ("3000 文件 / 服务端每页 7", 3000, 7)):
+            cli = _FakeClient(total, srv_cap)
+            rows, _, calls = await fetch(cli)
+            fids = [str(r["fid"]) for r in rows]
+            assert len(fids) == total, \
+                f"{label}：只取回 {len(fids)}/{total}（游标又在按请求 limit 推进了？）"
+            assert len(set(fids)) == total, f"{label}：出现重复条目"
+            # 游标必须严格按「上一页实际返回条数」递进（不是固定 1150）
+            for (prev_off, _), (next_off, _) in zip(calls, calls[1:]):
+                assert next_off - prev_off == srv_cap, \
+                    f"{label}：游标步进 {next_off - prev_off}，应等于服务端实际返回数 {srv_cap}"
+
+        # ② 正常场景不许变差（含边界）
+        for label, total, srv_cap in (
+                ("300 文件 / 每页 1150", 300, None),
+                ("2500 文件 / 每页 1150", 2500, None),
+                ("1150 正好一页", 1150, None),
+                ("1151 跨页边界", 1151, None),
+                ("0 文件（空目录）", 0, None)):
+            cli = _FakeClient(total, srv_cap)
+            rows, warns, _ = await fetch(cli)
+            assert len(rows) == total, f"{label}：取回 {len(rows)}/{total}"
+            assert len({str(r['fid']) for r in rows}) == len(rows), f"{label}：有重复"
+            assert warns == 0, f"{label}：正常场景不该有 warning，却记了 {warns} 条"
+
+        # ③-1 服务端忽略 offset：必须终止、记 warning、不重复累积
+        cli = _FakeClient(2500, 100, ignore_offset=True)
+        rows, warns, calls = await fetch(cli)
+        fids = [str(r["fid"]) for r in rows]
+        assert len(set(fids)) == len(fids), "服务端反复给同一批时出现了重复条目"
+        assert len(calls) <= 3, f"卡住检测没生效：翻了 {len(calls)} 页"
+        assert warns >= 1, "服务端反复返回同一批，应当记一条 warning（否则是静默停）"
+        assert any("反复返回同一批" in m for m in cap.msgs), \
+            f"warning 内容不对：{cap.msgs[-3:]}"
+
+        # ③-2 目录条目永远不混进文件列表
+        cli = _FakeClient(500, None, dirs=50)
+        rows, _, _ = await fetch(cli)
+        assert len(rows) == 500, f"文件数不对：{len(rows)}"
+        assert all(r.get("fid") not in (None, "") for r in rows), "文件夹条目混进了结果"
+
+        # ③-3 触到条目上限必须可见地截断（不能静默少数据）
+        old_max = p115.MAX_DIR_ITEMS
+        try:
+            p115.MAX_DIR_ITEMS = 250
+            cli = _FakeClient(2000, 100)
+            rows, warns, _ = await fetch(cli)
+            # 截断按**页**粒度生效（每读完一页检查一次），所以实际条数是「第一个 >= 上限的
+            # 页边界」，即 上限 <= len < 上限 + 单页。别断言精确等于上限 —— 那需要把条目
+            # 切一半，反而会丢掉整页数据的完整性。
+            assert 250 <= len(rows) < 250 + 100, \
+                f"截断点不对：{len(rows)}（应在 [250, 350) 之间）"
+            assert warns >= 1 and any("超过" in m for m in cap.msgs), \
+                "触到条目上限却没记 warning（等于静默少数据）"
+        finally:
+            p115.MAX_DIR_ITEMS = old_max
+    finally:
+        logger.removeHandler(cap)
+        logger.setLevel(old_level)
+
+    PASS.append("[36] list_dir 翻页游标用「实际返回条数」推进：修复前（固定加请求 limit）"
+                "服务端每页 500 条时 2500 文件只读到 1200、**漏 1300**；现在四种小页场景"
+                "一条不漏且步进等于实际返回数、正常/边界/空目录无 warning、"
+                "服务端忽略 offset 时终止并记 warning、目录条目不混入、"
+                "触条目上限时可见截断")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2424,6 +2566,7 @@ async def main():
     await case_request_body_hardening()
     case_coerce_finite_values()
     case_cloud_path_dotdot_guard()
+    await case_dir_paging_cursor()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
