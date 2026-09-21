@@ -391,20 +391,34 @@ class P115:
         return bool(isinstance(resp, dict) and resp.get("state"))
 
     async def cleanup_previous(self, pid: int, keep_name: str, keep_size: int,
-                               max_delete: int, keep_fid: str = "") -> dict:
-        """洗板清理：同一集只留刚上传那条，其余同集旧版本移进回收站。
+                               max_delete: int, keep_fid: str = "",
+                               keep_fids=None, keep_names=None) -> dict:
+        """洗板清理：同一集只留最新版，其余同集**旧版本**移进回收站。
 
         三道「别动它」：标识命中（最可靠，见下）、文件名完全相同、大小完全相同。
         标识那道要注意：秒传落库的 file_id 实测是 **pickcode**（形如 abcd0demo0pick001），
         而目录条目里的 `fid` 是数字串 —— 所以必须同时比对 `fid` / `pc` / `file_id`。
+
+        `keep_fids` / `keep_names` 是**额外**的保护集合（调用方传「同集其它仍在本地、
+        且已上传成功」的版本）。没有它就会这样：同一集两个版本几乎同时传完，
+        A 的清理把 B 当成旧版删掉、B 的清理把 A 删掉 ⇒ **云端同集一个不剩**，
+        而本地两条都是「已上传」终态、strm 指向不存在的文件。本地已复现（串行与并发都会）。
+        判据是「本地文件是否还在」：洗板时旧版的本地文件已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理；
+        同集两个都还在本地 ⇒ 都是正当新版本 ⇒ 都保护。
+
         返回 {"deleted": [文件名…], "note": 说明}；认不出季集 / 没有旧版本 / 多于上限都只回说明。
         """
         key = episode_key(keep_name)
         if key is None:
             return {"deleted": [], "note": "认不出季集（文件名里没有 SxxExx），跳过"}
-        keep_fid = str(keep_fid or "").strip()
-        if keep_fid in ("0", "None"):
-            keep_fid = ""
+        keep_ids: set[str] = set()
+        for cand in [keep_fid, *(keep_fids or ())]:
+            text = str(cand or "").strip()
+            if text and text not in ("0", "None"):
+                keep_ids.add(text)
+        keep_names_set: set[str] = {str(n) for n in (keep_names or ()) if n}
+        if keep_name:
+            keep_names_set.add(str(keep_name))
         rows = await self.list_dir(pid)
         victims: list[tuple[str, str]] = []
         for row in rows:
@@ -412,13 +426,13 @@ class P115:
             fid = row.get("fid") or row.get("file_id")
             if not name or fid in (None, ""):
                 continue                                 # list_dir 已滤掉目录，这里再兜一层
-            if keep_fid:
+            if keep_ids:
                 marks = {str(row.get(k)) for k in ("fid", "pc", "file_id")
                          if row.get(k) not in (None, "")}
-                if keep_fid in marks:
+                if marks & keep_ids:
                     continue                             # 刚上传那条（按标识，最可靠）
-            if name == keep_name:
-                continue                                 # 刚上传那条（按名字）
+            if name in keep_names_set:
+                continue                                 # 刚上传那条 / 同集其它正当版本（按名字）
             if episode_key(name) != key:
                 continue
             try:

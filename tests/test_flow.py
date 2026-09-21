@@ -2532,6 +2532,134 @@ async def case_dir_paging_cursor():
                 "触条目上限时可见截断")
 
 
+async def case_same_episode_no_mutual_delete():
+    """[37] 同一集两个版本几乎同时传完 → **不能互删**。
+
+    原实现只保护「本文件自己」那一条（`keep_fid`）。于是：
+      A 的清理看到 B（同集、已完成）→ B 的 id != A 的 keep_fid → 删 B
+      B 的清理看到 A → 删 A
+    ⇒ **云端同集一个不剩**，而本地两条都是「已上传」终态、symedia 的 strm 指向
+    不存在的文件。本地已复现（串行与并发都会中，实测剩余云端 `[]`）。
+
+    修复：`cleanup_previous()` 增加 `keep_fids` / `keep_names`，调用方
+    （`Uploader._same_episode_keeps`）把「同集、仍在本地、且已上传成功」的其它版本传进来。
+    判据是「本地文件是否还在」：洗板时旧版本地已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理。
+    """
+    from p115 import P115 as _P115
+
+    dv = "Show.S01E01.2160p.DV.mkv"
+    nov = "Show.S01E01.2160p.mkv"
+    assert p115.episode_key(dv) == p115.episode_key(nov), "构造前提：两个文件名必须同集"
+
+    # ---- A) 单元层：额外保护集合 ----
+    class _Cloud:
+        def __init__(self):
+            self.files: dict[str, dict] = {}
+
+        def add(self, fid: str, name: str, size: int = 1000):
+            self.files[fid] = {"fid": fid, "n": name, "s": size, "ico": "mkv"}
+
+        def snap(self):
+            return [dict(v) for v in self.files.values()]
+
+    def mgr_of(cloud):
+        m = _P115.__new__(_P115)                     # 不过 __init__（不需要 cookie）
+        m._dir_cache = {}
+        m._dir_cache_ttl = 30.0
+        m._dir_cache_max = 64
+        m._delete_lock = asyncio.Lock()
+
+        async def list_dir(pid, use_cache=True):
+            rows = cloud.snap()
+            m._remember_dir(int(pid), rows)
+            return rows
+
+        async def delete_file(fid):
+            async with m._delete_lock:
+                return bool(cloud.files.pop(str(fid), None))
+
+        m.list_dir = list_dir
+        m.delete_file = delete_file
+        return m
+
+    # ① 同集两版本互认 → 一个都不删
+    c1 = _Cloud(); c1.add("111", dv); c1.add("222", nov)
+    r1 = await mgr_of(c1).cleanup_previous(700, dv, 0, 9,
+                                           keep_fid="111", keep_fids=["222"], keep_names=[nov])
+    assert r1["deleted"] == [], f"同集两版本互认时不该删：{r1}"
+    assert len(c1.snap()) == 2, c1.snap()
+
+    # ② 只按名字保护（file_id 拿不到时也要挡住）
+    c2 = _Cloud(); c2.add("111", dv); c2.add("222", nov)
+    r2 = await mgr_of(c2).cleanup_previous(700, dv, 0, 9, keep_fid="111", keep_names=[nov])
+    assert r2["deleted"] == [], r2
+    assert len(c2.snap()) == 2, c2.snap()
+
+    # ③ 洗板核心行为不变：非本地的同集旧版仍必须被清
+    c3 = _Cloud(); c3.add("111", dv); c3.add("333", "Show.S01E01.1080p.mkv")
+    r3 = await mgr_of(c3).cleanup_previous(700, dv, 0, 9, keep_fid="111")
+    assert r3["deleted"] == ["Show.S01E01.1080p.mkv"], r3
+    assert [x["n"] for x in c3.snap()] == [dv], c3.snap()
+
+    # ---- B) 端到端：两个同集文件都真走完状态机 ----
+    cfg, store, mgr, _up0, tmp, src = make_env(mode="rapid_only", fail_first=0)
+    try:
+        rel_dir, cloud_dir = "TVs/Drama", "/TVs/Drama"
+        cfg["paths"]["map"] = [{"from": "TVs", "to": "/TVs"}]
+        cfg["upload"]["cleanup_previous_versions"] = True
+        cfg["upload"]["cleanup_max_delete"] = 9
+        up = Uploader(cfg, store, mgr)
+        await mgr.ensure_pid(cloud_dir)
+
+        gone: list[str] = []
+
+        async def fake_delete(fid):
+            gone.append(fid)
+            return True
+
+        mgr.delete_file = fake_delete
+
+        p1 = write_file(src, f"{rel_dir}/{dv}", 3 * 1024 * 1024)
+        p2 = write_file(src, f"{rel_dir}/{nov}", 3 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+
+        rec1 = await drive(up, store, p1)
+        rec2 = await drive(up, store, p2)
+        assert rec1["status"] == "已上传" and rec2["status"] == "已上传", \
+            (rec1["status"], rec2["status"])
+        # 两个都在本地 → 都是正当版本 → 谁都不该被当旧版删掉
+        assert gone == [], f"同集两个都在本地时不该删任何东西：{gone}"
+        combined = (rec1.get("message") or "") + (rec2.get("message") or "")
+        assert "同集旧版本已清" not in combined, combined
+
+        # _same_episode_keeps 的判据：本地在 → 保护
+        _fids, names = up._same_episode_keeps(cloud_dir, p2)
+        assert dv in names, f"另一版本仍在本地却没被保护：{names}"
+
+        # 本地删掉（模拟洗板旧版已被替换）→ 不再保护 ⇒ 照旧会被清理
+        os.remove(p1)
+        _fids2, names2 = up._same_episode_keeps(cloud_dir, p2)
+        assert dv not in names2, f"本地已删的旧版仍被保护（洗板会漏清）：{names2}"
+
+        # 洗板端到端：旧的同集记录（本地已不在）仍应被清
+        gone.clear()
+        old_path = os.path.join(tmp, "Show.S01E01.1080p.mkv")      # 刻意不建文件
+        store.add(old_path, 5 * 1024 * 1024, 1.0)
+        store.set(old_path, status="已上传", target_dir=cloud_dir, message="秒传命中（旧版）")
+        res = await mgr.cleanup_previous(cloud_dir and await mgr.ensure_pid(cloud_dir),
+                                         nov, 0, 9,
+                                         keep_fid="stub-keep",
+                                         keep_fids=[], keep_names=[dv])
+        assert "Show.S01E01.1080p.mkv" in res["deleted"], res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[37] 同集两版本不互删：cleanup_previous 支持额外保护集合（keep_fids/keep_names）；"
+                "端到端两个同集文件都「已上传」且谁都没被误删；"
+                "只按名字也能挡住；洗板场景（旧版本地已不在）不再保护、非本地同集旧版仍被清")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2567,6 +2695,7 @@ async def main():
     case_coerce_finite_values()
     case_cloud_path_dotdot_guard()
     await case_dir_paging_cursor()
+    await case_same_episode_no_mutual_delete()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

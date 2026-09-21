@@ -14,7 +14,7 @@ import os
 import time
 
 from notify import Notifier
-from p115 import resolve_upload_target
+from p115 import episode_key, resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
 CHUNK = 8 * 1024 * 1024
@@ -233,6 +233,44 @@ class Uploader:
         except Exception as exc:  # noqa: BLE001
             logger.warning("删除本地源文件失败（不影响上传）：%s：%s", path, exc)
 
+    def _same_episode_keeps(self, cloud_dir: str, local_path: str) -> tuple[list[str], list[str]]:
+        """同集里「仍在本地、且已上传成功」的**其它**版本 —— 这些不许被当成旧版清掉。
+
+        不这么做会互删：同一集两个版本几乎同时传完时，A 的清理看到 B（同集、已完成）
+        就把它当旧版删掉，B 的清理又把 A 删掉 ⇒ **云端同集一个不剩**，而本地两条都是
+        「已上传」终态、symedia 的 strm 指向不存在的文件。本地已复现（串行与并发都会中）。
+
+        判据是「本地文件是否还在」：
+          - 洗板场景：旧版的本地文件已被换掉/删除 ⇒ 不保护 ⇒ 照旧被清理（行为不变）；
+          - 同集两个都还在本地 ⇒ 都是正当新版本 ⇒ 都保护。
+        """
+        key = episode_key(os.path.basename(local_path))
+        if key is None:
+            return [], []
+        fids: list[str] = []
+        names: list[str] = []
+        try:
+            rows = self.store.by_status("已上传", limit=1000)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取同集已上传记录失败（不影响清理）：%s", exc)
+            return [], []
+        for rec in rows or []:
+            path = str(rec.get("path") or "")
+            if not path or path == local_path:
+                continue
+            if rec.get("target_dir") != cloud_dir:
+                continue
+            base = os.path.basename(path)
+            if episode_key(base) != key:
+                continue
+            if not os.path.exists(path):
+                continue                    # 本地已不在（旧版被换掉了）→ 不保护
+            names.append(base)
+            fid = str(rec.get("file_id") or "").strip()
+            if fid and fid not in ("0", "None"):
+                fids.append(fid)
+        return fids, names
+
     async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
         """洗板（重下同集不同版本）后，把云端同一集的旧版本移进 115 回收站。
 
@@ -251,7 +289,16 @@ class Uploader:
         # 比文件名可靠：115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
         cur = self.store.get(local_path) or {}
         keep_fid = str(cur.get("file_id") or "")
+        # 同集「仍在本地、且已上传成功」的其它版本也必须保护，否则两个版本几乎同时传完时
+        # 会互删（A 清 B、B 清 A ⇒ 云端同集一个不剩）。见 _same_episode_keeps 的说明。
+        keep_fids, keep_names = self._same_episode_keeps(cloud_dir, local_path)
         try:
+            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                  keep_fid=keep_fid,
+                                                  keep_fids=keep_fids,
+                                                  keep_names=keep_names)
+        except TypeError:
+            # 兼容测试替身 / 旧签名实现（只接 keep_fid）
             res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
                                                   keep_fid=keep_fid)
         except Exception as exc:  # noqa: BLE001
