@@ -477,6 +477,7 @@ function bind() {
   $("#btn-scan").onclick = () => act("/api/scan", "已触发扫描");
   $("#btn-retry").onclick = () => act("/api/retry-now", "已提前重试");
   $("#btn-requeue").onclick = () => act("/api/requeue", "已重新入队");
+  $("#btn-sweep").onclick = () => act("/api/sweep", "已触发同集核对");
   $("#btn-refresh").onclick = () => { S.lastFetch = Date.now(); refreshOverview(); if (S.tab === "tasks") loadTasks(); toast("已刷新"); };
   $("#btn-pause").onclick = () => act(S.paused ? "/api/resume" : "/api/pause", S.paused ? "已恢复调度" : "已暂停调度");
   $("#btn-logout").onclick = () => { location.href = "/logout"; };

@@ -634,7 +634,15 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 return self._json({"ok": True, "affected": n, "message": msg})
             if path == "/api/scan":
                 _wake(state)
-                return self._json({"ok": True, "action": "scan", "message": "已触发扫描"})
+                state["sweep_now"] = True       # 顺手核一遍云端同集重复（用户诉求：传完去校验）
+                return self._json({"ok": True, "action": "scan", "message": "已触发扫描 + 同集核对"})
+            if path == "/api/sweep":
+                # 用户诉求（原话）：「上传到 115 以后校验 115 的那个文件夹里面有没有相同集数的视频」。
+                # 只读不改库的入口：立刻去云端核对同集重复，把旧版移入 115 回收站。
+                state["sweep_now"] = True
+                _wake(state)
+                return self._json({"ok": True, "action": "sweep",
+                                   "message": "已触发同集核对：云端同集只留最新那版"})
             if path == "/api/retry-now":
                 n = store.retry_now()
                 _wake(state)

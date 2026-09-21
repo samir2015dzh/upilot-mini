@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -506,6 +507,129 @@ class P115:
                 logger.warning("洗板清理：删除出错 %s：%s", name, exc)
         if done:
             cache = getattr(self, "_dir_cache", None)    # 目录内容变了，缓存作废
+            if isinstance(cache, dict):
+                cache.pop(int(pid), None)
+        return {"deleted": done, "note": f"清掉 {len(done)} 个同集旧版本"}
+
+    # ---------- 同集清理（**纯云端时间**判据） ----------
+    # 用户明确的要求（原话）：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件
+    # 在秒传完已经被删掉了」。实测生产正是 `delete_after_upload=True`：每个上传成功的版本
+    # 本地文件都被收尾删掉、库里 `source_deleted=1` ⇒ 任何「本地文件在不在」的判据都会把
+    # 同集**所有**版本当成正当版本保护起来，清理永久空转（实测 2 小时内 `清理|洗板|旧版`
+    # 零行，云端 E33 一直是 18:11 与 19:15 两条）。
+    # 所以判据只用 115 条目自身的时间字段。
+    _CLOUD_TS_KEYS = ("te", "tp", "tu", "pt", "uppt", "user_ptime", "ptime",
+                      "user_utime", "utime", "mtime", "up_time", "t")
+
+    @classmethod
+    def cloud_ts(cls, row: dict) -> float:
+        """取云端条目的时间戳（越大越新）。取不到返回 0。
+
+        实测（真 115）文件条目带：
+          `te` / `tp` / `tu` = epoch 秒（如 `1789989329` = 2026-09-21 19:15:29 +0800）
+          `t`  = `"YYYY-MM-DD HH:MM"`（本地时区，只到分钟）
+        所以优先 `te`（秒级最精确），字符串日期作兜底。
+        """
+        for k in cls._CLOUD_TS_KEYS:
+            v = row.get(k)
+            if v in (None, ""):
+                continue
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                s = str(v).strip()
+                try:
+                    fmt = "%Y-%m-%d %H:%M:%S" if s.count(":") == 2 else "%Y-%m-%d %H:%M"
+                    return datetime.datetime.strptime(s, fmt).timestamp()
+                except Exception:  # noqa: BLE001
+                    continue
+            if n > 0:
+                return n
+        return 0.0
+
+    async def cleanup_episode_newest(self, pid: int, keep_name: str,
+                                     max_delete: int = 0, keep_fid: str = "") -> dict:
+        """同集只留**云端时间最新**的那条，其余移入 115 回收站。
+
+        这是用户需求的直接实现，也是唯一不依赖本地的判据。判据只用 115 条目自身的时间：
+          - 取同集里时间最大的那条为「要留的」（后秒传上去的那个）；
+          - 时间并列 / 全部取不到时间 ⇒ **保守不动手**，并返回可见 note（不静默）；
+          - `keep_fid` 命中「本次刚上传那条」时，若它**不是**时间最新（说明同集有更晚
+            上传的版本，或者用户点的是老版本那条的「重新排队」）⇒ **让位不动手**，
+            否则会把真正的最新版当旧版删掉，结果与用户预期相反。
+        最后一点很关键：测试替身的云端条目没有时间字段 ⇒ 天然「不动手」，
+        而真机（有 `te`）能正确清理 —— 同一套代码在两边都安全。
+        """
+        key = episode_key(keep_name)
+        if key is None:
+            return {"deleted": [], "note": "认不出季集（文件名里没有 SxxExx），跳过"}
+        rows = await self.list_dir(pid)
+        same = [r for r in rows
+                if episode_key(str(r.get("n") or r.get("name") or "")) == key]
+        if not same:
+            # 云端同集一条都没匹配上 —— 很可能是**本地文件名与云端文件名形式不同**
+            # （本地 `甲剧.S01E33.HDR.mkv` vs 云端 `甲剧 (2026) [tmdbid=100001] S01E33 […].mkv`
+            # ⇒ 剧名段不同 ⇒ 键不同）。这种情况必须**可见**：否则又是「开关开着、日志里
+            # 一行都没有」的老问题。按云端条目**互相分组**兜一遍，把线索写进 note。
+            bykey: dict[str, list[dict]] = {}
+            for r in rows:
+                k2 = episode_key(str(r.get("n") or r.get("name") or ""))
+                if k2:
+                    bykey.setdefault(k2, []).append(r)
+            dup = {k2: v for k2, v in bykey.items() if len(v) > 1}
+            if dup:
+                hit = next((k2 for k2, v in dup.items()
+                            if any(str(r.get("n") or "") == str(keep_name) for r in v)), "")
+                return {"deleted": [],
+                        "note": (f"本地文件名与云端对不上（本地键 {key}，云端同集多条的组："
+                                 + "、".join(sorted(dup))
+                                 + (f"；其中 {hit} 含本次上传那条" if hit else "")
+                                 + "），本次不动手")}
+            return {"deleted": [], "note": "没有旧版本"}
+        if len(same) < 2:
+            return {"deleted": [], "note": "没有旧版本"}
+        ts = [(self.cloud_ts(r), r) for r in same]
+        newest = max(t for t, _ in ts)
+        if newest <= 0:
+            return {"deleted": [],
+                    "note": (f"云端同集 {len(same)} 条，但条目没有可用时间字段，"
+                             f"分不清哪条是后传的，本次不动手")}
+        top = [r for t, r in ts if t == newest]
+        if len(top) != 1:
+            return {"deleted": [],
+                    "note": (f"云端同集 {len(same)} 条，最新那条的时间不唯一"
+                             f"（{len(top)} 条并列），本次不动手")}
+        # 护栏（纯云端）：本次刚上传那条若不是时间最新 ⇒ 让位（见 docstring 第三条）
+        mark = str(keep_fid or "").strip()
+        if mark:
+            mine = [t for t, r in ts
+                    if mark in (str(r.get("pc") or ""), str(r.get("fid") or ""))]
+            if mine and max(mine) < newest:
+                return {"deleted": [],
+                        "note": (f"本次上传那条不是云端最新的（同集另有更晚上传的版本），"
+                                 f"交给它处理，本次不动手")}
+        victims = [(str(r.get("n") or r.get("name") or ""),
+                    str(r.get("fid") or r.get("file_id") or ""))
+                   for t, r in ts if t < newest]
+        if not victims:
+            return {"deleted": [], "note": "没有旧版本"}
+        if max_delete > 0 and len(victims) > max_delete:
+            return {"deleted": [],
+                    "note": f"同集旧版本 {len(victims)} 个，超过上限 {max_delete}，本次不动手"}
+        done: list[str] = []
+        for name, fid in victims:
+            if not fid:
+                continue
+            try:
+                if await self.delete_file(fid):
+                    done.append(name)
+                    logger.info("同集清理：已移入 115 回收站 %s（保留云端时间最新那条）", name)
+                else:
+                    logger.warning("同集清理：删除失败 %s", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同集清理：删除出错 %s：%s", name, exc)
+        if done:
+            cache = getattr(self, "_dir_cache", None)
             if isinstance(cache, dict):
                 cache.pop(int(pid), None)
         return {"deleted": done, "note": f"清掉 {len(done)} 个同集旧版本"}

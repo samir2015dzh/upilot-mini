@@ -53,6 +53,13 @@ def start_http(cfg: dict, store, state: dict):
 # 切成 0.5 秒一片，每片醒来看一眼有没有指令，开销只是一次 dict.get。
 _WAKE_POLL = 0.5
 
+# 同集巡检的间隔（秒）。用户要的是「上传到 115 以后校验那个文件夹里有没有同集的」，
+# 那就得**主动定期去查**，而不是只在上传完成那一刻顺带做一次 ——
+# 云端已经存在的重复，光等上传事件是永远等不到的。
+# 5 分钟一次：一次巡检只对「库里同集有多条的组」各发一次列目录，开销很小；
+# 关掉 `upload.cleanup_previous_versions` 时巡检内部直接返回 0，不发任何请求。
+SWEEP_INTERVAL = 300.0
+
 
 async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) -> None:
     """等到下一轮扫描；期间界面下了指令就立即返回。
@@ -109,6 +116,7 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                 int(cfg["upload"]["concurrency"]))
 
     last_cookie_sync = 0.0
+    last_sweep = 0.0          # 上次同集巡检的时间（monotonic）
     cookie_sig = None        # (mtime_ns, size)：文件没动就连读都不读，只做一次 stat
     try:
         while not stop.is_set():
@@ -160,6 +168,28 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                         # 场景下两路同时上传同一个文件），且不受并发上限约束。
                         uploader.spawn(one)
                     uploader.dispatch()
+                # 同集巡检（用户诉求：「上传到 115 以后校验那个文件夹里有没有相同集数的视频」）。
+                # **纯云端视角**：只用「库里出现过的 target_dir + paths.target_root」当
+                # 入口路径，靠 115 条目自身的时间字段判「谁是后传的」—— 因为用户明确
+                # 「本地肯定没有，本地文件在秒传完已经被删掉了」。
+                # 独立于上传事件，每 SWEEP_INTERVAL 秒主动核一次；幂等。
+                # 放在 paused 分支外面：巡检是「把云端已有的重复收敛掉」，不是派发上传任务。
+                if time.monotonic() - last_sweep >= SWEEP_INTERVAL:
+                    last_sweep = time.monotonic()
+                    try:
+                        r = await uploader.sweep_cloud_episode_duplicates()
+                        if r.get("removed"):
+                            logger.info("同集巡检：%s", r.get("note"))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("同集巡检出错（不影响上传）：%s", exc)
+                # 「界面动作立刻巡检」：点「立即扫描 / 核对同集」也顺手核一遍，
+                # 免得用户刚传完还要等满 5 分钟才看到旧版被清掉。
+                if state.pop("sweep_now", False):
+                    try:
+                        r = await uploader.sweep_cloud_episode_duplicates()
+                        logger.info("同集巡检（界面触发）：%s", r.get("note"))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("同集巡检出错（不影响上传）：%s", exc)
             except Exception as exc:  # noqa: BLE001
                 logger.error("本轮扫描/调度出错：%s", exc)
             # 间隔每轮重读：界面上改了立刻生效。

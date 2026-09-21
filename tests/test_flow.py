@@ -3111,6 +3111,187 @@ async def case_same_episode_time_judgment():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_cloud_only_episode_cleanup():
+    """[43] 同集清理**只用 115 云端时间**判据（用户真机报障的最终根因）。
+
+    用户原话：「上传到115以后校验115的那个文件夹里面有没有相同集数的视频，就拿第33集为例，
+    现在115里面有两个第33集的甲剧，但是一个是hdr的版本（后秒传上去的），一个普通4k版本
+    （先秒传上去的），我需要的是后秒传上去这个hdr的版本后，把先秒传上去的普通4k版本删掉」；
+    并纠正：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件在秒传完已经被删掉了」。
+
+    真机实测数据（只读探针，逐字取自回贴）：
+      HDR 版: fid=1000000000000000011 te=1789989329 (19:15) pc=abcd0demo0pick002 size=5187057457
+      普通版: fid=1000000000000000012 te=1789985493 (18:11) pc=abcd0demo0pick003 size=1286794717
+      配置: cleanup_previous_versions=True / delete_after_upload=True / mode=rapid_only
+      日志: 2 小时内 `清理|洗板|旧版` **零行** —— 清理一次都没进过删除分支
+
+    根因：`delete_after_upload=True` ⇒ 每个上传成功的版本本地文件都被 `_delete_source()`
+    收尾删掉、库里 `source_deleted=1`。而第 37/38 处为防「同集互删」加的保护判据是
+    「本地文件还在 **或** 是本程序收尾删的 ⇒ 正当版本 ⇒ 保护」—— 在这个配置下**每个版本
+    都命中**，于是同集所有条目全被保护、`cleanup_previous` 返回「没有旧版本」、
+    清理永久空转（而调用方刻意不打印这个 note ⇒ 界面上开关开着、日志里连一行都没有）。
+
+    修法：新增纯云端判据 `p115.P115.cleanup_episode_newest()` —— 只用 115 条目自身的
+    时间字段（`te`/`tp`/`tu` epoch 秒，`t` 字符串兜底），与本地文件、本地记录状态完全无关。
+    """
+    from p115 import P115 as _P115
+
+    HDR = {"fid": "1000000000000000011", "cid": "1000000000000000100",
+           "n": "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv",
+           "s": 5187057457, "te": "1789989329", "tp": "1789989329", "tu": "1789989329",
+           "t": "2026-09-21 19:15", "pc": "abcd0demo0pick002", "ico": "mkv"}
+    PLN = {"fid": "1000000000000000012", "cid": "1000000000000000100",
+           "n": "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv",
+           "s": 1286794717, "te": "1789985493", "tp": "1789985493", "tu": "1789985493",
+           "t": "2026-09-21 18:11", "pc": "abcd0demo0pick003", "ico": "mkv"}
+    assert p115.episode_key(HDR["n"]) == p115.episode_key(PLN["n"]) == "甲剧 (2026)|s01e033|.mkv"
+
+    # ---- A) 时间字段解析（真机字段值逐字）----
+    assert p115.P115.cloud_ts(HDR) == 1789989329.0
+    assert p115.P115.cloud_ts(PLN) == 1789985493.0
+    assert p115.P115.cloud_ts(HDR) > p115.P115.cloud_ts(PLN), "HDR 是后传的，时间必须更大"
+    # 字符串兜底（只有 t 时）
+    assert p115.P115.cloud_ts({"t": "2026-09-21 19:15"}) > 1789980000
+    # 无时间字段 → 0（保守路径的前提）
+    assert p115.P115.cloud_ts({"fid": "1", "n": "x.mkv"}) == 0.0
+    # 单一真相源：uploader 的时间解析必须委托给 p115（别两份实现漂移）
+    assert Uploader._cloud_ts(HDR) == p115.P115.cloud_ts(HDR)
+
+    class _Cloud:
+        def __init__(self, rows):
+            self.f = {r["fid"]: dict(r) for r in rows}
+
+        def snap(self):
+            return [dict(v) for v in self.f.values()]
+
+    def mgr_of(cloud):
+        m = _P115.__new__(_P115)
+        m._dir_cache = {}
+        m._dir_cache_ttl = 30.0
+        m._dir_cache_max = 64
+        m._delete_lock = asyncio.Lock()
+
+        async def list_dir(pid, use_cache=True):
+            rows = cloud.snap()
+            m._remember_dir(int(pid), rows)
+            return rows
+
+        async def delete_file(fid):
+            async with m._delete_lock:
+                return bool(cloud.f.pop(str(fid), None))
+
+        m.list_dir = list_dir
+        m.delete_file = delete_file
+        return m
+
+    def names(c):
+        return [v["n"] for v in c.snap()]
+
+    # ---- B) ★ 用户的确切场景：普通4K先传(18:11) → HDR后传(19:15) → 删普通版 ----
+    c = _Cloud([PLN, HDR])
+    r = await mgr_of(c).cleanup_episode_newest(700, HDR["n"], 3, keep_fid=HDR["pc"])
+    assert names(c) == [HDR["n"]], f"应只剩 HDR 版，实际 {names(c)}"
+    assert r["deleted"] == [PLN["n"]], r
+
+    # ---- C) 反向：后传的是普通版 → 留普通版 ----
+    c2 = _Cloud([{**PLN, "te": "1789999000", "t": "2026-09-21 22:00"}, dict(HDR)])
+    await mgr_of(c2).cleanup_episode_newest(700, PLN["n"], 3, keep_fid=PLN["pc"])
+    assert names(c2) == [PLN["n"]], f"应只剩后传的普通版：{names(c2)}"
+
+    # ---- D) 护栏：本次那条不是最新（点在老版本重新排队）→ 让位不动手 ----
+    c3 = _Cloud([PLN, HDR])
+    r3 = await mgr_of(c3).cleanup_episode_newest(700, PLN["n"], 3, keep_fid=PLN["pc"])
+    assert len(c3.f) == 2, f"该让位不动手，实际删了：{names(c3)}"
+    assert "不是云端最新" in r3["note"], r3
+
+    # ---- E) 无时间字段（测试替身那种）→ 保守不动手 + 可见 note ----
+    c4 = _Cloud([{"fid": "1", "n": PLN["n"], "s": 1, "ico": "mkv"},
+                 {"fid": "2", "n": HDR["n"], "s": 2, "ico": "mkv"}])
+    r4 = await mgr_of(c4).cleanup_episode_newest(700, HDR["n"], 3, keep_fid="2")
+    assert len(c4.f) == 2 and "时间字段" in r4["note"], r4
+
+    # ---- F) 时间并列 → 不动手 ----
+    c5 = _Cloud([{**PLN, "te": "1789999999"}, {**HDR, "te": "1789999999"}])
+    r5 = await mgr_of(c5).cleanup_episode_newest(700, HDR["n"], 3, keep_fid=HDR["pc"])
+    assert len(c5.f) == 2 and "并列" in r5["note"], r5
+
+    # ---- G) 超过上限 → 整体跳过（防命名意外批量误删）----
+    rows = [PLN, {**PLN, "fid": "3001", "pc": "p3001", "te": "1789985000"},
+            {**PLN, "fid": "3002", "pc": "p3002", "te": "1789985100"}, HDR]
+    c6 = _Cloud(rows)
+    r6 = await mgr_of(c6).cleanup_episode_newest(700, HDR["n"], 1, keep_fid=HDR["pc"])
+    assert len(c6.f) == 4 and "超过上限" in r6["note"], r6
+
+    # ---- H) 只该同集：不同集/别的剧不许碰 ----
+    other = {**PLN, "fid": "4001", "pc": "p4001", "te": "1789980000",
+             "n": "甲剧 (2026) [tmdbid=100001] S01E34 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"}
+    c7 = _Cloud([HDR, other])
+    await mgr_of(c7).cleanup_episode_newest(700, HDR["n"], 3, keep_fid=HDR["pc"])
+    assert len(c7.f) == 2, f"不同集不该动：{names(c7)}"
+
+    # ---- I) 端到端：走 Uploader._cleanup_prev_versions（确认它改走纯云端判据）----
+    cfg, store, _mgr, _up0, tmp, src = make_env(mode="rapid_only", fail_first=0)
+    try:
+        cloud_dir = "/TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
+        cfg["upload"]["cleanup_previous_versions"] = True
+        cfg["upload"]["cleanup_max_delete"] = 3
+        cfg["upload"]["delete_after_upload"] = True          # ← 真机配置：本地会被收尾删掉
+        up = Uploader(cfg, store, _mgr)
+
+        class _RT(_P115):
+            def __init__(self_, rows):
+                self_._dir_cache = {}
+                self_._dir_cache_ttl = 30.0
+                self_._dir_cache_max = 64
+                self_._delete_lock = asyncio.Lock()
+                self_.f = {r["fid"]: dict(r) for r in rows}
+
+            async def ensure_pid(self_, p):
+                return 700
+
+            async def list_dir(self_, pid, use_cache=True):
+                rows = [dict(v) for v in self_.f.values()]
+                self_._remember_dir(int(pid), rows)
+                return rows
+
+            async def delete_file(self_, fid):
+                async with self_._delete_lock:
+                    return bool(self_.f.pop(str(fid), None))
+
+        rt = _RT([PLN, HDR])
+        up.mgr = rt
+        # 本地文件按真机行为**不存在**（秒传完已被收尾删掉），库里记录 source_deleted=1。
+        # ★ 本地文件名必须与云端条目名一致（真机就是这样：`<剧名 (年) [tmdbid=…]>/Season 01/`
+        #   下与云端同名），否则 episode_key 算出的剧名段不同、匹配不上（这是现实约束：
+        #   本地名与云端名形式不同时清不掉，代码已把这种情况做成**可见 note**）。
+        p_local = os.path.join(src, "TVs/Drama", HDR["n"])
+        store.add(p_local, 5187057457, 1.0)
+        store.set(p_local, status="已上传", target_dir=cloud_dir,
+                  file_id=HDR["pc"], source_deleted=1)
+        await up._cleanup_prev_versions(cloud_dir, 700, p_local)
+        assert list(rt.f.keys()) == [HDR["fid"]], \
+            f"★ 本地文件已被收尾删掉时旧版仍应被清：剩 {[v['n'] for v in rt.f.values()]}"
+
+        # ---- J) 名字对不上时必须给出**可见** note（不能静默「没有旧版本」）----
+        rt2 = _RT([PLN, HDR])
+        up.mgr = rt2
+        p_odd = os.path.join(src, "TVs/Drama", "甲剧.S01E33.HDR.mkv")   # 剧名段与云端不同
+        store.add(p_odd, 1, 1.0)
+        store.set(p_odd, status="已上传", target_dir=cloud_dir, file_id="x", source_deleted=1)
+        r_odd = await rt2.cleanup_episode_newest(700, "甲剧.S01E33.HDR.mkv", 3, keep_fid="x")
+        assert len(rt2.f) == 2, "名字对不上时不该动手"
+        assert "对不上" in r_odd["note"], f"名字对不上必须可见：{r_odd}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[43] 同集清理改为**纯云端时间**判据（真机根因）：delete_after_upload=True 时"
+                "每个版本本地都被收尾删掉、source_deleted=1，任何「本地在不在」判据都会把同集"
+                "全部版本保护住 ⇒ 清理永久空转（真机 2 小时日志零行）；"
+                "新判据用 115 条目 `te`/`tp`/`tu` epoch 秒（`t` 字符串兜底），与本地无关；"
+                "用户场景 6 项全通（HDR后传删普通版 / 反向 / 让位护栏 / 无时间字段保守 + 可见 / "
+                "时间并列不动手 / 超上限跳过 / 不同集不碰）；端到端确认本地被删时仍能清理")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -3151,6 +3332,7 @@ async def main():
     await case_secure_compare_all_channels()
     await case_same_name_duplicate_cleaned()
     await case_same_episode_time_judgment()
+    await case_cloud_only_episode_cleanup()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

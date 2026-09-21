@@ -14,7 +14,7 @@ import os
 import time
 
 from notify import Notifier
-from p115 import episode_key, resolve_upload_target
+from p115 import P115 as _P115, episode_key, resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
 CHUNK = 8 * 1024 * 1024
@@ -34,6 +34,12 @@ CHUNK = 8 * 1024 * 1024
 # `created_at` 只在 `store.add()`（scanner 发现新内容 → INSERT OR REPLACE）时写入，
 # 语义正是「这条记录代表的那份内容是什么时候到本地的」。
 SAME_BATCH_SECONDS = 1800.0
+
+# 同集巡检列云端目录时的分页硬上限（页数）。
+# 【坑】别用 p115.MAX_DIR_PAGES —— 那个常量不存在（p115 里叫 MAX_DIR_ITEMS，语义是
+# 「最多收多少条目」）；写成它会让 `_cloud_page` 一被调用就 NameError。
+# py_compile 查不出这类错误（运行时才炸），改完这类代码必须真跑一次。
+MAX_SWEEP_PAGES = 200
 
 # 跨实例共享的调度状态。
 #
@@ -369,50 +375,213 @@ class Uploader:
                 newest_at, newest_name = at, base
         return newest_name
 
-    async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
-        """洗板（重下同集不同版本）后，把云端同一集的旧版本移进 115 回收站。
+    # ---------- 同集巡检（**纯云端**视角） ----------
+    # 用户明确的话（原话）：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件
+    # 在秒传完已经被删掉了」。所以判据必须**全部**落在 115 返回的条目上 ——
+    # 不依赖本地文件、不依赖本地库里那条记录还在不在。
+    # 做法：父目录内按「剧名 + SxxExx + 扩展名」分组 → 同组多于一条时，
+    # 保留「115 侧时间最新」的那条，其余 `fs_delete` 移入回收站（可恢复）。
 
-        只认「剧名 + SxxExx + 扩展名」这个键：画质标签（DV / HDR / WEB-DL / 站点名…）
-        与集号之后的内容都不参与比较，所以 [.. DV ..] 与 [.. ..] 会被判成同一集。
-        任何失败都只记警告，绝不影响上传结果本身。
+    @staticmethod
+    def _cloud_ts(row: dict) -> float:
+        """取云端条目的时间戳（越大越新）。
+
+        【单一真相源】直接委托 `p115.P115.cloud_ts` —— 别在这里再写一份字段名列表：
+        真机实测字段是 `te`/`tp`/`tu`（epoch 秒）与 `t`（`YYYY-MM-DD HH:MM`），
+        两份实现一旦漂移，就会出现「上传后清理用一套字段、巡检用另一套」的诡异不一致。
+        """
+        return _P115.cloud_ts(row)
+
+    async def _cloud_page(self, cid: int) -> list[dict]:
+        """列一个云端目录的**全部条目**（含子目录），分页取全。只读。"""
+        out: list[dict] = []
+        offset, page = 0, 1150
+        prev_sig: tuple | None = None
+        for _ in range(MAX_SWEEP_PAGES):
+            try:
+                resp = await self.client.fs_files(
+                    {"cid": str(cid), "offset": offset, "limit": page,
+                     "show_dir": 1, "cur": 1}, async_=True)
+            except Exception as exc:
+                logger.warning("同集巡检：列云端目录 %s 失败：%s", cid, exc)
+                break
+            data = (resp or {}).get("data")
+            if isinstance(data, dict):
+                rows = data.get("list") or []
+            elif isinstance(data, list):
+                rows = data
+            else:
+                rows = (resp or {}).get("list") or []
+            rows = [r for r in rows if isinstance(r, dict)]
+            if not rows:
+                break
+            sig = tuple(str(r.get("fid") or r.get("cid")) for r in rows)
+            if sig and sig == prev_sig:
+                logger.warning("同集巡检：目录 %s 反复返回同一批，已停止", cid)
+                break
+            prev_sig = sig
+            out.extend(rows)
+            if len(rows) < page:
+                break
+            offset += len(rows)
+        return out
+
+    async def _cloud_walk(self, cid: int, depth: int = 0, max_depth: int = 3,
+                          seen: set | None = None) -> list[tuple[int, list[dict]]]:
+        """递归列出云端目录树，返回 [(cid, 条目列表), …]。只读。"""
+        seen = seen if seen is not None else set()
+        out: list[tuple[int, list[dict]]] = []
+        try:
+            key = int(cid)
+        except (TypeError, ValueError):
+            return out
+        if depth > max_depth or key in seen:
+            return out
+        seen.add(key)
+        rows = await self._cloud_page(key)
+        out.append((key, rows))
+        if depth >= max_depth:
+            return out
+        for r in rows:
+            sub = r.get("cid")
+            if r.get("fid") not in (None, "") or sub in (None, "", 0, "0"):
+                continue                                   # 只要子目录
+            try:
+                out.extend(await self._cloud_walk(int(sub), depth + 1, max_depth, seen))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    async def sweep_cloud_episode_duplicates(self, max_delete: int = 0) -> dict:
+        """同集巡检：**只看 115 云端**，同集多条时只留最近上传的那条。
+
+        用户诉求（原话）：「上传到115以后校验115的那个文件夹里面有没有相同集数的视频，
+        就拿第33集为例，现在115里面有两个第33集的甲剧，但是一个是hdr的版本（后秒传上去的），
+        一个普通4k版本（先秒传上去的），我需要的是后秒传上去这个hdr的版本后，把先秒传上去的
+        普通4k版本删掉」；并补充「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件
+        在秒传完已经被删掉了」。
+
+        所以本巡检**不读本地文件、不依赖本地记录状态**，只用两样东西：
+          1) 该扫哪些云端目录 —— 库里出现过的 `target_dir`，外加 `paths.target_root`
+             （库里记录全没了也还能从根往下找）；都只是**路径字符串**，不是本地文件；
+          2) 谁是「最新的那条」—— 115 条目自身的时间字段（见 `_CLOUD_TS_KEYS`）。
+        拿不到时间字段时**保守不动手**，但日志必须可见（不再静默）。
+
+        返回 {"removed": n, "dirs": 扫过的目录数, "note": 说明}；幂等（清完只剩一条）。
+        """
+        if not self.cleanup_prev:
+            return {"removed": 0, "dirs": 0, "note": "开关 upload.cleanup_previous_versions 关着"}
+        limit = max_delete or self.cleanup_max
+        # ① 要扫的云端目录（只是路径字符串）
+        roots: list[str] = []
+        try:
+            recs, _ = self.store.list_tasks(limit=2000)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("同集巡检：读取记录失败：%s", exc)
+            recs = []
+        for r in recs or []:
+            td = str(r.get("target_dir") or "").strip()
+            if td and td not in roots:
+                roots.append(td)
+        base = str((self.cfg.get("paths") or {}).get("target_root") or "").strip()
+        if base and base not in roots:
+            roots.append(base)
+        if not roots:
+            return {"removed": 0, "dirs": 0, "note": "没有可扫的云端目录"}
+
+        removed = 0
+        scanned = 0
+        for td in roots:
+            try:
+                cid = await self.mgr.ensure_pid(td)
+                tree = await self._cloud_walk(cid, 0, 3)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同集巡检：遍历 %s 失败：%s", td, exc)
+                continue
+            for dcid, items in tree:
+                scanned += 1
+                files = [r for r in items if r.get("fid") not in (None, "")]
+                groups: dict[str, list[dict]] = {}
+                for r in files:
+                    k = episode_key(str(r.get("n") or r.get("name") or ""))
+                    if k:
+                        groups.setdefault(k, []).append(r)
+                for k, grp in groups.items():
+                    if len(grp) < 2:
+                        continue                            # 该目录里这一集只有一条，正常
+                    ts = [(self._cloud_ts(r), r) for r in grp]
+                    newest = max(t for t, _ in ts)
+                    if newest <= 0:
+                        logger.info("同集巡检：%s（目录 %s）有 %d 条同集文件，"
+                                    "但 115 条目没有可用时间字段，分不清哪条是后传的，本次不动手",
+                                    k, td, len(grp))
+                        continue
+                    victims = [r for t, r in ts if t < newest]
+                    if not victims:
+                        continue                            # 时间戳都一样（同批），不动手
+                    if limit > 0 and len(victims) > limit:
+                        logger.info("同集巡检：%s 同集旧版本 %d 个，超过上限 %d，本次不动手",
+                                    k, len(victims), limit)
+                        continue
+                    for r in victims:
+                        fid = r.get("fid")
+                        name = str(r.get("n") or r.get("name") or "")
+                        try:
+                            if await self.mgr.delete_file(fid):
+                                removed += 1
+                                logger.info("同集巡检：%s 保留最后上传的那条，已移入 115 回收站 %s",
+                                            k, name)
+                            else:
+                                logger.warning("同集巡检：删除失败 %s", name)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("同集巡检：删除出错 %s：%s", name, exc)
+        if removed:
+            cache = getattr(self, "_dir_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()                               # 内容变了，缓存作废
+        return {"removed": removed, "dirs": scanned,
+                "note": f"扫了 {scanned} 个云端目录，清掉 {removed} 个同集旧版"}
+
+    async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
+        """上传成功后：云端同一集只留**刚上传的那条**，其余移入 115 回收站。
+
+        ★ 判据只用 115 云端条目自身的时间字段（`p115.P115.cleanup_episode_newest`）。
+        为什么不能按本地文件判（第 43 处，用户真机报障的最终根因）：
+          用户原话：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件在秒传完
+          已经被删掉了」。生产实测 `upload.delete_after_upload = True`
+          ⇒ 每个上传成功的版本本地文件都被 `_delete_source()` 收尾删掉、库里
+          `source_deleted=1`。而第 37/38 处为防「同集互删」加的保护判据是
+          「本地文件还在 **或** 是本程序收尾删的（source_deleted=1）⇒ 正当版本 ⇒ 保护」
+          —— 在这个配置下**每个版本都命中**，于是 keep_names 收进了同集所有条目、
+          `cleanup_previous` 返回「没有旧版本」、清理永久空转。
+          真机实测：2 小时内 `清理|洗板|旧版` 日志**零行**，云端 E33 一直是
+          18:11（普通版）与 19:15（HDR 版）两条。
+        新判据与本地完全无关，所以「本地已被删掉」「本地文件还在」「库里记录丢了」
+        这些情况一律不影响判定。
         """
         if not self.cleanup_prev:
             return
         name = os.path.basename(local_path)
-        try:
-            size = os.path.getsize(local_path)
-        except OSError:
-            size = 0
-        # 护栏（第 42 处另一半）：同集里已经有一个**更新**的版本时，本次不动手。
-        #
-        # 场景：用户点的可能是**老版本**那条的「重新排队」。它会重新上传成功（秒传命中），
-        # 然后以「刚上传那条」的身份去清理 —— 于是**真正的最新版被当旧版删掉**，
-        # 结果与用户想要的正好相反。有更新的版本在时交给它（它上传完成时自会清理）。
-        newer = self._newer_episode_sibling(cloud_dir, local_path)
-        if newer:
-            logger.info("洗板清理：%s 同集已有更新的版本 %s，交给它处理，本次不动手",
-                        name, newer)
-            cur0 = self.store.get(local_path) or {}
-            self.store.set(local_path,
-                           message=(cur0.get("message") or "")
-                                   + f"｜洗板清理：同集已有更新的版本 {newer}，本次不动手")
-            return
-        # 刚上传那条的标识（秒传/分块成功时已落库；实测是 115 的 pickcode，形如 abcd0demo0pick001）——
-        # 比文件名可靠：115 遇到同名会给新版改名成 "xxx (1).mkv"，只靠名字排除不掉它。
         cur = self.store.get(local_path) or {}
         keep_fid = str(cur.get("file_id") or "")
-        # 同集「仍在本地、且已上传成功」的其它版本也必须保护，否则两个版本几乎同时传完时
-        # 会互删（A 清 B、B 清 A ⇒ 云端同集一个不剩）。见 _same_episode_keeps 的说明。
-        keep_fids, keep_names = self._same_episode_keeps(cloud_dir, local_path)
         try:
-            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
-                                                  keep_fid=keep_fid,
-                                                  keep_fids=keep_fids,
-                                                  keep_names=keep_names)
-        except TypeError:
-            # 兼容测试替身 / 旧签名实现（只接 keep_fid）
-            res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
-                                                  keep_fid=keep_fid)
+            res = await self.mgr.cleanup_episode_newest(pid, name, self.cleanup_max,
+                                                        keep_fid=keep_fid)
+        except AttributeError:
+            # 兼容测试替身 / 旧实现（没有纯云端判据时退回老路径）
+            try:
+                size = os.path.getsize(local_path)
+            except OSError:
+                size = 0
+            keep_fids, keep_names = self._same_episode_keeps(cloud_dir, local_path)
+            try:
+                res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                      keep_fid=keep_fid,
+                                                      keep_fids=keep_fids,
+                                                      keep_names=keep_names)
+            except TypeError:
+                res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                      keep_fid=keep_fid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("洗板清理出错（不影响上传）：%s", exc)
             return
@@ -428,6 +597,7 @@ class Uploader:
         elif note and note != "没有旧版本":
             tail = f"｜洗板清理：{note}"
         if tail:
+            cur = self.store.get(local_path) or {}
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
 
     def dispatch(self) -> None:
