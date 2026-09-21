@@ -115,7 +115,12 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                     one = state.pop("process_one", None)
                     if one:
                         logger.info("界面指定立即处理：%s", one)
-                        await uploader._process(one)
+                        # 必须走 spawn：它带 _active 去重、semaphore 并发上限、
+                        # 以及异常兜底（退避/置错误）。直接 await _process 会绕过
+                        # 这一整套 —— 文件正在跑时再点「立即处理」，同一文件会被
+                        # 两个协程同时走状态机（重复发秒传请求、重复写状态；分块
+                        # 场景下两路同时上传同一个文件），且不受并发上限约束。
+                        uploader.spawn(one)
                     uploader.dispatch()
             except Exception as exc:  # noqa: BLE001
                 logger.error("本轮扫描/调度出错：%s", exc)

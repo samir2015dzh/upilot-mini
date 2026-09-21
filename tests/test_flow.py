@@ -25,7 +25,7 @@ sys.path.insert(0, APP)
 import config as cfgmod          # noqa: E402
 import scanner                   # noqa: E402
 import webui                     # noqa: E402
-from p115 import StubP115, resolve_upload_target   # noqa: E402
+from p115 import P115, StubP115, resolve_upload_target   # noqa: E402
 from store import Store          # noqa: E402
 from uploader import Uploader, sha1_of   # noqa: E402
 
@@ -1184,6 +1184,122 @@ async def case_all_states_recoverable():
                 "都能被 dispatch 捞起并推进到「已上传」；「上传中」且断点齐全时直接续传、不白走秒传")
 
 
+async def case_changed_file_not_lost():
+    """[24] 上传期间文件被替换（洗板重下）→ 按新内容重新入队，绝不丢。
+
+    MoviePilot 洗板重下会往**同一个路径**写新内容，而上传（尤其分块几 GB）要跑很久，
+    中间完全可能被换掉。这时 _process 手里还是旧 rec：
+      - 照常写「已上传」→ 盖掉 scanner 刚做的重置 → 库里终态、云端旧、本地新，
+        而终态让 scanner 与 dispatch 都不再碰它 → **新内容永远不会上传**；
+      - _delete_source 只比 size → 同 size 的新内容会被**误删**。
+    """
+    # 1) forget_pid 必须真的清掉 SQLite 里的 cid，否则 10014 兜底是空转
+    #    注意用真 P115：StubP115 的 forget_pid 是空操作、也没有 SQLite 缓存这回事。
+    import p115 as p115mod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+    try:
+        class _FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def fs_makedirs(self, path, async_=True):
+                self.calls += 1
+                return {"state": True, "errno": 0,
+                        "data": {"file_id": str(1000000000000000100 + self.calls)}}
+
+        real = p115mod.P115.__new__(p115mod.P115)
+        real.cfg, real.store = cfg, store
+        real._cid_mem = {}
+        real._makedirs_lock = asyncio.Lock()
+        real.client = _FakeClient()
+        first = await real.ensure_pid("/TVs/x/Season 01")
+        await real.forget_pid("/TVs/x/Season 01")
+        second = await real.ensure_pid("/TVs/x/Season 01")
+        assert first != second, f"forget_pid 后应重建目录，实得同一个 cid={first}"
+        assert real.client.calls == 2, f"应调用两次 fs_makedirs，实得 {real.client.calls}"
+        assert store.cid_get("/TVs/x/Season 01") == second, "库里 cid 应更新为新值"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 2) 秒传命中路径：文件在途被换 → 重新入队，不写「已上传」
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+    try:
+        path = write_file(src, "换版/s01e31.mkv", 4 * 1024)
+        scanner.scan_once(store, cfg)
+        store.set(path, status="待秒传", sha1="old-hash")
+        with open(path, "wb") as fh:
+            fh.write(b"B" * (8 * 1024))                 # 在途替换：内容与大小都变
+        await up._process(path)
+        rec = store.get(path)
+        assert rec["status"] == "待处理", f"应重新入队，实得 {rec['status']!r}"
+        assert rec["sha1"] is None, "换过内容后旧 sha1 必须作废"
+        assert rec["size"] == 8 * 1024, rec["size"]
+        assert "替换" in (rec["message"] or ""), rec["message"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 3) 文件没变时不受影响（不能误判成「被替换」）
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+    try:
+        path = write_file(src, "正常/s01e31.mkv", 4 * 1024)
+        scanner.scan_once(store, cfg)
+        await up._process(path)
+        assert store.get(path)["status"] == "已上传", store.get(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 4) 分块完成路径：在途被换 → 重新入队
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, small_file_mb=0.0, fail_first=99)
+    try:
+        path = write_file(src, "分块/s01e31.mkv", 4 * 1024)
+        scanner.scan_once(store, cfg)
+        # retry_count 顶到上限 → 秒传未命中即判「重试耗尽，转普通上传」，
+        # 这样才真正走到分块路径（否则会被安排成「待重试」就返回了）。
+        store.set(path, status="待上传", sha1="old-hash",
+                  retry_count=99, first_failed_at=time.time())
+        real_mp = mgr.multipart
+
+        async def mp_then_swap(p, pid, sha1, record):
+            out = await real_mp(p, pid, sha1, record)
+            with open(p, "wb") as fh:
+                fh.write(b"C" * (16 * 1024))            # 传完那一刻文件已被换
+            return out
+
+        mgr.multipart = mp_then_swap
+        await up._process(path)
+        rec = store.get(path)
+        assert rec["status"] == "待处理", f"分块路径也应重新入队，实得 {rec['status']!r}"
+        assert "替换" in (rec["message"] or ""), rec["message"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 5) _delete_source：同 size 但 mtime 不同 → 不删（破坏性操作必须两个都对上）
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0, delete_after=True)
+    try:
+        path = write_file(src, "同大小/s01e31.mkv", 4 * 1024)
+        scanner.scan_once(store, cfg)
+        rec = store.get(path)
+        with open(path, "wb") as fh:
+            fh.write(b"Z" * (4 * 1024))                 # 同 size、不同内容
+        os.utime(path, (os.path.getatime(path), os.path.getmtime(path) + 100))
+        up._delete_source(path, rec)
+        assert os.path.exists(path), "同 size 但 mtime 已变：新内容被误删了"
+        assert store.get(path)["status"] == "待处理", store.get(path)
+
+        # 两个都对上 → 正常删
+        rec2 = store.get(path)
+        os.utime(path, (os.path.getatime(path), rec2["mtime"]))
+        up._delete_source(path, rec2)
+        assert not os.path.exists(path), "size 与 mtime 都对上时应正常删除"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[24] 上传期间文件被替换（洗板重下）不丢内容：forget_pid 连 SQLite 一起清"
+                "（10014 兜底不再空转）；秒传/分块两条路径都按新内容重新入队并不盖掉 scanner 的重置；"
+                "文件未变时不误判；_delete_source 要求 size 与 mtime 双匹配（拒绝误删同 size 的新文件）")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1207,6 +1323,7 @@ async def main():
     await case_status_selfheal()
     await case_unexpected_error_stops_retry()
     await case_all_states_recoverable()
+    await case_changed_file_not_lost()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

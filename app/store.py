@@ -214,6 +214,16 @@ class Store:
             )
             self.db.commit()
 
+    def cid_del(self, cloud_path: str) -> None:
+        """删掉某个云端路径的 cid 缓存。
+
+        云端目录被删/被移走、115 回 10014 时必须清掉这条 —— 只清内存那份的话，
+        下一次 ensure_pid 会立刻从 SQLite 读回同一个旧 cid，等于没清。
+        """
+        with self.lock:
+            self.db.execute("DELETE FROM meta WHERE k=?", (f"cid:{cloud_path}",))
+            self.db.commit()
+
     # ---------- 任务明细（界面用） ----------
 
     def list_tasks(self, status: str | None = None, q: str = "", limit: int = 50,

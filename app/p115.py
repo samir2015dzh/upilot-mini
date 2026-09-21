@@ -241,8 +241,19 @@ class P115:
             return cid
 
     async def forget_pid(self, cloud_dir: str) -> None:
-        """秒传报 10014（云端目录不存在）时清缓存。"""
-        self._cid_mem.clear()
+        """秒传报 10014（云端目录不存在）时清缓存，让下一次 ensure_pid 真正重建目录。
+
+        内存和 SQLite **两份都要清**：ensure_pid 的顺序是「先看内存 → 再看库 →
+        都没有才调 fs_makedirs」。只清内存的话，第二次进来立刻从库里读回同一个
+        旧 cid，fs_makedirs 根本不会被调用 —— 那句「清缓存后重建目录」就成了空转，
+        10014 会一轮一轮重复报下去，永远不会自愈。
+        """
+        path = normalize_cloud_path(cloud_dir)
+        self._cid_mem.pop(path, None)
+        try:
+            self.store.cid_del(path)
+        except AttributeError:          # 兼容没有 cid_del 的旧 store / 测试替身
+            pass
 
     # ---------- 目录内容 / 删除（洗板清理用） ----------
 

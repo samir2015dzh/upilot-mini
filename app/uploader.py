@@ -122,6 +122,36 @@ class Uploader:
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
 
+    def _file_changed_on_disk(self, path: str, rec: dict) -> bool:
+        """上传结束前确认磁盘上还是当初那个文件。
+
+        MoviePilot 洗板重下会在**同一个路径**写入新内容；而上传（尤其分块传几 GB）
+        要跑很久，中间完全可能被换掉。这时 _process 手里还是旧 rec，跑完若照常写
+        「已上传」，就会盖掉 scanner 刚做的重置 —— 库里成终态，云端是旧内容、本地是
+        新内容，而终态让 scanner 与 dispatch 都不再碰它：**新内容永远不会上传**。
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return True                                  # 文件没了，也按「已变」处理
+        try:
+            if int(rec.get("size") or -1) != int(st.st_size):
+                return True
+            return abs(float(rec.get("mtime") or 0) - st.st_mtime) > 1e-6
+        except (TypeError, ValueError):
+            return False
+
+    def _requeue_changed_file(self, path: str) -> None:
+        """上传期间文件被替换：重置成新文件重新入队（不是「已上传」）。"""
+        try:
+            st = os.stat(path)
+            self.store.set(path, status="待处理", size=st.st_size, mtime=st.st_mtime,
+                           sha1=None, stable_count=0, file_id=None, progress=0.0,
+                           message="上传期间文件被替换（洗板重下），已按新内容重新入队")
+            logger.info("上传期间文件被替换，已重新入队：%s", os.path.basename(path))
+        except OSError:
+            self.store.set(path, status="错误", message="上传期间文件消失")
+
     def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
         """秒传命中 / 上传完成后，把通知丢到后台去发（不等它）。
 
@@ -166,6 +196,16 @@ class Uploader:
             size = int(rec.get("size") or 0)
             if size and os.path.getsize(real) != size:
                 logger.warning("不删（大小已变，可能被换过）：%s", path)
+                return
+            # 光比大小不够：洗板重下可能恰好同 size（同一集的不同版本往往只差几 MB，
+            # 也存在大小完全相同的编码）。删是破坏性的，必须连 mtime 一起对上才动手。
+            try:
+                same_mtime = abs(float(rec.get("mtime") or 0) - os.path.getmtime(real)) <= 1e-6
+            except OSError:
+                same_mtime = False
+            if not same_mtime:
+                logger.warning("不删（修改时间已变，文件被换过）：%s", path)
+                self._requeue_changed_file(path)
                 return
             os.remove(real)
             logger.info("已删除本地源文件：%s", path)
@@ -297,6 +337,11 @@ class Uploader:
                     pid = await self.mgr.ensure_pid(cloud_dir)
                 hit, info = False, {"reason": msg}
             if hit:
+                if self._file_changed_on_disk(path, rec):
+                    # 命中的是旧内容；本地已是新内容。绝不能写「已上传」——
+                    # 终态会让新内容再也上不去（洗板重下的典型后果）。
+                    self._requeue_changed_file(path)
+                    return
                 store.set(path, status="已上传", progress=100.0,
                           file_id=info.get("file_id", ""), upload_mode="rapid",
                           message=f"秒传命中 → {cloud_dir}")
@@ -347,6 +392,11 @@ class Uploader:
         store.set(path, status="上传中", message="分块上传中")
         try:
             result = await self.mgr.multipart(path, pid, rec["sha1"] or "", store.get(path))
+            if self._file_changed_on_disk(path, rec):
+                # 上传期间文件被替换（洗板重下）：云端那半截旧内容没有意义，
+                # 按「新内容」重新入队；绝不能写「已上传」把 scanner 的重置盖掉。
+                self._requeue_changed_file(path)
+                return
             store.set(path, status="已上传", progress=100.0, upload_mode="normal",
                       file_id=str((result or {}).get("file_id", "")),
                       message=f"分块上传完成 → {cloud_dir}")
