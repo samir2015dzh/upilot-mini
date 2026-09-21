@@ -1300,6 +1300,86 @@ async def case_changed_file_not_lost():
                 "文件未变时不误判；_delete_source 要求 size 与 mtime 双匹配（拒绝误删同 size 的新文件）")
 
 
+async def case_config_save_concurrent():
+    """[25] 配置落盘并发安全：多线程同时 save/load 不报错、不撕裂、不留临时文件。
+
+    webui 是 ThreadingHTTPServer（每个请求一个线程），主循环的 115 cookie 同步也在
+    自己的线程里 —— 两边都会调 cfgmod.save() / load()。原来既没锁、临时文件又是固定
+    名字（config.yaml.tmp）：一个线程刚写完就被另一个的 os.replace 消费掉，前者立刻
+    FileNotFoundError；还有 PermissionError。实测 4 线程并发：613/1000 次抛异常。
+    """
+    import re as _re
+    import tempfile as _tf
+    from pathlib import Path as _P
+
+    tmp = _tf.mkdtemp(prefix="upilot-save-")
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    cfgmod.CONFIG_PATH = _P(tmp) / "config.yaml"
+    cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+    try:
+        import threading as _th
+        cfgmod.save(copy.deepcopy(cfgmod.DEFAULTS))
+        bad_write: list[str] = []
+        bad_read: list[str] = []
+        stop = _th.Event()
+
+        def writer(tag: str, n: int = 120):
+            c = copy.deepcopy(cfgmod.DEFAULTS)
+            c["state"] = {"db": os.path.join(tmp, f"{tag}.db")}
+            for i in range(n):
+                c["log_level"] = f"{tag}{i:05d}"
+                try:
+                    cfgmod.save(c)
+                except Exception as exc:  # noqa: BLE001
+                    bad_write.append(f"{tag}/{i} {type(exc).__name__}: {exc}")
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    cfgmod.load()
+                except Exception as exc:  # noqa: BLE001
+                    bad_read.append(f"{type(exc).__name__}: {exc}")
+
+        rd = _th.Thread(target=reader, daemon=True)   # 守护线程：异常路径也不会挂住退出
+        ws = [_th.Thread(target=writer, args=(f"W{j}",), daemon=True) for j in range(2)]
+        rd.start()
+        for t in ws:
+            t.start()
+        for t in ws:
+            t.join(timeout=60)
+        stop.set()
+        rd.join(timeout=10)
+
+        assert not bad_write, f"并发 save 抛错：{bad_write[:3]}"
+        assert not bad_read, f"并发 load 抛错：{bad_read[:3]}"
+
+        # 落盘必须是「某一次完整写入」，不能是两次交叉的半截内容
+        import yaml as _yaml
+        got = _yaml.safe_load(cfgmod.CONFIG_PATH.read_text(encoding="utf-8"))
+        lv = str(got.get("log_level") or "")
+        assert _re.fullmatch(r"W[01]\d{5}", lv), f"落盘内容撕裂：log_level={lv!r}"
+
+        # 临时文件不许残留（里面是完整凭据）
+        left = [p.name for p in _P(tmp).iterdir() if ".tmp" in p.name]
+        assert not left, f"残留临时文件：{left}"
+
+        # 失败路径不留垃圾：写到不存在的目录 → 抛错但不留下 .tmp
+        cfgmod.CONFIG_PATH = _P(tmp) / "nodir" / "config.yaml"
+        cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+        try:
+            cfgmod.save(copy.deepcopy(cfgmod.DEFAULTS))
+        except Exception:  # noqa: BLE001
+            pass
+        strays = [p for p in _P(tmp).rglob("*.tmp")]
+        assert not strays, f"失败路径留下临时文件：{strays}"
+    finally:
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[25] 配置落盘并发安全：多线程 save/load 交叉零异常、落盘无撕裂、"
+                "不残留 .tmp（凭据不在里面过夜）；失败路径同样不留垃圾")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1324,6 +1404,7 @@ async def main():
     await case_unexpected_error_stops_retry()
     await case_all_states_recoverable()
     await case_changed_file_not_lost()
+    await case_config_save_concurrent()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

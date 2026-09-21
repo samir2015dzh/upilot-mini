@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 
 import json
@@ -18,6 +20,14 @@ EXAMPLE_PATH = Path("/app/config/config.example.yaml")
 # unhealthy（服务其实好好地在旧端口跑），监控显示异常，配了 depends_on:
 # service_healthy 的地方还会被卡住。所以用这个文件兜底。
 PORT_FILE = CONFIG_PATH.parent / ".http_port"
+
+# 配置落盘的互斥锁。
+# webui 是 ThreadingHTTPServer（每个请求一个线程），主循环的 115 cookie 同步也在
+# 自己的线程里调 save() —— 两边可以同时进来。原来既没有锁、.tmp 又是固定路径：
+# 一个线程刚写完 tmp 就被另一个的 os.replace 消费掉，前者立刻报 FileNotFoundError；
+# 还有 PermissionError（文件正被占用）。实测 4 线程并发 save：613/1000 次抛异常，
+# 落盘内容还会撕裂。
+_SAVE_LOCK = threading.RLock()
 
 # 115 客户端身份（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
 # 用途：所有 115 请求（目录 / 秒传 / 上传）都用它当身份，挑一个自己平时不用的端。
@@ -160,9 +170,17 @@ def ensure_config() -> Path:
 
 
 def load() -> dict:
-    ensure_config()
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        user = yaml.safe_load(f) or {}
+    """读配置。
+
+    与 save() 共用同一把锁：Linux 上 POSIX rename 是原子的（读者拿旧 inode，
+    不受写者影响），所以生产环境其实不需要；但 Windows 上「目标文件正被打开」
+    会让 os.replace 报 WinError 5 —— 开发/测试环境会随机失败。加锁代价可忽略，
+    两个平台都确定。
+    """
+    with _SAVE_LOCK:
+        ensure_config()
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            user = yaml.safe_load(f) or {}
     cfg = _merge(DEFAULTS, user)
 
     env_cookie = os.environ.get("P115_COOKIE", "").strip()
@@ -566,22 +584,40 @@ def _chmod_private(path, mode: int = 0o600) -> None:
 
 
 def save(cfg: dict) -> Path:
-    """把当前内存配置落盘（原子写 + 保留一份 .bak）。"""
-    ensure_config()
-    path = CONFIG_PATH
-    body = ("# 本文件由界面保存生成（字段说明见 config.example.yaml）\n"
-            + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False))
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(body, encoding="utf-8")
-    # .tmp 里已经是完整凭据，别等 os.replace 之后才收紧
-    _chmod_private(tmp)
-    backup = path.parent / (path.name + ".bak")
-    if path.exists():
-        shutil.copyfile(path, backup)
-        # shutil.copyfile 用默认 umask 建新文件（通常 644），并把 cookie /
-        # 面板密码 / notify 凭据一起复制进去 —— 备份比正本还宽松，
-        # 同机其他进程能直接读到。必须跟着收紧。
-        _chmod_private(backup)
-    os.replace(tmp, path)
-    _chmod_private(path)
-    return path
+    """把当前内存配置落盘（原子写 + 保留一份 .bak）。
+
+    并发安全：webui 每个请求一个线程、主循环 cookie 同步一个线程，都会调这里。
+    所以 (a) 整段用 _SAVE_LOCK 串行化，(b) 临时文件用 mkstemp 生成**唯一名字**
+    （原来是固定的 config.yaml.tmp：一个线程刚写完就被另一个 os.replace 消费掉，
+    前者立刻 FileNotFoundError；实测 4 线程并发 613/1000 次抛异常，内容还会撕裂）。
+    """
+    with _SAVE_LOCK:
+        ensure_config()
+        path = CONFIG_PATH
+        body = ("# 本文件由界面保存生成（字段说明见 config.example.yaml）\n"
+                + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False))
+        backup = path.parent / (path.name + ".bak")
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                        dir=str(path.parent))
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            # .tmp 里已经是完整凭据，别等 os.replace 之后才收紧
+            _chmod_private(tmp)
+            if path.exists():
+                shutil.copyfile(path, backup)
+                # shutil.copyfile 用默认 umask 建新文件（通常 644），并把 cookie /
+                # 面板密码 / notify 凭据一起复制进去 —— 备份比正本还宽松，
+                # 同机其他进程能直接读到。必须跟着收紧。
+                _chmod_private(backup)
+            os.replace(tmp, path)
+        except BaseException:
+            # 失败就别留垃圾（凭据在临时文件里）
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        _chmod_private(path)
+        return path
