@@ -315,9 +315,20 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
 
         # ---- 鉴权 ----
         def _client_ip(self) -> str:
-            fwd = self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or ""
-            if fwd:
-                return fwd.split(",")[0].strip()
+            """取用于限速的来源标识。
+
+            X-Real-IP / X-Forwarded-For 是**客户端可以随便伪造**的。无条件信任它们，
+            等于每次请求换一个值就换一个限速 key —— 失败计数永远攒不到上限，
+            登录限速形同虚设（实测同一来源换 12 次头、一次都没被锁）。而限速是本项目
+            唯一的登录爆破防护。所以只有在「确实挂在反代后面」时才读这两个头：
+            http.auth.trust_forwarded_ip = true（面板里一项，默认关）。
+            默认直接用 TCP 对端地址，伪造头完全无效。
+            """
+            a = auth_cfg(cfg)
+            if a.get("trust_forwarded_ip"):
+                fwd = self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or ""
+                if fwd:
+                    return fwd.split(",")[0].strip()[:64]
             return self.client_address[0] if self.client_address else "?"
 
         def _guard(self) -> bool:

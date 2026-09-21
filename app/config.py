@@ -121,7 +121,11 @@ DEFAULTS: dict = {
         # 反代/暴露到内网时打开：页面与 /api/* 需要 HTTP Basic 或 ?token=…
         # /health 始终放行（容器 HEALTHCHECK 在容器内直连）
         "auth": {"enabled": False, "mode": "basic", "username": "admin",
-                 "password": "", "session_hours": 72},
+                 "password": "", "session_hours": 72,
+                 # 挂在反向代理后面才打开：这时才信任 X-Real-IP / X-Forwarded-For
+                 # 作为「来源」用于登录限速。默认关 —— 这两个头客户端可伪造，
+                 # 无条件信任会让限速失效（换头即绕过）。
+                 "trust_forwarded_ip": False},
     },
     "log_level": "INFO",
 }
@@ -358,6 +362,11 @@ FIELD_GROUPS: list[dict] = [
          "hint": "留空 = 不改。改了之后，已登录的浏览器都要重新登一次"},
         {"key": "http.auth.session_hours", "label": "登录一次管多久（小时）", "type": "int",
          "min": 1, "max": 8760},
+        {"key": "http.auth.trust_forwarded_ip", "label": "在反向代理后面（信任来源 IP 头）",
+         "type": "bool", "advanced": True,
+         "hint": "只有当这个面板确实挂在反向代理后面时才打开。打开后会按 X-Real-IP / X-Forwarded-For "
+                 "判断「来源」来做登录失败限速 —— 这两个头客户端可以伪造，直连时打开等于让限速失效"
+                 "（换着头就能无限猜密码）。默认关：按 TCP 对端地址计数，伪造头无效。"},
         {"key": "http.port", "label": "面板端口", "type": "int", "min": 1, "max": 65535, "restart": True,
          "hint": "默认 9844，一般不用改"},
         {"key": "http.public_url", "label": "对外网址（可选）", "type": "text", "advanced": True,

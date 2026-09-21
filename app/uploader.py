@@ -19,6 +19,17 @@ from p115 import resolve_upload_target
 logger = logging.getLogger("upilot.upload")
 CHUNK = 8 * 1024 * 1024
 
+# 跨实例共享的调度状态。
+#
+# main.py 在改配置时（upload./retry./notify. 任意一项、或 115 cookie 同步）会重建
+# Uploader，而**旧实例已经派发的后台任务仍在事件循环里跑**。这几样如果留在实例上：
+#   - _active 为空     → 同一个文件被新旧两个协程同时处理（实测秒传请求发 2 次）；
+#   - sem 各算一份     → 并发上限直接翻倍（旧 1 / 新 2）；
+#   - _bg 为空         → 旧实例被覆盖后，它的后台任务失去强引用，可能被 GC 回收；
+#   - _err_streak 清空 → 连续异常计数作废，退避重试永远到不了阈值。
+# 所以统一放模块级共享。sem 只在并发数真的变了时重建（容量要跟着配置走）。
+_SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None, "sem_n": -1}
+
 
 async def sha1_of(path: str, record: dict, store) -> str:
     """算过就直接复用（重启/重试都不再读盘）；没算过则 8MB 分块流式算。"""
@@ -50,8 +61,14 @@ class Uploader:
         self.cfg = cfg
         self.store = store
         self.mgr = manager
-        self.sem = asyncio.Semaphore(max(1, int(cfg["upload"]["concurrency"])))
-        self._active: set[str] = set()
+        # 与旧实例共享（见模块顶部 _SHARED 的说明）：改配置重建 Uploader 时，
+        # 旧任务还在跑，实例级状态会让同一文件被处理两遍。
+        _n = max(1, int(cfg["upload"]["concurrency"]))
+        if _SHARED["sem"] is None or _SHARED["sem_n"] != _n:
+            _SHARED["sem"] = asyncio.Semaphore(_n)
+            _SHARED["sem_n"] = _n
+        self.sem = _SHARED["sem"]
+        self._active: set[str] = _SHARED["active"]
         up = cfg["upload"]
         self.small_bytes = float(up["small_file_mb"]) * 1024 * 1024
         rt = cfg["retry"]
@@ -72,12 +89,14 @@ class Uploader:
         self.cleanup_prev = bool(up.get("cleanup_previous_versions"))
         self.cleanup_max = int(up.get("cleanup_max_delete") or 3)
         self.notifier = Notifier(cfg)
-        self._bg: set = set()          # 持有后台通知任务的引用，防止跑到一半被回收
+        # 同样跨实例共享：旧实例被覆盖后，它派发的后台任务若只被实例持有的 set 引用，
+        # 会被 GC 回收（跑到一半消失）；异常计数清空则让退避重试永远到不了阈值。
+        self._bg: set = _SHARED["bg"]          # 后台任务强引用，防止跑到一半被回收
         # 未预期异常（不是 115 的瞬态错误，而是 fs_makedirs 500、文件读不了这类
         # 真实故障）的连续次数。一次就判死刑太狠 —— ensure_pid 是裸调、没被
         # _retry_transient 包住，一次网络抖动也会冒到这里；无人值守时把文件永久
         # 标成「错误」等于要人工介入。改成退避重试，连续 error_max_attempts 次才停。
-        self._err_streak: dict[str, int] = {}
+        self._err_streak: dict[str, int] = _SHARED["err_streak"]
         self.error_max_attempts = 3
 
     # ---------- 调度 ----------
