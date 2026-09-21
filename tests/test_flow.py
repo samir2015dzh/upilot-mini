@@ -29,6 +29,7 @@ import scanner                   # noqa: E402
 import webui                     # noqa: E402
 from p115 import P115, StubP115, normalize_cloud_path, resolve_upload_target   # noqa: E402
 from store import Store          # noqa: E402
+import store as store_store      # noqa: E402  （用例 [38] 要断言 DDL / 老库补列）
 from uploader import Uploader, sha1_of   # noqa: E402
 
 PASS: list[str] = []
@@ -2660,6 +2661,116 @@ async def case_same_episode_no_mutual_delete():
                 "只按名字也能挡住；洗板场景（旧版本地已不在）不再保护、非本地同集旧版仍被清")
 
 
+async def case_delete_after_upload_no_mutual_delete():
+    """[38] `upload.delete_after_upload` 开着时，同集两版本仍**不能互删**。
+
+    第 37 处的判据是「本地文件是否还在」，但它分不开两种情况：
+      ① 洗板把旧版换掉了（本地文件没了）；
+      ② `delete_after_upload` 开关把**刚传完的正当版本**收尾删了（本地文件也没了）。
+    于是 ② 会退化成互删：A 传完 → 本地被程序删掉 → B 的清理看不到 A → 把 A 当旧版删掉。
+    本地已复现（同对照把开关关掉则 delete 目标为空）。
+
+    修法：`files` 表加 `source_deleted`，`_delete_source()` 成功删除后置 1；
+    `_same_episode_keeps()` 判据改为「本地还在 **或** 是本程序收尾删的」；
+    `_requeue_changed_file()` / scanner 的整条替换负责把该事实作废。
+    """
+    dv = "Show.S01E05.2160p.DV.mkv"
+    nov = "Show.S01E05.2160p.mkv"
+    assert p115.episode_key(dv) == p115.episode_key(nov)
+
+    # ---- A) DDL / 老库补列 ----
+    assert "source_deleted" in store_store.DDL, "DDL 必须含 source_deleted"
+    import sqlite3 as _sq
+    tmp0 = tempfile.mkdtemp(prefix="v38-ddl-")
+    try:
+        db = os.path.join(tmp0, "old.db")
+        conn = _sq.connect(db)
+        conn.executescript(
+            "CREATE TABLE files(path TEXT PRIMARY KEY, size INTEGER NOT NULL,"
+            " mtime REAL NOT NULL, sha1 TEXT, status TEXT NOT NULL DEFAULT '待处理',"
+            " stable_count INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0,"
+            " first_failed_at REAL, next_retry_at REAL, upload_id TEXT, upload_callback TEXT,"
+            " upload_oss_url TEXT, upload_partsize INTEGER, target_dir TEXT, pid INTEGER,"
+            " file_id TEXT, progress REAL DEFAULT 0, speed REAL DEFAULT 0, message TEXT,"
+            " upload_mode TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);"
+            " CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);")
+        conn.execute("INSERT INTO files(path,size,mtime,status,created_at,updated_at)"
+                     " VALUES('/old/a.mkv',1,1.0,'已上传',1,1)")
+        conn.commit()
+        conn.close()
+        st_old = store_store.Store(db)
+        cols = {r["name"] for r in st_old.db.execute("PRAGMA table_info(files)").fetchall()}
+        assert "source_deleted" in cols, f"老库没补上该列：{sorted(cols)}"
+        assert int(st_old.get("/old/a.mkv").get("source_deleted") or 0) == 0, \
+            "旧记录必须默认 0（否则老库里的旧版会被误保护、洗板漏清）"
+    finally:
+        shutil.rmtree(tmp0, ignore_errors=True)
+
+    # ---- B) delete_after_upload 开着：同集两版本不互删 ----
+    cfg, store, mgr, _up0, tmp, src = make_env(mode="rapid_only", fail_first=0)
+    try:
+        cloud_dir = "/TVs/Drama"
+        cfg["paths"]["map"] = [{"from": "TVs", "to": "/TVs"}]
+        cfg["upload"]["cleanup_previous_versions"] = True
+        cfg["upload"]["cleanup_max_delete"] = 9
+        cfg["upload"]["delete_after_upload"] = True          # ← 关键：程序会删本地源文件
+        up = Uploader(cfg, store, mgr)
+        await mgr.ensure_pid(cloud_dir)
+
+        gone: list[str] = []
+
+        async def fake_delete(fid):
+            gone.append(str(fid))
+            return True
+
+        mgr.delete_file = fake_delete
+        # 两个版本大小刻意不同（相同会被 keep_size 那道挡住，测不出这个洞）
+        p1 = write_file(src, f"TVs/Drama/{dv}", 3 * 1024 * 1024)
+        p2 = write_file(src, f"TVs/Drama/{nov}", 5 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+
+        rec1 = await drive(up, store, p1)
+        assert rec1["status"] == "已上传", rec1["status"]
+        assert not os.path.exists(p1), "delete_after_upload 应删掉本地源文件"
+        assert int(store.get(p1).get("source_deleted") or 0) == 1, \
+            "删除本地源文件后必须落 source_deleted=1（否则判据分不开洗板与收尾删除）"
+
+        # 关键：另一版本的本地文件已不在，但它仍是正当版本 → 必须被保护
+        _fids, names = up._same_episode_keeps(cloud_dir, p2)
+        assert dv in names, f"被程序收尾删掉的正当版本没被保护（互删会重现）：{names}"
+
+        gone.clear()
+        rec2 = await drive(up, store, p2)
+        assert rec2["status"] == "已上传", rec2["status"]
+        assert gone == [], f"同集两版本都正当，谁都不该被删：{gone}"
+
+        # ---- C) 洗板场景：本地文件不在、且不是本程序删的 → 仍要清 ----
+        # 把 p1（dv 那条）降回「非程序删」—— 此时它本地文件已不在、source_deleted=0，
+        # 正是洗板把旧版换掉后的等价态。
+        store.set(p1, source_deleted=0)
+        assert not os.path.exists(p1), "构造前提：本地文件必须不在（模拟洗板换掉）"
+        assert int(store.get(p1).get("source_deleted") or 0) == 0
+        _fids2, names2 = up._same_episode_keeps(cloud_dir, p2)
+        assert dv not in names2, f"洗板场景仍保护旧版（会漏清）：{names2}"
+
+        # ---- D) 洗板重下：scanner 整条替换 → 事实作废 ----
+        p1b = write_file(src, f"TVs/Drama/{dv}", 9 * 1024 * 1024)   # 新内容、同路径
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        rec = store.get(p1b)
+        assert int(rec.get("source_deleted") or 0) == 0, \
+            f"洗板重下后旧事实必须作废：{rec.get('source_deleted')}"
+        assert rec["status"] == "待处理", rec["status"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[38] delete_after_upload 开着时同集两版本不互删：source_deleted 落库；"
+                "被程序收尾删掉的正当版本仍受保护、delete 目标为空；"
+                "洗板场景（本地被换掉且非程序删）不再保护、照旧清理；"
+                "洗板重下经 scanner 整条替换使事实作废；老库自动补列且默认 0")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2696,6 +2807,7 @@ async def main():
     case_cloud_path_dotdot_guard()
     await case_dir_paging_cursor()
     await case_same_episode_no_mutual_delete()
+    await case_delete_after_upload_no_mutual_delete()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

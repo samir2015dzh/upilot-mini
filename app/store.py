@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS files(
   progress REAL DEFAULT 0, speed REAL DEFAULT 0,
   message TEXT,
   upload_mode TEXT,
+  source_deleted INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_status ON files(status, next_retry_at);

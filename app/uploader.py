@@ -166,6 +166,8 @@ class Uploader:
             st = os.stat(path)
             self.store.set(path, status="待处理", size=st.st_size, mtime=st.st_mtime,
                            sha1=None, stable_count=0, file_id=None, progress=0.0,
+                           # 事实作废：文件是被换掉的，不是本程序收尾删的
+                           source_deleted=0,
                            message="上传期间文件被替换（洗板重下），已按新内容重新入队")
             logger.info("上传期间文件被替换，已重新入队：%s", os.path.basename(path))
         except OSError:
@@ -228,8 +230,12 @@ class Uploader:
                 return
             os.remove(real)
             logger.info("已删除本地源文件：%s", path)
+            # 落一条「本地文件是本程序上传成功后删的」的持久事实（一次 set 同时更新 message）。
+            # 洗板清理要靠它区分「正当版本的本地文件被收尾删掉」与「旧版本地被换掉」——
+            # 只看 os.path.exists() 分不开这两者，会导致互删（见 _same_episode_keeps）。
             cur = self.store.get(path) or {}
-            self.store.set(path, message=(cur.get("message") or "") + "｜已删除本地源文件")
+            self.store.set(path, source_deleted=1,
+                           message=(cur.get("message") or "") + "｜已删除本地源文件")
         except Exception as exc:  # noqa: BLE001
             logger.warning("删除本地源文件失败（不影响上传）：%s：%s", path, exc)
 
@@ -240,9 +246,16 @@ class Uploader:
         就把它当旧版删掉，B 的清理又把 A 删掉 ⇒ **云端同集一个不剩**，而本地两条都是
         「已上传」终态、symedia 的 strm 指向不存在的文件。本地已复现（串行与并发都会中）。
 
-        判据是「本地文件是否还在」：
-          - 洗板场景：旧版的本地文件已被换掉/删除 ⇒ 不保护 ⇒ 照旧被清理（行为不变）；
-          - 同集两个都还在本地 ⇒ 都是正当新版本 ⇒ 都保护。
+        判据是「这个版本还是不是正当的新版本」：
+          - 本地文件还在 ⇒ 正当新版本 ⇒ 保护；
+          - 本地文件已被**本程序**在上传成功后收尾删掉（`source_deleted=1`）⇒ 同样是正当版本 ⇒ 保护；
+          - 本地文件不在、且不是本程序删的 ⇒ 旧版本地被换掉了 ⇒ **不保护** ⇒ 照旧清理。
+
+        为什么必须加 `source_deleted` 这一条：只看 `os.path.exists()` 分不开
+        「洗板把旧版换掉了」与「`upload.delete_after_upload` 开关把刚传完的版本收尾删了」。
+        后者开着时，先传完的那条本地文件是程序自己删的，后传那条就把它当旧版删掉 ——
+        **互删重现**（本地已复现：A 传完本地消失 → B 视角保护集合空 → B 的清理删 A；
+        同对照把开关关掉则 delete 目标为空）。
         """
         key = episode_key(os.path.basename(local_path))
         if key is None:
@@ -263,8 +276,8 @@ class Uploader:
             base = os.path.basename(path)
             if episode_key(base) != key:
                 continue
-            if not os.path.exists(path):
-                continue                    # 本地已不在（旧版被换掉了）→ 不保护
+            if not os.path.exists(path) and not int(rec.get("source_deleted") or 0):
+                continue                    # 旧版本地被换掉了（不是程序收尾删的）→ 不保护
             names.append(base)
             fid = str(rec.get("file_id") or "").strip()
             if fid and fid not in ("0", "None"):
