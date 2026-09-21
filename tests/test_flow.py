@@ -1971,6 +1971,174 @@ async def case_ui_actions_wake_loop():
                 "停止信号立即结束；路由里裸写 scan_now 已被锁死")
 
 
+async def case_request_body_hardening():
+    """[32][33] HTTP 请求体与连接收尾的两处硬化。
+
+    [32] `_body_fields()` 原来直接 `self.rfile.read(Content-Length)`：
+         length 由客户端**自己声明**、且 Handler 没设 `timeout`。实测「声明 100MB、
+         只发 3 字节」的连接会把线程永久卡在 read 上 —— 20 条连接就让线程净增 20
+         （ThreadingHTTPServer 每请求一线程、线程数无上限）。而 `POST /login` 在
+         **校验凭据之前**就读 body ⇒ 未鉴权即可触发。
+    [33] `_send()` 只 catch `BrokenPipeError`/`ConnectionResetError`，而客户端早断在
+         Windows 上抛 `ConnectionAbortedError(WinError 10053)` ⇒ 每条早断连接都在
+         日志里刷一段 traceback，把真正的错误淹掉。
+    """
+    import socket as _socket
+    import threading as _th
+
+    src_txt = open(os.path.join(APP, "webui.py"), encoding="utf-8").read()
+    # 静态口径：上限存在且合理、Handler 有 timeout、断开异常在捕获元组里
+    assert 0 < webui.MAX_BODY_BYTES <= 64 * 1024 * 1024, \
+        f"MAX_BODY_BYTES 不合理：{webui.MAX_BODY_BYTES}"
+    assert webui.HANDLER_TIMEOUT and webui.HANDLER_TIMEOUT > 0, "HANDLER_TIMEOUT 未设置"
+    assert "timeout = HANDLER_TIMEOUT" in src_txt, "Handler 没设 timeout（半开会永久占线程）"
+    assert "ConnectionAbortedError" in src_txt, "断开异常没被捕获（会刷 traceback）"
+    assert "rfile.read(length) if length > 0" not in src_txt, "裸读 body 的写法又回来了"
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+    saved_failures = None
+    try:
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "mode": "form",
+                                "username": "admin", "password": "s3cret-token",
+                                "session_hours": 72}}
+        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
+        port = srv.server_address[1]
+
+        def conn(t=5.0):
+            return _socket.create_connection(("127.0.0.1", port), timeout=t)
+
+        def reset_limits():
+            """本用例会连打多次失败登录，清掉限速计数以免干扰其它断言。"""
+            nonlocal saved_failures
+            with webui._FAIL_LOCK:
+                if saved_failures is None:
+                    saved_failures = dict(webui._FAILURES)
+                webui._FAILURES.clear()
+
+        def health_ok() -> bool:
+            try:
+                s = conn()
+                s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                d = s.recv(100)
+                s.close()
+                return d.startswith(b"HTTP/1.0 200")
+            except OSError:
+                return False
+
+        # ---- [32]-1 超限请求体必须**立刻**被拒，而不是阻塞在 read 上 ----
+        reset_limits()
+        s = conn()
+        s.sendall(b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 104857600\r\n"
+                  b"Content-Type: application/x-www-form-urlencoded\r\n\r\nabc")
+        s.settimeout(6.0)
+        t0 = time.monotonic()
+        head = ""
+        try:
+            head = s.recv(200).split(b"\r\n")[0].decode("latin1")
+        except _socket.timeout:
+            pass
+        spent = time.monotonic() - t0
+        s.close()
+        assert head, "超限请求体没被拒绝：服务端仍阻塞在 read"
+        assert spent < 3.0, f"超限请求耗时 {spent:.2f}s，仍在阻塞"
+
+        # ---- [32]-2 一批超限半开连接不得把线程堆起来 ----
+        reset_limits()
+        base_threads = _th.active_count()
+        socks = []
+        for _ in range(20):
+            try:
+                x = conn()
+                x.sendall(b"POST /login HTTP/1.1\r\nHost: x\r\n"
+                          b"Content-Length: 104857600\r\n\r\n")
+                socks.append(x)
+            except OSError:
+                break
+        time.sleep(1.5)
+        grew = _th.active_count() - base_threads
+        alive = len(socks)
+        for x in socks:
+            try:
+                x.close()
+            except OSError:
+                pass
+        assert alive >= 10, f"只开成 {alive} 条连接，样本太少"
+        assert grew < alive // 2, \
+            f"{alive} 条超限半开连接让线程净增 {grew}（修复前约等于连接数）"
+        assert health_ok(), "半开连接期间 /health 应仍可用"
+
+        # ---- [32]-3 回归红线：正常表单登录必须照旧 302 + 下发会话 ----
+        reset_limits()
+        body = urllib.parse.urlencode({"username": "admin",
+                                       "password": "s3cret-token", "next": "/"}).encode()
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/login", data=body,
+                                     headers={"Content-Type":
+                                              "application/x-www-form-urlencoded"})
+        try:
+            r = opener.open(req, timeout=8)
+            code, jar = r.status, r.headers.get("Set-Cookie", "")
+        except urllib.error.HTTPError as exc:
+            code, jar = exc.code, exc.headers.get("Set-Cookie", "")
+        assert code == 302 and jar.startswith("upilot_session="), \
+            f"正常登录被请求体上限挡住了：{code} {jar[:40]}"
+
+        # ---- [32]-4 边界：恰好等于上限不得被误拒（别 off-by-one 挡正常表单）----
+        reset_limits()
+        pad = "a=" + "x" * (webui.MAX_BODY_BYTES - 2)
+        s2 = conn(8.0)
+        s2.settimeout(8.0)
+        s2.sendall(("POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n"
+                    "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                    % len(pad)).encode() + pad.encode())
+        head2 = ""
+        try:
+            head2 = s2.recv(200).split(b"\r\n")[0].decode("latin1")
+        except _socket.timeout:
+            pass
+        s2.close()
+        assert head2, "恰好等于上限的请求体被误拒"
+
+        # ---- [33] 早断连接不得把服务搞坏（修复前每条都刷 traceback）----
+        reset_limits()
+        for _ in range(10):
+            try:
+                x = conn()
+                x.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                x.close()                       # 立刻断开，不等响应
+            except OSError:
+                pass
+        time.sleep(0.8)
+        assert health_ok(), "早断连接后服务应仍健康"
+
+        # ---- 收尾：其它正常接口不受影响 ----
+        reset_limits()
+        assert http_get(f"http://127.0.0.1:{port}/health")[0] == 200
+        assert http_get(f"http://127.0.0.1:{port}/api/status",
+                        "admin", "s3cret-token")[0] == 200
+
+        PASS.append(
+            f"[32][33] 请求体与连接收尾硬化：超限（声明 100MB 只发 3 字节）立刻被拒、"
+            f"20 条超限半开连接线程只净增 {grew}（修复前≈连接数，全卡在 read）、"
+            f"正常表单登录照旧 302+会话、恰好等于上限（{webui.MAX_BODY_BYTES}B）不误拒、"
+            f"早断连接不刷 traceback 且服务仍健康")
+    finally:
+        if saved_failures is not None:
+            with webui._FAIL_LOCK:
+                webui._FAILURES.clear()
+                webui._FAILURES.update(saved_failures)
+        if srv is not None:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2002,6 +2170,7 @@ async def main():
     await case_login_limiter_source()
     await case_empty_username_session()
     case_a2a_token_resolution()
+    await case_request_body_hardening()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

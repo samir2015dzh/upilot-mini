@@ -46,6 +46,17 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 LOG_BUFFER: deque = deque(maxlen=400)
 _buffer_attached = False
 
+# 请求体硬上限。配置表单最大也就几十 KB，给到 4MB 绰绰有余。
+# 没有上限时 `_body_fields()` 会按客户端**自己声明**的 Content-Length 去 read()：
+# 实测声明 100MB、只发 3 字节，31 个连接就能让 31 个线程全部阻塞在 read 上
+# （ThreadingHTTPServer 每请求一线程、线程数无上限），每个还预备那么大的缓冲。
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
+# 单条连接的空闲/读超时（秒）。BaseHTTPRequestHandler 默认 timeout=None：
+# 半开连接（发了请求头就不发 body）会**永久**占着一个线程。
+# 注意 `/login` 在**校验任何凭据之前**就会读 body，所以未鉴权也能触发这条路径。
+HANDLER_TIMEOUT = 30.0
+
 
 class _BufferHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
@@ -307,20 +318,26 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "upilot-mini"
+        # 半开连接不会永久占着线程（见 HANDLER_TIMEOUT 的说明）
+        timeout = HANDLER_TIMEOUT
 
         # ---- 工具 ----
         def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> bool:
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            for k, v in (extra or {}).items():
-                self.send_header(k, v)
-            self.end_headers()
             try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                # 客户端半路断开 / 读超时都属正常（浏览器刷新、健康检查掐连接、
+                # curl -m 超时退出）。原来只 catch 前两个，而 Windows 上断开抛的是
+                # ConnectionAbortedError(WinError 10053) —— 实测 30 个早断连接就刷了
+                # 30 段 traceback 到日志里，把真正的错误淹掉。
+                logger.debug("应答中断（%s）：%s", type(exc).__name__, exc)
             return False
 
         def _json(self, obj, code: int = 200, extra: dict | None = None) -> bool:
@@ -451,12 +468,40 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             self._send(404, b"not found", "text/plain")
 
         def _body_fields(self) -> dict:
-            """解析表单或 JSON 请求体，返回字段字典。"""
+            """解析表单或 JSON 请求体，返回字段字典。
+
+            两道保护（原来是裸 `self.rfile.read(Content-Length)`）：
+            1) **长度上限** MAX_BODY_BYTES —— length 是客户端自己声明的，不设上限时
+               声明 100MB 就能让服务端照单预备缓冲；实测 31 个「声明 100MB 只发 3 字节」
+               的连接把 31 个线程全卡在 read 上（每请求一线程、线程数无上限）。
+            2) **读不完整要兜住** —— 半开连接会在这里读到 socket 超时（Handler.timeout）；
+               原来没 catch，异常直接冒到 socketserver 的线程里刷 traceback。
+            另外 `POST /login` 在**校验凭据之前**就调本函数，所以这条路必须自己扛住。
+            """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
+            if length <= 0:
+                return {}
+            if length > MAX_BODY_BYTES:
+                # 不读、也不预分配：直接断开这条连接（HTTP/1.0 单请求，不会错位后续）
+                logger.warning("请求体 %d 字节超过上限 %d，已拒绝：%s",
+                               length, MAX_BODY_BYTES, self.command)
+                self.close_connection = True
+                return {}
+            try:
+                raw = self.rfile.read(length)
+            except (TimeoutError, OSError) as exc:
+                # 半开连接 / 客户端中途断开
+                logger.debug("读取请求体失败（%s）：%s", type(exc).__name__, exc)
+                self.close_connection = True
+                return {}
+            if len(raw) < length:
+                # 提前断开导致只读到一半：宁可当空处理，也别拿半截内容去解析
+                logger.debug("请求体只读到 %d/%d 字节，按空处理", len(raw), length)
+                self.close_connection = True
+                return {}
             text = raw.decode("utf-8", "replace")
             if "application/json" in (self.headers.get("Content-Type") or ""):
                 try:
