@@ -1553,6 +1553,128 @@ async def case_scan_now_wakes_loop():
         f"无指令时不空转；停止信号立即结束；「先 pop 后 get」的不可达写法已锁死")
 
 
+async def case_ui_actions_wake_loop():
+    """[28] 所有界面动作都必须叫醒主循环（否则提示「已…」实际要等满 interval）。
+
+    第 22 处修好 `scan_now` 之后，同类问题还有一批：`/api/requeue`、`/api/resume`、
+    `/api/task upload-now`、`/api/config` 保存 —— 提示语分别写着「N 个失败项已重新入队」
+    「已恢复调度」「已跳过等待，立即处理」，但它们只改 store / `paused` / `process_one`，
+    这些标志**唤不醒**主循环里的 `await stop.wait()`。面板把 `scan.interval_seconds`
+    上限开放到 86400 秒（24 小时），调大后这几个按钮等于没点。
+
+    本用例做三重防守：① 静态上不许再有绕过 `_wake` 的裸写；② 运行时逐动作验证
+    长间隔下都能立刻唤醒；③ 消费后不许空转（不然每 0.5 秒白扫一轮）。
+    """
+    import main as mainmod
+
+    src = open(os.path.join(APP, "webui.py"), encoding="utf-8").read()
+
+    # ---- ① 静态：路由里不许裸写 scan_now；_wake 必须覆盖所有改状态的动作 ----
+    wake_def_start = src.index("def _wake(state: dict) -> None:")
+    wake_def_end = src.index("# ---------- 配置读取 ----------", wake_def_start)
+    outside = src[:wake_def_start] + src[wake_def_end:]
+    assert 'state["scan_now"] = True' not in outside, \
+        "有界面动作绕过了 _wake()，直接裸写 scan_now"
+    n_wake = src.count("_wake(state)")
+    assert n_wake >= 8, f"_wake(state) 调用点只有 {n_wake} 个，界面动作有遗漏"
+
+    # 每个「改状态后需要主循环立刻反应」的路由段里都必须出现 _wake。
+    # 注意两件事：① 窗口要取到下一个路由为止 —— 取太短会漏掉注释之后那一行；
+    # ② `/api/config` 在文件里有 GET/POST 两份，POST 那份（真正保存的那个）在后面，
+    #    所以要 last=True 定位，否则抓到 GET 段必然误报。
+    def seg_after(marker: str, end_markers: tuple[str, ...], last: bool = False) -> str:
+        idx = src.rindex(marker) if last else src.index(marker)
+        rest = src[idx + len(marker):]
+        cut = len(rest)
+        for em in end_markers:
+            if em in rest:
+                cut = min(cut, rest.index(em))
+        return rest[:cut]
+
+    checks = {
+        'if path == "/api/requeue":': ('if path in ("/api/pause"',),
+        'if path == "/api/retry-now":': ('if path == "/api/requeue":',),
+        'if path == "/api/scan":': ('if path == "/api/retry-now":',),
+        'elif action == "upload-now":': ('elif action == "delete":',),
+        'if action == "retry":': ('elif action == "retry-now":',),
+        'elif action == "retry-now":': ('elif action == "upload-now":',),
+        'if path in ("/api/pause", "/api/resume"):': ('if path == "/logout":',),
+    }
+    for marker, ends in checks.items():
+        body = seg_after(marker, ends)
+        assert "_wake(state)" in body, f"{marker} 分支没有叫醒主循环"
+
+    # 保存配置：任何改动（哪怕只是把 interval 调小）都要立刻叫醒。
+    # 注意用 last=True —— /api/config 有 GET（表单结构）和 POST（保存）两份，
+    # 只有 POST 那份才需要 _wake。
+    cfg_body = seg_after('if path == "/api/config":', ('if path == "/api/task":',), last=True)
+    assert "_wake(state)" in cfg_body, "保存配置后没有叫醒主循环"
+
+    # ---- ② 运行时：interval=3600 下逐个动作都必须立刻唤醒 ----
+    async def wakes_within(mutate, interval: float = 3600.0, hard: float = 2.0):
+        stop, state = asyncio.Event(), {"paused": True}
+
+        async def click():
+            await asyncio.sleep(0.2)
+            mutate(state)
+
+        t0 = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(mainmod._wait_next_round(stop, state, interval), click()),
+                timeout=hard)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def wake(s: dict):
+        s["wake_seq"] = int(s.get("wake_seq") or 0) + 1
+        s["scan_now"] = True
+
+    scenarios = {
+        "requeue（重试失败项）": wake,
+        "resume（恢复调度）": lambda s: (s.update(paused=False), wake(s)),
+        "upload-now（立即处理）": lambda s: (s.update(process_one="x"), wake(s)),
+        "scan（立即扫描）": wake,
+        "保存配置（含调小间隔）": lambda s: (s.update(reload=True), wake(s)),
+    }
+    for name, mut in scenarios.items():
+        ok = await wakes_within(mut)
+        assert ok, f"{name} 唤不醒主循环（interval=3600 时要等满）"
+
+    # ---- ③ 回归守卫：无指令不空转；消费后不空转；停止信号立即返回 ----
+    stop = asyncio.Event()
+    t0 = time.monotonic()
+    await mainmod._wait_next_round(stop, {}, 1.5)
+    assert time.monotonic() - t0 >= 1.2, "无指令却提前返回（会变成 0.5 秒空转一轮）"
+
+    stop2 = asyncio.Event()
+    stop2.set()
+    t0 = time.monotonic()
+    await mainmod._wait_next_round(stop2, {}, 60)
+    assert time.monotonic() - t0 < 0.3, "停止信号没能立刻结束等待"
+
+    stop3, state3 = asyncio.Event(), {}
+
+    async def click3():
+        await asyncio.sleep(0.2)
+        wake(state3)
+
+    await asyncio.gather(mainmod._wait_next_round(stop3, state3, 30), click3())
+    state3.pop("scan_now", False)          # 主循环消费掉指令
+    try:
+        await asyncio.wait_for(mainmod._wait_next_round(stop3, state3, 5), timeout=1.0)
+        raised = False
+    except asyncio.TimeoutError:
+        raised = True
+    assert raised, "指令消费后仍在空转（wake_seq 没被正确当作「一次性」信号）"
+
+    PASS.append(f"[28] 界面动作统一叫醒主循环：{n_wake} 个 _wake 调用点、"
+                "requeue/resume/upload-now/scan/保存配置 在 interval=3600s 时全部立即唤醒"
+                "（修复前要等满整个间隔，上限 24 小时）；无指令不空转、消费后不空转、"
+                "停止信号立即结束；路由里裸写 scan_now 已被锁死")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1580,6 +1702,7 @@ async def main():
     await case_config_save_concurrent()
     await case_save_cookie_atomic()
     await case_scan_now_wakes_loop()
+    await case_ui_actions_wake_loop()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

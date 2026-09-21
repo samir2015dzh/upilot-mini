@@ -55,11 +55,20 @@ _WAKE_POLL = 0.5
 
 
 async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) -> None:
-    """等到下一轮扫描；期间界面下了指令（scan_now / reload）就立即返回。"""
+    """等到下一轮扫描；期间界面下了指令就立即返回。
+
+    认两个口径：
+      1) `scan_now` / `reload` —— 历史标志，向后兼容；
+      2) `wake_seq` 变化 —— webui._wake() 每次界面动作都会 +1。
+    第 2 条是根本修法：以后新增界面动作只要调 _wake，就不必再来这里补标志名。
+    """
     deadline = time.monotonic() + max(0.0, float(interval))
+    seen_seq = state.get("wake_seq")
     while not stop.is_set():
         if state.get("scan_now") or state.get("reload"):
             return                       # 界面刚下的指令，别等满整个间隔
+        if state.get("wake_seq") != seen_seq:
+            return                       # 界面动作叫醒（见 webui._wake）
         remain = deadline - time.monotonic()
         if remain <= 0:
             return

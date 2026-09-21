@@ -77,6 +77,26 @@ _FAILURES: dict[str, list] = {}
 _FAIL_LOCK = threading.Lock()
 
 
+def _wake(state: dict) -> None:
+    """叫醒主循环：让它立刻结束本轮等待，马上重读 state 并执行刚下的指令。
+
+    为什么必须显式叫醒：主循环在等下一轮时是 `stop.wait()` 的分片轮询，它只认
+    `scan_now` / `reload` 两个标志。而好几个界面动作只改 store、或只改 `paused`
+    / `process_one`：
+        /api/requeue  → 提示「N 个失败项已重新入队」
+        /api/resume   → 提示「已恢复调度」
+        /api/task upload-now → 提示「已跳过等待，立即处理」
+    这些提示都写着“已…/立即”，但主循环要睡满一整个 interval 才会轮到它们。
+    面板把 `scan.interval_seconds` 上限开放到 86400 秒（24 小时），用户按 hint
+    调大之后，这几个按钮等于没点。判据：界面说生效、实际没生效。
+
+    `wake_seq` 是给等待器用的单调计数：以后新增界面动作只要调本函数，就不必
+    再去等值器的白名单里补标志名（第 22、23 处就是这么漏掉的）。
+    """
+    state["wake_seq"] = int(state.get("wake_seq") or 0) + 1
+    state["scan_now"] = True
+
+
 # ---------- 配置读取 ----------
 def auth_cfg(cfg: dict) -> dict:
     return (cfg.get("http") or {}).get("auth") or {}
@@ -490,7 +510,9 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 cfgmod.save(cfg)
                 if result["reload"]:
                     state["reload"] = True
-                    state["scan_now"] = True
+                # 保存后立刻叫醒主循环：一是 reload 项要尽快重建 115 客户端，
+                # 二是 scan.interval_seconds 变小之后，等待期还在按旧的长间隔睡。
+                _wake(state)
                 logger.info("界面保存配置：%s", ", ".join(result["changed"]) or "无变化")
                 tips = []
                 if result["reload"]:
@@ -508,12 +530,12 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     return self._json({"ok": False, "error": "没找到这个文件记录"}, 404)
                 if action == "retry":
                     n = store.reset_one(target)
-                    state["scan_now"] = True
+                    _wake(state)
                     msg = "已重新排队，马上再试"
                 elif action == "retry-now":
                     store.set(target, next_retry_at=0)
                     n, msg = 1, "已提前到期，马上重试秒传"
-                    state["scan_now"] = True
+                    _wake(state)
                 elif action == "upload-now":
                     if (cfg["upload"].get("mode") or "") == "rapid_only":
                         store.set(target, next_retry_at=0)
@@ -522,6 +544,9 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                         n = store.mark_ready(target)
                         msg = "已跳过等待，立即处理"
                     state["process_one"] = target
+                    # 光置 process_one 唤不醒主循环（它只认 scan_now/reload/wake_seq），
+                    # 而提示写着「立即处理」—— 必须显式叫醒。
+                    _wake(state)
                 elif action == "delete":
                     n = store.forget(target)
                     msg = "记录已删除（文件本体没动，下次扫描会重新入队）"
@@ -530,19 +555,26 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 logger.info("界面操作 %s → %s", action, target)
                 return self._json({"ok": True, "affected": n, "message": msg})
             if path == "/api/scan":
-                state["scan_now"] = True
+                _wake(state)
                 return self._json({"ok": True, "action": "scan", "message": "已触发扫描"})
             if path == "/api/retry-now":
                 n = store.retry_now()
-                state["scan_now"] = True
+                _wake(state)
                 return self._json({"ok": True, "action": "retry-now", "affected": n,
                                    "message": f"{n} 个待重试文件已提前到期"})
             if path == "/api/requeue":
                 n = store.requeue()
+                # 只改 store 不动 state：主循环要睡满整个 interval 才会重新派发，
+                # 而面板把 scan.interval_seconds 上限开放到 86400 秒（24 小时），
+                # 提示却写着「已重新入队」。
+                _wake(state)
                 return self._json({"ok": True, "action": "requeue", "affected": n,
                                    "message": f"{n} 个失败项已重新入队"})
             if path in ("/api/pause", "/api/resume"):
                 state["paused"] = path.endswith("pause")
+                # 恢复调度要立刻生效：主循环只在轮次开头读 paused，
+                # 不叫醒的话「已恢复调度」要等满一个间隔才真的恢复。
+                _wake(state)
                 return self._json({
                     "ok": True, "action": path.rsplit("/", 1)[-1], "paused": state["paused"],
                     "message": "已暂停调度（在途任务继续跑完）" if state["paused"] else "已恢复调度",
