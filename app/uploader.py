@@ -419,13 +419,32 @@ class Uploader:
             except Exception as exc:
                 logger.warning("同集巡检：列云端目录 %s 失败：%s", cid, exc)
                 return None                                # 失败 ≠ 空目录
-            data = (resp or {}).get("data")
+            d = resp if isinstance(resp, dict) else {}
+            # ★ 115 的业务错误是 **HTTP 200 + `state: false`（带 `errno`/`error`）**，
+            # 不抛异常。不判这一层，就会把「被拒绝」当成「目录是空的」——
+            # 实测五种形状（`state:false`、`errno` 风控、只有 `error`、空响应体、
+            # `state:false` 且带 `data:[]`）**全部**落进「空目录」分支：
+            # 巡检于是报「扫了 N 个目录、清掉 0 个」，**一行日志都没有** ——
+            # 限流/风控/登录失效全都表现成「一切正常」（与第 44 处同一个病根：
+            # 失败 ≠ 空目录，那次只堵住了「抛异常」这条路，业务错误这条路漏了）。
+            if d.get("state") is False or (
+                    d.get("error") and "data" not in d and "list" not in d):
+                logger.warning(
+                    "同集巡检：列云端目录 %s 被拒绝（state=%s errno=%s）：%s",
+                    cid, d.get("state"), d.get("errno"), d.get("error"))
+                return None                                # 业务错误 ≠ 空目录
+            data = d.get("data")
             if isinstance(data, dict):
                 rows = data.get("list") or []
             elif isinstance(data, list):
                 rows = data
+            elif "list" in d:
+                rows = d.get("list") or []
+            elif data is None and not d:
+                logger.warning("同集巡检：列云端目录 %s 返回空响应体", cid)
+                return None                                # 空响应体 ≠ 空目录
             else:
-                rows = (resp or {}).get("list") or []
+                rows = []
             rows = [r for r in rows if isinstance(r, dict)]
             if not rows:
                 break

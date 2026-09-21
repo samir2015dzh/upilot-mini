@@ -3306,6 +3306,126 @@ async def case_cloud_only_episode_cleanup():
                 "巡检列目录走 mgr.client（真机踩过 self.client 不存在 → 静默恒 0）")
 
 
+async def case_sweep_business_error_visible():
+    """[46~47] 巡检把 115 业务拒绝当「空目录」吞掉；is_transient 死代码（真机+拆包取证）。
+
+    起因：用户问「你这个巡检不会触发115的风控吧」。答案本身是「不会」（36 次/小时、
+    只读元数据、同一会话、开关关着零请求），但顺着验证挖出两处真 bug：
+
+    [46] 115 的业务拒绝是 **HTTP 200 + `state:false`（带 errno/error），不抛异常**。
+    第 44 处只把「抛异常」这条路和空目录分开 —— 业务拒绝这条路全部落进「空目录」分支：
+    真被限流/风控/登录失效时，巡检照报「扫了 N 个、清了 0 个」，**一行日志都没有**
+    —— 假装一切正常比崩溃更糟，用户永远查不到原因。
+
+    [47] `is_transient()` **从未生效过**。证据 = `pip download --python-version 312
+    --no-deps` 拉 p115client 0.0.9.6.5.1 wheel 拆全源码：`HTTPError`/`urllib.error`/
+    `requests.` 命中数**全为 0**；传输层 `from urllib3_future_request import request`；
+    业务错误由 `check_response()` 转成 `P115OSError(P115Error, OSError)` 抛出，
+    errno 语义（其源码映射）：EAGAIN=操作过于频繁、EBUSY=忙（115 的复制/移动/删除/
+    还原同时只允许一个）、EAUTH=登录失效。⇒ 原判据只认 `urllib.error.HTTPError`
+    （p115.py:86-87）恒 False；且旧 `TRANSIENT_HTTP_CODES` 含 **401/403**
+    —— 认证失败被拒后原地自动重试，方向恰好反了，正是风控最忌讳的行为。
+    """
+    import errno as _errno
+    import io
+
+    # ---- A) _cloud_page：业务拒绝必须 → None（失败）；真空目录仍 → []（可继续）----
+    BAD = [
+        ("state=False", {"state": False, "error": "操作过于频繁"}),
+        ("风控 errno", {"state": False, "errno": 990009, "error": "触发风控"}),
+        ("只有 error", {"error": "登录失效"}),
+        ("空响应体", {}),
+        ("state=False+data", {"state": False, "error": "x", "data": []}),
+    ]
+    OK_EMPTY = [
+        ("正常空目录", {"state": True, "data": {"list": [], "count": 0}}),
+        ("data=[] 空", {"state": True, "data": []}),
+        ("state 真但 data 里没有 list", {"state": True, "data": {"count": 0}}),
+    ]
+    OK_ROWS = [
+        ("dict+list", {"state": True, "data": {"list": [{"fid": 1, "n": "a.mkv"}]}}),
+        ("data 直接是 list", {"state": True, "data": [{"fid": 1, "n": "a.mkv"}]}),
+        ("顶层 list", {"state": True, "list": [{"fid": 1, "n": "a.mkv"}]}),
+    ]
+
+    class _C:
+        def __init__(self, resp):
+            self.resp = resp
+
+        async def fs_files(self, payload, async_=True):
+            return self.resp
+
+    class _Mgr:
+        def __init__(self, resp):
+            self.client = _C(resp)
+
+        async def cached_pid(self, td):
+            return 7999
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-46-")
+    try:
+        cfg = copy.deepcopy(cfgmod.DEFAULTS)
+        cfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        cfg["upload"]["cleanup_previous_versions"] = True
+        st = Store(cfg["state"]["db"])
+
+        for label, resp in BAD:
+            got = await Uploader(cfg, st, _Mgr(resp))._cloud_page(7999)
+            assert got is None, f"{label}：业务拒绝必须判「失败」(None)，实际 {got!r}"
+        for label, resp in OK_EMPTY:
+            got = await Uploader(cfg, st, _Mgr(resp))._cloud_page(7999)
+            assert got == [], f"{label}：真空目录必须是 []，实际 {got!r}"
+        for label, resp in OK_ROWS:
+            got = await Uploader(cfg, st, _Mgr(resp))._cloud_page(7999)
+            assert got is not None and len(got) == 1, f"{label}：应拿到 1 条，实际 {got!r}"
+
+        # ---- B) 巡检端到端：被拒目录既不能删、也不能算进「已扫」（计数会骗人）----
+        p = os.path.join(tmp, "x.mkv")
+        st.add(p, 1, 1.0)
+        st.set(p, status="已上传", target_dir="/root")
+        up = Uploader(cfg, st, _Mgr({"state": False, "errno": 990009, "error": "触发风控"}))
+        r = await up.sweep_cloud_episode_duplicates()
+        assert r["removed"] == 0, f"被风控时绝不能删任何东西：{r!r}"
+        assert r["dirs"] == 0, f"被拒绝的目录绝不能算「已扫」（第 44 处同款病根）：{r!r}"
+
+        # ---- C) is_transient：按 OSError.errno 判；认证/参数类绝不软重试 ----
+        assert p115.is_transient(OSError(_errno.EAGAIN, "操作过于频繁")) is True
+        assert p115.is_transient(OSError(_errno.EBUSY, "busy")) is True
+        assert p115.is_transient(OSError(_errno.ETIMEDOUT, "timeout")) is True
+        assert p115.is_transient(OSError(_errno.ECONNRESET, "reset")) is True
+        assert p115.is_transient(OSError(_errno.EIO, "io")) is False, "EIO 非「稍后再试」语义"
+        assert p115.is_transient(OSError(_errno.EINVAL, "参数错误")) is False
+        assert p115.is_transient(OSError(_errno.EACCES, "拒绝访问")) is False, \
+            "权限/认证方向绝不软重试（风控最忌讳被拒后原地重试）"
+
+        def _http(code):
+            return urllib.error.HTTPError("http://x", code, "m", {}, io.BytesIO(b""))
+
+        assert p115.is_transient(_http(429)) is True
+        assert p115.is_transient(_http(503)) is True
+        assert p115.is_transient(_http(401)) is False, "401 认证失败：绝不自动重试"
+        assert p115.is_transient(_http(403)) is False
+        assert p115.is_transient(ValueError("无关异常")) is False
+
+        # ---- D) 源码自检（防回归）：业务拒绝的判据必须在 _cloud_page 里 ----
+        src = inspect.getsource(Uploader._cloud_page)
+        assert "被拒绝" in src, "_cloud_page 必须显式判 115 业务拒绝并打日志"
+        assert "return None" in src, "失败必须返回 None（与空目录区分）"
+        assert "state" in src, "必须看 state 字段"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append(
+        "[46] 巡检把 115 业务拒绝（HTTP 200 + state:false，不抛异常）当「空目录」吞掉："
+        "被限流/风控/登录失效时照报「扫了 N 个、清了 0 个」且零日志（比崩溃更糟——"
+        "永远查不到原因）→ 修为 state:false/带 error 无 data → warning（含 errno）"
+        "+ None 不计入已扫；11 种响应形状复测全对；"
+        "[47] is_transient 实测从未生效（p115client wheel 里 HTTPError/urllib.error/"
+        "requests. 命中全 0，走 urllib3_future_request，异常是 P115OSError(OSError)）→ "
+        "改按 OSError.errno 判（EAGAIN/EBUSY/网络抖动软重试，EAUTH/EINVAL/EIO 立即上抛），"
+        "HTTPError 兼容分支剔除 401/403（认证失败绝不自动重试）")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -3348,6 +3468,7 @@ async def main():
     await case_same_episode_time_judgment()
     await case_cloud_only_episode_cleanup()
     await case_cleanup_previous_versions()
+    await case_sweep_business_error_visible()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

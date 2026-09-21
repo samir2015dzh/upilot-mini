@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import errno as _errno
 import json
 import logging
 import os
@@ -19,7 +20,31 @@ import time
 
 logger = logging.getLogger("upilot.p115")
 
-TRANSIENT_HTTP_CODES = (401, 403, 429, 500, 502, 503, 504)
+# 「瞬态错误」判据（第 46~47 处，实测修正）。
+#
+# 证据链 = 拆 `p115client` 0.0.9.6.5.1 wheel 全源码（`pip download --python-version 312
+# --no-deps`）：`HTTPError` / `urllib.error` / `requests.` 命中数**全为 0**。
+# 它实际 `from urllib3_future_request import request`，而 115 的业务错误由
+# `check_response()` 转成 **`P115OSError(P115Error, OSError)`** 抛出 ——
+# 「稍后再试」的语义全落在 `OSError.errno` 上（其源码 errno 映射：
+# EAGAIN=操作过于频繁、EBUSY=忙（115 的复制/移动/删除/还原同时只允许一个）、
+# EAUTH=请重新登录/登录失效）。
+#
+# ⇒ 原先只认 `urllib.error.HTTPError` 的 `is_transient` **从未命中过**（恒 False），
+#   瞬态错误一律顶到任务级重试；且旧 `TRANSIENT_HTTP_CODES` 把 **401/403 也算瞬态**
+#   —— 认证失败被拒后原地自动重试，方向恰好反了，正是风控最忌讳的行为。
+#
+# 认证类（EAUTH）**不在**瞬态集合里：登录失效/凭据错误立即上抛，走任务级错误处理。
+TRANSIENT_ERRNOS = tuple(
+    getattr(_errno, name) for name in (
+        "EAGAIN", "EWOULDBLOCK", "EBUSY", "ETIMEDOUT", "ECONNRESET",
+        "ECONNABORTED", "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "ENETRESET",
+    ) if getattr(_errno, name, None) is not None
+)
+
+# 兼容分支：万一将来传输层真换成 urllib，按 HTTP 状态码判；
+# **401/403 已剔除** —— 认证失败绝不自动重试。
+TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
 
 # 翻目录的硬上限（条目数）。
 # 与「页数上限」不同：页数上限会在「服务端单页很小 + 目录很大」时静默截断
@@ -83,6 +108,17 @@ def upload_mark(result) -> str:
 
 
 def is_transient(exc: Exception) -> bool:
+    """这个异常值不值得「原地等一会儿再试」。
+
+    主判据走 `OSError.errno` —— `p115client` 的异常体系（`P115OSError` 及其子类）
+    继承 `OSError`，errno 就是它给的语义：忙 / 操作过于频繁 / 网络抖动 → 软重试
+    （`_retry_transient` 里 2/4/8s 退避）；EAUTH / EINVAL / EIO 等 → 立即上抛。
+
+    兼容分支保留 `urllib.error.HTTPError`（万一将来换传输层），但其状态码集合里
+    已剔除 401/403。
+    """
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in TRANSIENT_ERRNOS:
+        return True
     from urllib.error import HTTPError
     return isinstance(exc, HTTPError) and exc.code in TRANSIENT_HTTP_CODES
 
