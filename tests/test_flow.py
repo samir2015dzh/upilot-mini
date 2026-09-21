@@ -1463,6 +1463,96 @@ async def case_save_cookie_atomic():
                 "与 save() 并发零异常 + 不残留 .tmp")
 
 
+async def case_scan_now_wakes_loop():
+    """[27] 界面的「立即扫描 / 马上再试」必须**立刻**生效。
+
+    两处叠加的缺陷：
+    1. 逻辑错误：`state.pop("scan_now")` 之后，下面又 `state.get("scan_now")` 决定
+       要不要把等待缩短到 0.5 秒 —— 同一个标志先 pop 后 get，那个分支永远不可达。
+    2. 机制错误：主循环原来 `await asyncio.wait_for(stop.wait(), timeout=interval)`
+       直接睡满 interval；而 scan_now 是 webui 的**请求线程**写的，置进 dict
+       唤不醒主循环里的 await。
+    叠加结果：面板提示「已触发扫描 / 马上再试」，实际要等满一个间隔。而面板把
+    `scan.interval_seconds` 上限开放到 86400 秒（24 小时），调大后点「立即扫描」
+    等于没点。判据：界面说生效、实际没生效 + 代码存在但不可达。
+    """
+    import main as mainmod
+
+    # 静态：不可达写法不许回来；唤醒入口必须存在且被用上。
+    src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+    assert "wait_s = 0.5 if state.get(\"scan_now\")" not in src, \
+        "「先 pop 后 get」的不可达写法又回来了"
+    assert "async def _wait_next_round" in src, "缺少唤醒等待的实现"
+    assert "_wait_next_round(stop, state, interval)" in src, "等待循环没有用它"
+
+    # 行为 1：长间隔期间下指令 → 必须在几百毫秒内返回（不是等满 5 秒）
+    stop = asyncio.Event()
+    state: dict = {}
+    holder: dict = {}
+
+    async def setter():
+        await asyncio.sleep(0.3)
+        state["scan_now"] = True
+
+    t0 = time.monotonic()
+    await asyncio.gather(mainmod._wait_next_round(stop, state, 5), setter())
+    spent = time.monotonic() - t0
+    assert spent < 1.5, f"下了「立即扫描」指令仍等了 {spent:.2f}s（应 <1.5s）"
+    holder["scan_now_wait"] = spent
+
+    # 行为 2：interval 上限那个量级（86400s）下指令同样立刻返回
+    stop2, state2 = asyncio.Event(), {}
+
+    async def setter2():
+        await asyncio.sleep(0.3)
+        state2["scan_now"] = True
+
+    t0 = time.monotonic()
+    await asyncio.gather(mainmod._wait_next_round(stop2, state2, 86400), setter2())
+    spent2 = time.monotonic() - t0
+    assert spent2 < 1.5, f"interval=86400 时下指令仍等了 {spent2:.2f}s"
+
+    # 行为 3：reload（改配置重建 115 客户端）也要能唤醒
+    stop3, state3 = asyncio.Event(), {}
+
+    async def setter3():
+        await asyncio.sleep(0.3)
+        state3["reload"] = True
+
+    t0 = time.monotonic()
+    await asyncio.gather(mainmod._wait_next_round(stop3, state3, 3600), setter3())
+    assert time.monotonic() - t0 < 1.5, "reload 唤不醒等待循环"
+
+    # 行为 4：没指令时不许提前返回（不能变成 0.5 秒空转一轮）
+    stop4, state4 = asyncio.Event(), {}
+    t0 = time.monotonic()
+    await mainmod._wait_next_round(stop4, state4, 1.2)
+    spent4 = time.monotonic() - t0
+    assert spent4 >= 1.0, f"无指令却 {spent4:.2f}s 就返回了（应等满 ~1.2s）"
+
+    # 行为 5：收到停止信号立即返回
+    stop5, state5 = asyncio.Event(), {}
+    stop5.set()
+    t0 = time.monotonic()
+    await mainmod._wait_next_round(stop5, state5, 60)
+    assert time.monotonic() - t0 < 0.3, "停止信号没能立刻结束等待"
+
+    # 行为 6：指令在等待期间置入 → 下一轮 pop 得到 True（与消费点口径一致）
+    stop6, state6 = asyncio.Event(), {}
+
+    async def setter6():
+        await asyncio.sleep(0.2)
+        state6["scan_now"] = True
+
+    await asyncio.gather(mainmod._wait_next_round(stop6, state6, 30), setter6())
+    assert state6.pop("scan_now", False) is True, "唤醒后 pop 不到指令，会白扫一轮"
+
+    PASS.append(
+        f"[27] 「立即扫描」立刻生效：长间隔（5s / 3600s / 面板上限 86400s）下指令 "
+        f"{holder['scan_now_wait']:.2f}s 内唤醒（修复前要睡满整个间隔）；reload 同样能唤醒；"
+        f"无指令时不空转；停止信号立即结束；「先 pop 后 get」的不可达写法已锁死")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1489,6 +1579,7 @@ async def main():
     await case_changed_file_not_lost()
     await case_config_save_concurrent()
     await case_save_cookie_atomic()
+    await case_scan_now_wakes_loop()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

@@ -43,6 +43,32 @@ def start_http(cfg: dict, store, state: dict):
 
 # ---------------- 主循环 ----------------
 
+# 等待下一轮时的轮询粒度（秒）。
+#
+# 为什么要切片：`state["scan_now"]` / `state["reload"]` 是**别的线程**写的
+# （webui 用 ThreadingHTTPServer，每个请求一个线程），置进去**不会**唤醒主循环
+# 里的 `await stop.wait()`。原来直接 await 整个 interval，用户在等待期间点
+# 「立即扫描 / 马上再试」，要等满一整个间隔才动；而面板把
+# `scan.interval_seconds` 上限开放到 86400 秒（24 小时），界面提示却写着「马上」。
+# 切成 0.5 秒一片，每片醒来看一眼有没有指令，开销只是一次 dict.get。
+_WAKE_POLL = 0.5
+
+
+async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) -> None:
+    """等到下一轮扫描；期间界面下了指令（scan_now / reload）就立即返回。"""
+    deadline = time.monotonic() + max(0.0, float(interval))
+    while not stop.is_set():
+        if state.get("scan_now") or state.get("reload"):
+            return                       # 界面刚下的指令，别等满整个间隔
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=min(_WAKE_POLL, remain))
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_service(cfg: dict, dry_run: bool) -> int:
     store = Store(cfg["state"]["db"])
 
@@ -100,7 +126,10 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                             cfgmod.save(cfg)
                             state["reload"] = True
                             logger.info("已从 %s 同步 115 cookie（长度 %d），115 客户端将重建", src, len(fresh))
-                if state.pop("scan_now", False):
+                # 消费界面指令。必须 pop：它表示「上一轮等待期间用户点过」，
+                # 本轮已经会立刻扫，留着会让下一轮的空转判断也命中。
+                scan_now = state.pop("scan_now", False)
+                if scan_now:
                     logger.info("收到界面指令：立即扫描")
                 if state.pop("reload", False):
                     logger.info("配置已更新：重建 115 客户端与调度器")
@@ -124,13 +153,13 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                     uploader.dispatch()
             except Exception as exc:  # noqa: BLE001
                 logger.error("本轮扫描/调度出错：%s", exc)
-            # 间隔每轮重读：界面上改了立刻生效；点过「立即扫描」则缩短等待
+            # 间隔每轮重读：界面上改了立刻生效。
+            # 「点过立即扫描就缩短等待」不能靠读 state 判断 —— scan_now 在上一处
+            # 就被 pop 掉了（同一标志先 pop 后 get ⇒ 那个分支永远不可达），
+            # 而且它是别的线程写的，置进去也唤不醒这里的 await。改由
+            # _wait_next_round 每 0.5 秒醒一次自己看。
             interval = max(2, int(cfg["scan"]["interval_seconds"]))
-            wait_s = 0.5 if state.get("scan_now") else interval
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=wait_s)
-            except asyncio.TimeoutError:
-                pass
+            await _wait_next_round(stop, state, interval)
     finally:
         logger.info("收到退出信号，等待在途任务结束…")
         await asyncio.sleep(0.5)
