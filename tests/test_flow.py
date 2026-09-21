@@ -2771,6 +2771,113 @@ async def case_delete_after_upload_no_mutual_delete():
                 "洗板重下经 scanner 整条替换使事实作废；老库自动补列且默认 0")
 
 
+async def case_secure_compare_all_channels():
+    """[39][40] 三条鉴权通道必须用**同一种**常数时间比较，且能吃下非 ASCII 凭据。
+
+    [40] `hmac.compare_digest()` 作用在 **str** 上只接受纯 ASCII —— 遇到中文/emoji 抛
+    `TypeError: comparing strings with non-ASCII characters is not supported`。
+    而 `check_credentials()` 的两个调用点（`check_auth` 的 Basic 分支、`_do_login`）
+    都不在 try 里：面板把密码设成含中文后，**Basic 通道每次请求都抛 TypeError**，
+    socketserver 兜住并打一整段 traceback，客户端拿到的是「连接断开」而不是 401/500
+    （界面表现为一直转圈）。同一条凭据，Cookie 通道与 `?token=` 通道却是好的 ——
+    「一条路能进、一条路进不去」是最难查的形态。本地已端到端复现。
+
+    [39] 同一份 `check_auth` 里三条通道，两条用 `compare_digest`、只有 `?token=` 那条用
+    `==`（首个不同字节即返回，耗时与匹配前缀相关）。统一成 `_secure_eq()`。
+
+    修法：新增 `_secure_eq(a, b)` —— 先 `str(...).encode("utf-8")` 再 `compare_digest`，
+    任意内容都接受且仍是常数时间；三条通道全部改走它。
+    """
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    srv = None
+    webui._FAILURES.clear()
+
+    # ---- A) 单元层：_secure_eq 自身 ----
+    assert webui._secure_eq("abc", "abc") is True
+    assert webui._secure_eq("abc", "abd") is False
+    assert webui._secure_eq("", "") is True
+    # ★ 核心：非 ASCII 不抛异常
+    assert webui._secure_eq("密码", "密码") is True, "非 ASCII 相等必须为 True（旧写法抛 TypeError）"
+    assert webui._secure_eq("密码", "密碼") is False
+    assert webui._secure_eq("p@ss🔐", "p@ss🔐") is True, "emoji 也要能比"
+    assert webui._secure_eq(None, "") is False or webui._secure_eq(None, None) is True
+    # 直接锤旧写法会抛（记录这个前提，别把用例写成恒真）
+    try:
+        import hmac as _hmac
+        _hmac.compare_digest("密码", "密码")
+        non_ascii_raises = False
+    except TypeError:
+        non_ascii_raises = True
+    assert non_ascii_raises, "前提：hmac.compare_digest 对非 ASCII str 必须抛 TypeError"
+
+    # ---- B) 三通道 × 中文/emoji 凭据 ----
+    USR, PWD = "管理员", "密码中文测试🔐"
+    a = {"enabled": True, "mode": "basic", "username": USR, "password": PWD}
+    assert webui.check_credentials(a, USR, PWD) is True, "中文凭据必须通过（旧写法抛 TypeError）"
+    assert webui.check_credentials(a, USR, "wrong") is False
+    assert webui.check_credentials(a, "wrong", PWD) is False
+
+    c = copy.deepcopy(cfgmod.DEFAULTS)
+    c["http"]["auth"] = dict(a, session_hours=72)
+    # ① ?token= 通道
+    assert webui.check_auth(c, {}, "token=" + urllib.parse.quote(PWD)) is True, "?token= 中文密码应放行"
+    assert webui.check_auth(c, {}, "token=nope") is False
+    # ② Cookie 会话（签名内部走 encode，本来就支持非 ASCII —— 这条是「对照，不能修坏」）
+    tok = webui.make_session(USR, PWD, 1)
+    assert webui.check_auth(c, {"Cookie": f"{webui.COOKIE_NAME}={tok}"}, "") is True
+    # ③ Basic 通道（★ 修复点）
+    ok_cred = base64.b64encode(f"{USR}:{PWD}".encode()).decode()
+    bad_cred = base64.b64encode(f"{USR}:wrong".encode()).decode()
+    assert webui.check_auth(c, {"Authorization": "Basic " + ok_cred}, "") is True, \
+        "Basic 中文凭据应放行（修复前抛 TypeError）"
+    assert webui.check_auth(c, {"Authorization": "Basic " + bad_cred}, "") is False
+    # ④ 关闭鉴权时恒真（别把开关弄坏）
+    c_off = copy.deepcopy(cfgmod.DEFAULTS)
+    c_off["http"]["auth"]["enabled"] = False
+    assert webui.check_auth(c_off, {}, "") is True
+
+    # ---- C) 端到端：中文密码走 Basic 必须是 200/401，而不是断连 ----
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def get(headers=None, path="/api/status"):
+        req = urllib.request.Request(f"{base}{path}")
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            return opener.open(req, timeout=5).status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": True, "mode": "basic", "username": USR,
+                                "password": PWD, "session_hours": 72}}
+        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        assert get() == 401, "无凭据应 401"
+        assert get({"Authorization": "Basic " + ok_cred}) == 200, \
+            "★ Basic 中文凭据应得 200（修复前抛 TypeError → 连接断开）"
+        assert get({"Authorization": "Basic " + bad_cred}) == 401, "错误凭据应 401"
+        assert get(path="/api/status?token=" + urllib.parse.quote(PWD)) == 200
+        assert get(path="/api/status?token=nope") == 401
+        assert get(path="/health") == 200, "/health 免鉴权"
+
+        PASS.append("[39][40] 三条鉴权通道统一常数时间比较、且吃下非 ASCII 凭据："
+                    "`_secure_eq` 按 UTF-8 编码后 compare_digest（中文/emoji 不再抛 "
+                    "TypeError）；?token= 通道由 `==` 改为常数时间；"
+                    "端到端 Basic 中文密码得 200 / 错误得 401（修复前 TypeError → 断连）；"
+                    "Cookie 与关闭鉴权两条路径未受影响")
+    finally:
+        webui._FAILURES.clear()
+        if srv is not None:
+            srv.shutdown()
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2808,6 +2915,7 @@ async def main():
     await case_dir_paging_cursor()
     await case_same_episode_no_mutual_delete()
     await case_delete_after_upload_no_mutual_delete()
+    await case_secure_compare_all_channels()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

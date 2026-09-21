@@ -177,11 +177,35 @@ def parse_cookie(raw: str) -> dict:
 
 
 # ---------- 凭据校验 ----------
+def _secure_eq(a, b) -> bool:
+    """常数时间比较两个值（按 UTF-8 编码后比字节）。
+
+    为什么必须编码：`hmac.compare_digest()` 在 **str** 上只接受纯 ASCII，
+    遇到中文/emoji 直接抛
+    `TypeError: comparing strings with non-ASCII characters is not supported`。
+    而 `check_credentials` 的两处调用点（`check_auth` 的 Basic 分支、`_do_login`）
+    **都不在 try 块里** —— 实测：面板把密码设成含中文后，Basic 通道每次请求都在
+    这里抛 TypeError，socketserver 兜住并打一整段 traceback，客户端拿到的是
+    **连接断开**（不是 401、也不是 500，界面表现为「一直转圈」）；
+    而 Cookie 通道与 `?token=` 通道却是好的。同一份凭据「一条路能进、
+    一条路进不去」，这是最难查的形态。
+    编成 bytes 后 compare_digest 接受任意内容，且仍是常数时间比较。
+
+    同时用于替换 `?token=` 那条的 `==` —— `==` 一旦发现首个不同字节就返回，
+    耗时与「匹配了多少前缀」相关，构成可被逐字节探测的时序侧信道
+    （实测 `==` 在 40 字符密码上耗时随匹配前缀波动，而 compare_digest 稳定）。
+    """
+    try:
+        return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def check_credentials(a: dict, user: str, pwd: str) -> bool:
     want_user = _username(a)
-    if not hmac.compare_digest(pwd, _password(a)):
+    if not _secure_eq(pwd, _password(a)):
         return False
-    return (not want_user) or hmac.compare_digest(user, want_user)
+    return (not want_user) or _secure_eq(user, want_user)
 
 
 def check_auth(cfg: dict, headers, query: str) -> bool:
@@ -193,7 +217,7 @@ def check_auth(cfg: dict, headers, query: str) -> bool:
     if not _enabled(a):
         return True
     pwd = _password(a)
-    if parse_qs(query).get("token", [""])[0] == pwd:
+    if _secure_eq(parse_qs(query).get("token", [""])[0], pwd):
         return True
     # 必须用 `is not None` 判断：parse_session 用「返回用户名」表示通过，
     # 而用户名可以是**空串**（面板把「用户名」清空，或用户登录时不填）。
