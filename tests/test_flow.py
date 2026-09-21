@@ -2878,6 +2878,118 @@ async def case_secure_compare_all_channels():
             srv.shutdown()
 
 
+async def case_same_name_duplicate_cleaned():
+    """[41] 云端同集**同名重复**必须能被清掉（真机现象：两条逐字同名的 S01E33）。
+
+    真机取证：115 同一目录下出现两条完全同名的
+    `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv`，
+    面板开关开着、日志里连一行都没有 —— 洗板清理**静默失效**。
+
+    根因：`cleanup_previous` 把 `keep_name` 自动塞进了「名字保护集」，
+    于是 `if name in keep_names_set: continue` 把**所有与 keep_name 同名的条目**
+    一并保护住。而下列两种情形里，要清的旧条目名恰好就等于 `keep_name`：
+      ① 云端同集同名重复（本次真机现象）；
+      ② 115 同名自动改名：新版成了 "xxx (1).mkv"，而**旧的那条名字正好等于 keep_name**。
+    两种情形下旧条目都永远跳过 ⇒ 连「大小不同」那道闸门都走不到，静默返回「没有旧版本」。
+    本地已复现：四种组合全部 `deleted=[]`。
+
+    修法：判据改为**标识优先** —— 只要 `keep_ids` 精确命中了某一条，就说明「刚上传那条」
+    已被 fid/pickcode 唯一确定，同名的其它条目就是重复项，名字与大小两道闸门都不再保护它；
+    无标识可用时保持保守（不动手），但把静默改成**可见的 note**。
+    另外区分两类保护：`keep_name`（自动、无标识时兜底）vs `explicit_names`
+    （调用方显式传的同集其它正当版本、**始终**保护）。
+    """
+    from p115 import P115 as _P115
+
+    FULL = "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv"
+    REN = FULL[:-4] + " (1).mkv"                     # 115 同名自动改名的产物
+    OTHER = "甲剧 (2026) [tmdbid=100001] S01E33 [1080p WEB-DL].mkv"
+    assert p115.episode_key(FULL) == p115.episode_key(REN) == p115.episode_key(OTHER), \
+        "构造前提：三个文件名必须同集"
+
+    class _Cloud:
+        def __init__(self, rows):
+            self.f = {fid: {"fid": fid, "n": n, "s": s, "ico": "mkv"} for fid, n, s in rows}
+
+        def snap(self):
+            return [dict(v) for v in self.f.values()]
+
+    def mgr_of(cloud):
+        m = _P115.__new__(_P115)
+        m._dir_cache = {}
+        m._dir_cache_ttl = 30.0
+        m._dir_cache_max = 64
+        m._delete_lock = asyncio.Lock()
+
+        async def list_dir(pid, use_cache=True):
+            rows = cloud.snap()
+            m._remember_dir(int(pid), rows)
+            return rows
+
+        async def delete_file(fid):
+            async with m._delete_lock:
+                return bool(cloud.f.pop(str(fid), None))
+
+        m.list_dir = list_dir
+        m.delete_file = delete_file
+        return m
+
+    MB = 1024 * 1024
+    got = []
+
+    async def run(label, rows, keep_fid, keep_fids, keep_names, keep_size, expect_left):
+        c = _Cloud(rows)
+        r = await mgr_of(c).cleanup_previous(700, FULL, keep_size, 9,
+                                            keep_fid=keep_fid, keep_fids=keep_fids,
+                                            keep_names=keep_names)
+        left = sorted(x["fid"] for x in c.snap())
+        assert left == sorted(expect_left), f"{label}：剩余 {left}，期望 {sorted(expect_left)}（{r}）"
+        got.append(label)
+        return r
+
+    # ① 真机现象：两条逐字同名、大小不同、标识命中「新的」
+    r1 = await run("① 同名重复 + 标识命中", [("111", FULL, 3 * MB), ("222", FULL, 5 * MB)],
+                   "222", [], [], 5 * MB, ["222"])
+    assert r1["deleted"] == [FULL], r1
+
+    # ② 同上但大小完全相同 —— 修复前会被 keep_size 挡住
+    r2 = await run("② 同名重复 + 大小相同", [("111", FULL, 5 * MB), ("222", FULL, 5 * MB)],
+                   "222", [], [], 5 * MB, ["222"])
+    assert r2["deleted"] == [FULL], r2
+
+    # ③ 115 自动改名：旧版名 = keep_name(完整)，新版名 = keep_name (1)
+    r3 = await run("③ 115 自动改名", [("111", FULL, 3 * MB), ("222", REN, 5 * MB)],
+                   "222", [], [], 5 * MB, ["222"])
+    assert r3["deleted"] == [FULL], r3
+
+    # ④ 无标识 + 同名多条：保守不动手，但 note 必须**可见**（不能再说「没有旧版本」）
+    r4 = await run("④ 无标识兜底", [("111", FULL, 3 * MB), ("222", FULL, 5 * MB)],
+                   "", [], [], 5 * MB, ["111", "222"])
+    assert r4["deleted"] == [], r4
+    assert "同名" in r4["note"], f"无标识时 note 必须点明同名重复：{r4}"
+
+    # ⑤ 显式 keep_names（同集其它正当版本）必须始终保护，即使同名
+    r5 = await run("⑤ 显式保护始终生效", [("111", FULL, 3 * MB), ("222", REN, 5 * MB)],
+                   "111", [], [REN], 3 * MB, ["111", "222"])
+    assert r5["deleted"] == [], r5
+
+    # ⑥ 洗板核心行为不变：不同名的同集旧版照旧被清
+    r6 = await run("⑥ 洗板核心行为不变", [("111", FULL, 3 * MB), ("333", OTHER, 7 * MB)],
+                   "111", [], [], 3 * MB, ["111"])
+    assert r6["deleted"] == [OTHER], r6
+
+    # ⑦ 同集正当版本仍互不删（第 37 处的保护不能被这次改动弄坏）
+    r7 = await run("⑦ 同集正当版本互不删", [("111", FULL, 3 * MB), ("222", OTHER, 7 * MB)],
+                   "111", ["222"], [OTHER], 3 * MB, ["111", "222"])
+    assert r7["deleted"] == [], r7
+
+    PASS.append("[41] 云端同集同名重复能被清掉（真机两条逐字同名的 S01E33）：判据改为标识优先 —— "
+                "标识命中后同名条目不再受名字/大小两道闸门保护；"
+                "覆盖「同名+大小不同」「同名+大小相同」「115 自动改名（旧名=keep_name）」三种情形；"
+                "无标识时保守不动手但 note 点明同名重复（不再静默说「没有旧版本」）；"
+                "显式 keep_names 始终保护、同集正当版本仍互不删、不同名旧版照旧清理")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2916,6 +3028,7 @@ async def main():
     await case_same_episode_no_mutual_delete()
     await case_delete_after_upload_no_mutual_delete()
     await case_secure_compare_all_channels()
+    await case_same_name_duplicate_cleaned()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

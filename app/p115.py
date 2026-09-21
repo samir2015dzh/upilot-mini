@@ -416,33 +416,67 @@ class P115:
             text = str(cand or "").strip()
             if text and text not in ("0", "None"):
                 keep_ids.add(text)
-        keep_names_set: set[str] = {str(n) for n in (keep_names or ()) if n}
-        if keep_name:
-            keep_names_set.add(str(keep_name))
+        explicit_names: set[str] = {str(n) for n in (keep_names or ()) if n}
+        auto_name = str(keep_name) if keep_name else ""
         rows = await self.list_dir(pid)
+
+        def _marks(row: dict) -> set[str]:
+            return {str(row.get(k)) for k in ("fid", "pc", "file_id")
+                    if row.get(k) not in (None, "")}
+
+        # 「刚上传那条」是否已被**标识**精确锁定？锁定了的话，自动加入的 keep_name
+        # 必须让位给标识判定。
+        #
+        # 不让位的后果（实测）：把 keep_name 自动塞进保护集后
+        #   `if name in keep_names_set: continue`
+        # 会把**所有与 keep_name 同名的条目**一并保护住。而
+        #   ① 云端同集同名重复（用户实际遇到：两条逐字同名的 S01E33）
+        #   ② 115 同名自动改名（新版成 "xxx (1).mkv"，**旧的那条名字正好等于 keep_name**）
+        # 这两种情形下旧条目名恰好就是 keep_name ⇒ 永远跳过 ⇒ 洗板清理静默失效：
+        # 面板开关是开着的、日志里连一行都没有。
+        #
+        # 注意区分两类保护：
+        #   - `keep_name`（自动）：只是「无标识时的兜底」，有标识时让位；
+        #   - `explicit_names`（调用方显式传的同集其它正当版本）：**始终**保护，
+        #     因为那确实是另一条要留下的文件，不能因为同名就连它一起删。
+        hit_by_id = bool(keep_ids) and any(_marks(r) & keep_ids for r in rows)
+        same_name_others = [r for r in rows
+                            if auto_name and str(r.get("n") or r.get("name") or "") == auto_name
+                            and not (_marks(r) & keep_ids)] if auto_name else []
+
         victims: list[tuple[str, str]] = []
         for row in rows:
             name = str(row.get("n") or row.get("name") or "")
             fid = row.get("fid") or row.get("file_id")
             if not name or fid in (None, ""):
                 continue                                 # list_dir 已滤掉目录，这里再兜一层
-            if keep_ids:
-                marks = {str(row.get(k)) for k in ("fid", "pc", "file_id")
-                         if row.get(k) not in (None, "")}
-                if marks & keep_ids:
-                    continue                             # 刚上传那条（按标识，最可靠）
-            if name in keep_names_set:
-                continue                                 # 刚上传那条 / 同集其它正当版本（按名字）
+            if keep_ids and _marks(row) & keep_ids:
+                continue                                 # 刚上传那条 / 同集正当版本（按标识，最可靠）
+            if name in explicit_names:
+                continue                                 # 调用方显式保护的正当版本，始终让位
+            # 标识已把「刚上传那条」唯一确定 ⇒ 本条同名条目是重复项/旧版，
+            # 不再走名字与大小两道闸门（否则同名旧版永远清不掉）。
+            locked = bool(hit_by_id and auto_name and name == auto_name)
+            if not locked and auto_name and name == auto_name:
+                continue                                 # 无标识时的兜底：别动同名条目
             if episode_key(name) != key:
                 continue
             try:
                 size = int(row.get("s") or row.get("size") or 0)
             except (TypeError, ValueError):
                 size = 0
-            if keep_size and size == keep_size:
+            if not locked and keep_size and size == keep_size:
                 continue                                 # 大小一模一样：更像刚传那条被改过名，别动
             victims.append((name, str(fid)))
         if not victims:
+            # 云端同名多条却没动手：必须**可见**（原来只说「没有旧版本」，
+            # 看日志会以为没事，其实是有重复清不掉）。
+            if same_name_others:
+                why = ("这次没有可用的文件标识（file_id/pickcode），分不清哪条是新的"
+                       if not keep_ids else "同名条目在保护名单里")
+                return {"deleted": [],
+                        "note": (f"云端同集有 {len(same_name_others)} 条与本次上传同名的条目，"
+                                 f"{why}，本次不动手")}
             return {"deleted": [], "note": "没有旧版本"}
         if max_delete > 0 and len(victims) > max_delete:
             return {"deleted": [],
