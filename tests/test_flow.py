@@ -1128,6 +1128,62 @@ async def case_unexpected_error_stops_retry():
                 "连续 3 次才置「错误」停止；错误项能被「失败项重新入队」救回")
 
 
+async def case_all_states_recoverable():
+    """[23] 全部非终态都能被 dispatch 恢复（容器被强杀后的自愈）。
+
+    `_process` 是「先置状态、再去干活」的：置完「秒传中」「上传中」就被 SIGKILL
+    （OOM / docker restart / 宿主机重启）时，except 根本不执行，记录就悬在那个状态上。
+    dispatch 若不认这个状态，它就永久卡死 —— 而且这种卡死没有任何报错，界面也看不出。
+    """
+    import uploader as upmod
+
+    stuck_states = ["待处理", "处理中", "待秒传", "秒传中", "待上传", "上传中", "待重试"]
+    for st_name in stuck_states:
+        cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+        try:
+            path = write_file(src, f"{st_name}/s01e01.mkv", 2 * 1024 * 1024)
+            store.add(path, os.path.getsize(path), os.path.getmtime(path))
+            # 模拟容器被强杀时的库状态：带 sha1；分块进行中的还带断点信息
+            store.set(path, status=st_name, sha1="0" * 40,
+                      upload_id="uid-1", upload_oss_url="http://oss/x",
+                      upload_callback="{}", upload_partsize=10 * 1024 * 1024)
+            up = Uploader(cfg, store, mgr)
+            for _ in range(4):
+                up.dispatch()
+                await asyncio.sleep(0.15)
+            after = store.get(path)["status"]
+            assert after != st_name, f"{st_name} 卡死了，重启后无法自愈：{after}"
+            assert after == "已上传", f"{st_name} 应被推进到「已上传」，实得 {after}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # 「上传中」且断点齐全时，应直接续传，而不是白走一轮秒传再被推回待重试
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=99)
+    try:
+        path = write_file(src, "续传/s01e01.mkv", 12 * 1024 * 1024)
+        store.add(path, os.path.getsize(path), os.path.getmtime(path))
+        store.set(path, status="上传中", sha1="0" * 40,
+                  upload_id="uid-1", upload_oss_url="http://oss/x",
+                  upload_callback="{}", upload_partsize=10 * 1024 * 1024)
+        up = Uploader(cfg, store, mgr)
+        calls = {"rapid": 0}
+        real_rapid = mgr.rapid
+
+        async def spy(*a, **k):
+            calls["rapid"] += 1
+            return await real_rapid(*a, **k)
+
+        mgr.rapid = spy
+        await up._process(path)
+        assert calls["rapid"] == 0, f"断点齐全时应直接续传，不该再走秒传（实际调了 {calls['rapid']} 次）"
+        assert store.get(path)["status"] == "已上传", store.get(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[23] 状态自愈（全量）：7 个非终态（待处理/处理中/待秒传/秒传中/待上传/上传中/待重试）"
+                "都能被 dispatch 捞起并推进到「已上传」；「上传中」且断点齐全时直接续传、不白走秒传")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1150,6 +1206,7 @@ async def main():
     case_config_roundtrip()
     await case_status_selfheal()
     await case_unexpected_error_stops_retry()
+    await case_all_states_recoverable()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

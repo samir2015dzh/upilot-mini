@@ -213,14 +213,16 @@ class Uploader:
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
 
     def dispatch(self) -> None:
-        # 「待上传」两种模式都得派发：非纯秒传时 _process 走分块上传；纯秒传时
-        # _process 开头那段兜底会把它拉回「待重试」。这里若按模式筛掉，库里残留的
-        # 「待上传」（切换模式前入队的、或 rapid_then_upload 时期转过来的）就永远不会
-        # 被自动派发 —— 只有人在界面点「立即处理」才救得回来，无人值守时一直卡着。
-        # 「处理中」同理必须捞：容器重启时若有文件正卡在算 SHA1，没人派发它就永远
-        # 停在「处理中」；派发后 _process 接着算完（已算好的直接复用）。
+        # 这里必须覆盖**全部**非终态，否则那个状态的文件就永久卡住：
+        #   - 「待上传」：非纯秒传时走分块；纯秒传时 _process 开头把它拉回重试队列。
+        #     库里残留的（切模式前入队的）只能靠人被点「立即处理」救，无人值守就一直卡。
+        #   - 「处理中」「秒传中」「上传中」：这三个是 _process 内部先置状态、再去干活的。
+        #     容器被强杀时 except 不执行，记录就悬在这三个状态上；没人派发 → 永久卡死。
+        #     （这台机器上跑着十几个容器，docker restart / OOM 都是常态。）
+        # 「待重试」是唯一带 due 过滤的：只有它需要等 next_retry_at（秒传重试 / 异常退避）。
         todo = [("待处理", False), ("处理中", False), ("待秒传", False),
-                ("待上传", False), ("待重试", True)]
+                ("秒传中", False), ("待上传", False), ("上传中", False),
+                ("待重试", True)]
         for status, due in todo:
             for rec in self.store.by_status(status, limit=100, due=due):
                 self.spawn(rec["path"])
@@ -275,7 +277,16 @@ class Uploader:
 
         # 3) 秒传
         store = self.store
-        while True:
+        # 容器被强杀（OOM / docker restart / 宿主机重启）时，_process 已经把状态置成
+        # 「上传中」再去传分块，SIGKILL 下 except 不会执行 —— 那条记录就永远停在
+        # 「上传中」。重新被派发时若重走秒传：云端不会有完整文件（本来就传一半），
+        # 必然未命中 → 被推回「待重试」白等好几轮才转回分块。断点齐全就直接续传。
+        resume_upload = (rec["status"] == "上传中"
+                         and all(rec.get(k) for k in
+                                 ("upload_id", "upload_oss_url", "upload_callback")))
+        if resume_upload:
+            logger.info("恢复被打断的分块上传（断点续传）：%s", os.path.basename(path))
+        while not resume_upload:
             store.set(path, status="秒传中")
             try:
                 hit, info = await self.mgr.rapid(path, rec["size"], rec["sha1"] or "", pid)
