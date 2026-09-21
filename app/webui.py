@@ -556,6 +556,12 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
 
     srv = ThreadingHTTPServer((http_cfg.get("host", "0.0.0.0"), int(http_cfg.get("port", 9844))), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # 记下**实际绑定**的端口（端口写 0 时是内核分配的真实值），供健康检查兜底：
+    # 面板上改了 http.port 但还没重建容器时，真正在跑的还是这个端口。
+    try:
+        cfgmod.PORT_FILE.write_text(str(srv.server_address[1]), encoding="utf-8")
+    except OSError:
+        pass
     a = auth_cfg(cfg)
     state_desc = "关闭"
     if _enabled(a):

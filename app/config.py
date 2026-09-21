@@ -12,6 +12,12 @@ import yaml
 
 CONFIG_PATH = Path(os.environ.get("UPILOT_CONFIG", "/config/config.yaml"))
 EXAMPLE_PATH = Path("/app/config/config.example.yaml")
+# 面板**实际监听**的端口（webui.serve() 绑定成功后写入）。
+# 用途：http.port 是「改了要重建容器」的项，但保存会立刻落盘 —— 而绑定不会变。
+# 健康检查若只按配置里的端口去查，用户一改端口、还没重建容器，容器就立刻变成
+# unhealthy（服务其实好好地在旧端口跑），监控显示异常，配了 depends_on:
+# service_healthy 的地方还会被卡住。所以用这个文件兜底。
+PORT_FILE = CONFIG_PATH.parent / ".http_port"
 
 # 115 客户端身份（app 值取自 p115client.const.APP_TO_SSOENT）；中文标签对齐 115 官方客户端。
 # 用途：所有 115 请求（目录 / 秒传 / 上传）都用它当身份，挑一个自己平时不用的端。
