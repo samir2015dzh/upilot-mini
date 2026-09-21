@@ -1,6 +1,7 @@
 """配置加载：/config/config.yaml 为主，环境变量可覆盖 cookie。"""
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -501,8 +502,26 @@ def coerce(field: dict, raw) -> object:
         if not text:
             raise ValueError(f"{label}：请填数字")
         try:
-            value = float(text) if kind == "float" else int(float(text))
+            as_float = float(text)
         except ValueError as exc:
+            raise ValueError(f"{label}：请填数字") from exc
+        # inf / nan 必须在这里挡掉，两重原因：
+        #   1) 落进配置后会让所有比较失效 —— 实测把 `scan.min_size_mb` 填成 inf，
+        #      `st.st_size < min_bytes` 恒真，**每个文件都被静默跳过**（0 个入队），
+        #      界面看不出任何错误，只是「什么也不再上传」；nan 则相反（比较恒 False
+        #      ⇒ 等于不设限）。
+        #   2) `int(float('inf'))` 抛的是 **OverflowError**，而 webui 只 catch
+        #      ValueError ⇒ 保存时变成未处理异常（500/断连），而不是友好提示。
+        # 顺带把 int 的转换异常统一成 ValueError，别让别的数值异常漏到 webui。
+        try:
+            finite = math.isfinite(as_float)
+        except TypeError:                    # 理论上不会发生，防外部传入怪对象
+            finite = False
+        if not finite:
+            raise ValueError(f"{label}：请填有限数字")
+        try:
+            value = as_float if kind == "float" else int(as_float)
+        except (ValueError, OverflowError) as exc:
             raise ValueError(f"{label}：请填数字") from exc
         lo, hi = field.get("min"), field.get("max")
         if lo is not None and value < lo:

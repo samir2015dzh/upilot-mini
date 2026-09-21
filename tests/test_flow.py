@@ -11,6 +11,7 @@ import builtins
 import copy
 import gc
 import glob
+import math
 import os
 import shutil
 import sys
@@ -2139,6 +2140,137 @@ async def case_request_body_hardening():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def case_coerce_finite_values():
+    """[34] 面板数值字段必须挡掉 inf/nan，且异常统一成 ValueError。
+
+    两个真实后果（都实测过）：
+    1. **静默失效**：`coerce` 用 `float(text)` 后直接比值，`math.isfinite` 从没被检查。
+       把 `scan.min_size_mb` 存成 `inf` → 落盘成 `.inf` → 重新 load 仍是 inf →
+       scanner 里 `st.st_size < min_bytes` **恒真**，每个文件都被跳过
+       （实测 0 个入队；同一目录 min_size_mb=0 时是 3 个）。
+       界面上看不到任何错误，只是「从此再也不上传」。nan 则相反（比较恒 False ⇒ 不限）。
+    2. **500 而非友好提示**：int 字段走 `int(float(text))`，`float("1e400")` 得到 inf、
+       `int(inf)` 抛的是 **OverflowError**，而 webui 的 `POST /api/config` 只 catch
+       `ValueError` ⇒ 保存时变成未处理异常。
+    """
+    from pathlib import Path
+
+    src_txt = open(os.path.join(APP, "config.py"), encoding="utf-8").read()
+    assert "import math" in src_txt, "config.py 没导入 math"
+    assert "math.isfinite" in src_txt, "coerce 里没有有限性检查"
+
+    def field_of(key: str) -> dict:
+        f = cfgmod.find_field(key)
+        assert f, f"面板里没有字段 {key}"
+        return f
+
+    # 1) 非有限值：必须 ValueError（不是 OverflowError，也不是被接受）
+    hazards = [
+        ("scan.min_size_mb", "inf"), ("scan.min_size_mb", "-inf"),
+        ("scan.min_size_mb", "nan"), ("scan.min_size_mb", "Infinity"),
+        ("scan.min_size_mb", "NaN"), ("scan.min_size_mb", "1e400"),
+        ("scan.interval_seconds", "1e400"), ("scan.interval_seconds", "inf"),
+        ("scan.interval_seconds", "1e309"), ("scan.stable_rounds", "inf"),
+        ("upload.concurrency", "1e400"), ("upload.small_file_mb", "inf"),
+        ("retry.max_hours", "inf"), ("retry.max_hours", "nan"),
+    ]
+    for key, raw in hazards:
+        f = field_of(key)
+        try:
+            got = cfgmod.coerce(f, raw)
+        except ValueError:
+            continue                                  # 正是期望的
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(
+                f"{key}={raw!r} 抛了 {type(exc).__name__}，webui 只 catch ValueError ⇒ 会变成 500"
+            ) from exc
+        raise AssertionError(f"{key}={raw!r} 被接受了：{got!r}（会让配置校验形同虚设）")
+
+    # 2) 正常值不受影响（注意 float 字段本来就返回 float：0 → 0.0）
+    normal = [
+        ("scan.min_size_mb", "0", 0.0), ("scan.min_size_mb", "1.5", 1.5),
+        ("scan.interval_seconds", "30", 30), ("scan.interval_seconds", "2", 2),
+        ("scan.interval_seconds", "86400", 86400), ("scan.interval_seconds", "30.0", 30),
+        ("scan.interval_seconds", " 30 ", 30),
+        ("scan.stable_rounds", "2", 2), ("upload.concurrency", "2", 2),
+        ("retry.max_hours", "12.5", 12.5), ("retry.max_hours", "0", 0.0),
+    ]
+    for key, raw, want in normal:
+        f = field_of(key)
+        got = cfgmod.coerce(f, raw)
+        assert got == want, f"{key}={raw!r} → {got!r}，期望 {want!r}"
+        if f["type"] == "int":
+            assert isinstance(got, int), f"{key} 是 int 字段却返回 {type(got).__name__}"
+
+    # 3) 越界校验不能被这轮改动碰坏
+    for key, raw in (("scan.interval_seconds", "1"), ("scan.interval_seconds", "99999"),
+                     ("scan.stable_rounds", "0"), ("scan.stable_rounds", "21"),
+                     ("scan.min_size_mb", "-1")):
+        f = field_of(key)
+        try:
+            got = cfgmod.coerce(f, raw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{key}={raw!r} 越界却被接受：{got!r}")
+
+    # 4) 端到端：apply_values 必须拒绝、内存不许被改脏、落盘不许出现 .inf/.nan
+    tmp = tempfile.mkdtemp(prefix="upilot-finite-")
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+    cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+    try:
+        cfg = copy.deepcopy(cfgmod.DEFAULTS)
+        cfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        cfgmod.save(cfg)
+
+        # JSON 通道真的能送来 Infinity（Python json 默认 allow_nan=True）
+        inf = __import__("json").loads('{"v": Infinity}')["v"]
+        # 注意：不能用 `inf != inf - 1` 判断 —— inf-1 仍是 inf，那样写表达式恒为 False。
+        assert math.isinf(inf) and inf > 0, "json.loads 应能解析出 Infinity"
+        before_min = cfg["scan"]["min_size_mb"]
+        before_int = cfg["scan"]["interval_seconds"]
+        try:
+            cfgmod.apply_values(cfg, {"scan.min_size_mb": inf})
+            raise AssertionError("apply_values 接受了 inf")
+        except ValueError:
+            pass
+        assert cfg["scan"]["min_size_mb"] == before_min, "非法字段不该改到内存"
+
+        # 混合提交：合法项也不许生效（两阶段原子性）
+        try:
+            cfgmod.apply_values(cfg, {"scan.interval_seconds": 45, "scan.min_size_mb": inf})
+            raise AssertionError("混合提交被接受")
+        except ValueError:
+            pass
+        assert cfg["scan"]["interval_seconds"] == before_int, "混合提交里合法项被提前改了"
+
+        # 落盘内容里不许出现 YAML 的 .inf/.nan 记法
+        cfgmod.save(cfg)
+        text = cfgmod.CONFIG_PATH.read_text(encoding="utf-8")
+        for token in (".inf", ".nan", "-.inf", ".Infinity"):
+            assert token not in text, f"配置里出现了 {token}"
+
+        # 5) 危害守卫：coerce 之后的 min_size_mb 必然有限（扫描不会再被静默跳过）
+        f = field_of("scan.min_size_mb")
+        for raw in ("0", "1.5", "100"):
+            v = cfgmod.coerce(f, raw)
+            assert v == v and v not in (float("inf"), float("-inf")), \
+                f"min_size_mb={raw!r} 变成了非有限值 {v!r}"
+
+        # 正常保存仍可用
+        res = cfgmod.apply_values(cfg, {"scan.min_size_mb": 2, "scan.interval_seconds": 45})
+        cfgmod.save(cfg)
+        back = cfgmod.load()
+        assert back["scan"]["min_size_mb"] == 2 and back["scan"]["interval_seconds"] == 45, back["scan"]
+    finally:
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[34] 面板数值字段挡 inf/nan：14 组非有限输入全部 ValueError（修复前 inf/nan 会被"
+                "接受、int 字段抛 OverflowError 变 500）、scanner 不再因 min_size_mb=inf 静默跳过"
+                "全部文件、正常值与越界校验不受影响、apply_values 拒绝且不脏内存、落盘无 .inf/.nan")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2171,6 +2303,7 @@ async def main():
     await case_empty_username_session()
     case_a2a_token_resolution()
     await case_request_body_hardening()
+    case_coerce_finite_values()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
