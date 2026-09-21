@@ -248,21 +248,66 @@ def load_cookie_from(path: str) -> str:
     return hits[0] if hits else ""
 
 
+def _atomic_write_text(path: Path, body: str, *, backup: bool = True) -> None:
+    """原子写 + 收紧权限 +（可选）留一份 .bak。**调用方负责持 _SAVE_LOCK**。
+
+    为什么必须原子：config.yaml 是唯一正本，里面是 cookie / 面板密码 / notify 凭据。
+    直接 write_text 覆盖正本，写入途中断电、OOM kill 或磁盘满就会留下半截文件 ——
+    凭据全丢、服务起不来。mkstemp + os.replace 保证读者要么看到旧的、要么看到新的。
+    """
+    backup_path = path.parent / (path.name + ".bak")
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        # .tmp 里已经是完整凭据，别等 os.replace 之后才收紧
+        _chmod_private(tmp)
+        if backup and path.exists():
+            shutil.copyfile(path, backup_path)
+            # shutil.copyfile 用默认 umask 建新文件（通常 644），并把 cookie /
+            # 面板密码 / notify 凭据一起复制进去 —— 备份比正本还宽松，
+            # 同机其他进程能直接读到。必须跟着收紧。
+            _chmod_private(backup_path)
+        os.replace(tmp, path)
+    except BaseException:
+        # 失败就别留垃圾（临时文件里是完整凭据）
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    _chmod_private(path)
+
+
 def save_cookie(cookie: str) -> None:
-    """把 cookie 写回配置（仅替换 p115.cookie 一行，保留注释）。"""
-    ensure_config()
-    text = CONFIG_PATH.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    out, hit = [], False
-    for line in lines:
-        if line.strip().startswith("cookie:"):
-            out.append(f'  cookie: "{cookie}"')
-            hit = True
-        else:
-            out.append(line)
-    if not hit:
-        out.insert(1, f'  cookie: "{cookie}"')
-    CONFIG_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+    """把 cookie 写回配置（仅替换 p115.cookie 一行，保留注释）。
+
+    走与 save() 同一把锁 + 原子写：这个函数原本是 read_text → 改行 → write_text
+    直接覆盖正本，既没锁、也不是原子替换（实测 inode 不变 = 原地改写）。它与面板
+    保存走的是不同路径（本函数只在 `main.py login` 里被调用，是另一个进程），
+    所以并发概率低；但**非原子写正本**的风险与并发无关 —— 写入途中进程被 kill 或
+    磁盘满，config.yaml 会只剩半截，cookie / 面板密码 / notify 凭据一起丢。
+    """
+    with _SAVE_LOCK:
+        ensure_config()
+        path = CONFIG_PATH
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        # YAML 双引号标量与 JSON 字符串语法兼容：json.dumps 会把 cookie 里的
+        # 反斜杠 / 引号正确转义，直接 f'"{cookie}"' 拼则会把配置写坏。
+        quoted = json.dumps(cookie, ensure_ascii=False)
+        out, hit = [], False
+        for line in lines:
+            if line.strip().startswith("cookie:"):
+                out.append(f"  cookie: {quoted}")
+                hit = True
+            else:
+                out.append(line)
+        if not hit:
+            out.insert(1, f"  cookie: {quoted}")
+        _atomic_write_text(path, "\n".join(out) + "\n")
 
 
 # ---------------- 界面可编辑配置（设置页据此渲染，后端据此校验） ----------------
@@ -596,28 +641,5 @@ def save(cfg: dict) -> Path:
         path = CONFIG_PATH
         body = ("# 本文件由界面保存生成（字段说明见 config.example.yaml）\n"
                 + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False))
-        backup = path.parent / (path.name + ".bak")
-        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
-                                        dir=str(path.parent))
-        tmp = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            # .tmp 里已经是完整凭据，别等 os.replace 之后才收紧
-            _chmod_private(tmp)
-            if path.exists():
-                shutil.copyfile(path, backup)
-                # shutil.copyfile 用默认 umask 建新文件（通常 644），并把 cookie /
-                # 面板密码 / notify 凭据一起复制进去 —— 备份比正本还宽松，
-                # 同机其他进程能直接读到。必须跟着收紧。
-                _chmod_private(backup)
-            os.replace(tmp, path)
-        except BaseException:
-            # 失败就别留垃圾（凭据在临时文件里）
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
-        _chmod_private(path)
+        _atomic_write_text(path, body)
         return path

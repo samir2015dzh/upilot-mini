@@ -1380,6 +1380,89 @@ async def case_config_save_concurrent():
                 "不残留 .tmp（凭据不在里面过夜）；失败路径同样不留垃圾")
 
 
+async def case_save_cookie_atomic():
+    """[26] `main.py login` 写 cookie 必须原子化 + 正确转义。
+
+    save_cookie() 原来是 read_text → 改行 → write_text **直接覆盖正本**：既没锁、
+    也不是原子替换（实测 inode 不变）。它与面板保存是两个进程，并发概率低；但
+    「非原子写正本」的风险与并发无关 —— 写入途中被 kill 或磁盘满，config.yaml
+    只剩半截，cookie / 面板密码 / notify 凭据一起丢。另外旧写法 f'"{cookie}"'
+    是裸拼，cookie 里出现反斜杠或双引号会把整个 YAML 写坏。
+    """
+    import tempfile as _tf
+    from pathlib import Path as _P
+
+    tmp = _tf.mkdtemp(prefix="upilot-cookie-")
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    cfgmod.CONFIG_PATH = _P(tmp) / "config.yaml"
+    cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+    try:
+        import yaml as _yaml
+        import threading as _th
+
+        cfg = copy.deepcopy(cfgmod.DEFAULTS)
+        cfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        cfg["p115"]["cookie"] = "OLD=1"
+        cfgmod.save(cfg)
+
+        # 原子替换：必须换 inode（原地改写说明还是直接覆盖正本）
+        ino_before = cfgmod.CONFIG_PATH.stat().st_ino
+        cfgmod.save_cookie("UID=abc; CID=xyz; SEID=999")
+        assert cfgmod.CONFIG_PATH.stat().st_ino != ino_before, \
+            "save_cookie 仍是原地改写（非原子），写入途中断电会丢全部凭据"
+
+        got = _yaml.safe_load(cfgmod.CONFIG_PATH.read_text(encoding="utf-8"))
+        assert got["p115"]["cookie"] == "UID=abc; CID=xyz; SEID=999", \
+            f"cookie 没写对：{got['p115']['cookie']!r}"
+        # 其余内容（注释、别的键）不能被冲掉
+        assert cfgmod.CONFIG_PATH.read_text(encoding="utf-8").startswith("#"), "首行注释丢了"
+        assert got["state"]["db"].endswith("s.db"), "其它配置项被冲掉了"
+
+        # 特殊字符：反斜杠 / 双引号（旧实现会把 YAML 写坏）
+        nasty = 'UID=a\\b; CID="x:y"; SEID=z\\\\w'
+        cfgmod.save_cookie(nasty)
+        got = _yaml.safe_load(cfgmod.CONFIG_PATH.read_text(encoding="utf-8"))
+        assert got["p115"]["cookie"] == nasty, \
+            f"特殊字符 cookie 往返不一致：{got['p115']['cookie']!r} != {nasty!r}"
+
+        # 与 save() 并发：两边都不得抛错，落盘必须可解析
+        bad: list[str] = []
+
+        def do_cookie():
+            for i in range(60):
+                try:
+                    cfgmod.save_cookie(f"UID=iter{i}")
+                except Exception as exc:  # noqa: BLE001
+                    bad.append(f"cookie/{i} {type(exc).__name__}: {exc}")
+
+        def do_save():
+            c = copy.deepcopy(cfgmod.DEFAULTS)
+            c["state"] = {"db": os.path.join(tmp, "s2.db")}
+            for i in range(60):
+                c["log_level"] = f"LVL{i:05d}"
+                try:
+                    cfgmod.save(c)
+                except Exception as exc:  # noqa: BLE001
+                    bad.append(f"save/{i} {type(exc).__name__}: {exc}")
+
+        ts = [_th.Thread(target=do_cookie, daemon=True),
+              _th.Thread(target=do_save, daemon=True)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=60)
+        assert not bad, f"save_cookie ∥ save 并发抛错：{bad[:3]}"
+        _yaml.safe_load(cfgmod.CONFIG_PATH.read_text(encoding="utf-8"))
+
+        assert not [p for p in _P(tmp).iterdir() if ".tmp" in p.name], "残留 .tmp"
+    finally:
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[26] save_cookie 原子化：换 inode（非原地改写）+ 特殊字符正确转义 + "
+                "与 save() 并发零异常 + 不残留 .tmp")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1405,6 +1488,7 @@ async def main():
     await case_all_states_recoverable()
     await case_changed_file_not_lost()
     await case_config_save_concurrent()
+    await case_save_cookie_atomic()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
