@@ -182,8 +182,12 @@ class P115:
         self._cid_mem: dict[str, int] = {}
         # 目录内容缓存：{pid: (条目, 取回时间)}。上游实测「同一目录被反复列会触发 115 限流（405）」，
         # 洗板清理是「一个文件列一次目录」，整季下载会连打，所以加 TTL 复用。
+        # 注意：TTL 只在读取时判断，过期条目不会自己消失 —— 每个条目是那个目录的
+        # **完整文件列表**（几百个 dict）。媒体库有几百个目录时，长跑会把这些已过期的
+        # 列表一直持在内存里，所以必须自己淘汰（见 list_dir 写入前）。
         self._dir_cache: dict[int, tuple[list, float]] = {}
         self._dir_cache_ttl = 30.0
+        self._dir_cache_max = 64        # 最多缓存这么多个目录（dict 有序 = 近似 LRU）
         # 115 的 fs_delete 文档明确要求「不要并发执行」（删除与从回收站还原互斥），
         # 而 upload.concurrency 允许两个文件同时走到清理，所以删除必须串行化。
         self._delete_lock = asyncio.Lock()
@@ -251,9 +255,11 @@ class P115:
         （那个键在文件夹条目上压根不存在，等于没过滤）。
         """
         key = int(pid)
-        if use_cache:
-            hit = self._dir_cache.get(key)
-            if hit and time.monotonic() - hit[1] < self._dir_cache_ttl:
+        cache = getattr(self, "_dir_cache", None)
+        if use_cache and isinstance(cache, dict):
+            ttl = float(getattr(self, "_dir_cache_ttl", 30.0))
+            hit = cache.get(key)
+            if hit and time.monotonic() - hit[1] < ttl:
                 return list(hit[0])
         out: list[dict] = []
         offset = 0
@@ -278,8 +284,29 @@ class P115:
             offset += page
             if not rows or offset >= total:
                 break
-        self._dir_cache[key] = (list(out), time.monotonic())
+        self._remember_dir(key, out)
         return out
+
+    def _remember_dir(self, key: int, entries: list) -> None:
+        """写入目录缓存，顺手淘汰：先清过期，再按插入顺序压到上限。
+
+        TTL 只影响「能不能复用」，不会让条目消失；不主动淘汰的话，条目数只增不减
+        （每个条目是该目录的完整文件列表），长跑就是一条稳定的内存增长曲线。
+        属性一律 getattr 取值：测试里会手工构造 P115（走 __new__、不过 __init__），
+        项目里对这类实例既有约定就是用 getattr 守卫。
+        """
+        cache = getattr(self, "_dir_cache", None)
+        if not isinstance(cache, dict):
+            return
+        cap = max(1, int(getattr(self, "_dir_cache_max", 64)))
+        ttl = float(getattr(self, "_dir_cache_ttl", 30.0))
+        now = time.monotonic()
+        if len(cache) >= cap:
+            for k in [k for k, (_, ts) in cache.items() if now - ts >= ttl]:
+                cache.pop(k, None)
+            while len(cache) >= cap:
+                cache.pop(next(iter(cache)), None)
+        cache[key] = (list(entries), now)
 
     async def delete_file(self, file_id) -> bool:
         """把文件移进 115 回收站（`/rb/delete`，可恢复，非物理删除）。
