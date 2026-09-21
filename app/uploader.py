@@ -73,6 +73,12 @@ class Uploader:
         self.cleanup_max = int(up.get("cleanup_max_delete") or 3)
         self.notifier = Notifier(cfg)
         self._bg: set = set()          # 持有后台通知任务的引用，防止跑到一半被回收
+        # 未预期异常（不是 115 的瞬态错误，而是 fs_makedirs 500、文件读不了这类
+        # 真实故障）的连续次数。一次就判死刑太狠 —— ensure_pid 是裸调、没被
+        # _retry_transient 包住，一次网络抖动也会冒到这里；无人值守时把文件永久
+        # 标成「错误」等于要人工介入。改成退避重试，连续 error_max_attempts 次才停。
+        self._err_streak: dict[str, int] = {}
+        self.error_max_attempts = 3
 
     # ---------- 调度 ----------
 
@@ -85,9 +91,30 @@ class Uploader:
             try:
                 async with self.sem:
                     await self._process(path)
+                self._err_streak.pop(path, None)       # 跑通一轮 → 清掉异常计数
             except Exception as exc:  # noqa: BLE001
-                logger.error("处理 %s 出错：%s", path, exc)
-                self.store.set(path, message=f"异常：{exc}")
+                # 只记 message、不改状态是不行的：文件会停在「处理中」「待处理」这类
+                # 中间态，而 dispatch 每轮又把它捞回来 → 每轮重试一次、日志一直刷、
+                # 并发名额一直被占，界面上却看不到「错误」，用户无从下手。
+                # 但一次就判「错误」同样不行：ensure_pid 是裸调、没被 _retry_transient
+                # 包住，115 抖一下也会走到这里。所以退避重试，连续多次才停。
+                n = self._err_streak.get(path, 0) + 1
+                self._err_streak[path] = n
+                if n >= self.error_max_attempts:
+                    self._err_streak.pop(path, None)
+                    logger.error("处理 %s 连续 %d 次异常，停止自动重试：%s", path, n, exc)
+                    self.store.set(path, status="错误",
+                                   message=f"连续 {n} 次异常，已停止自动重试：{exc}")
+                else:
+                    backoff = min(600.0, 30.0 * n)
+                    logger.warning("处理 %s 第 %d 次异常，%d 秒后重试：%s",
+                                   path, n, int(backoff), exc)
+                    # 用「待重试」实现退避（只有它在 dispatch 里带 due 过滤，会看
+                    # next_retry_at）。_process 见到 sha1 为空会先补算，所以退避回来
+                    # 不会拿空 sha1 去秒传。
+                    self.store.set(path, status="待重试",
+                                   next_retry_at=time.time() + backoff,
+                                   message=f"第 {n} 次异常，{int(backoff)} 秒后重试：{exc}")
             finally:
                 self._active.discard(path)
 
@@ -215,20 +242,28 @@ class Uploader:
             return
 
         # 1) 预处理：等稳定 + 算 SHA1
-        if rec["status"] == "待处理":
-            if rec["stable_count"] < int(self.cfg["scan"]["stable_rounds"]):
-                return                                   # 还没稳定，等下一轮扫描
-            # 大文件算 SHA1 要几十秒到几分钟，这段必须让它在界面上「看得见」：
-            # 置成「处理中」（active() 会捞它、前端渲染「计算 SHA1 xx%」，sha1_of
-            # 每秒回写 progress）。否则它一直是「待处理」，既不进「正在处理」区、
-            # 也不计入概览的正在处理数，看起来像卡死。
+        if (rec["status"] == "待处理"
+                and rec["stable_count"] < int(self.cfg["scan"]["stable_rounds"])):
+            return                                       # 还没稳定，等下一轮扫描
+
+        if not rec.get("sha1"):
+            # sha1 是下面秒传的必需入参，任何状态下都不能为空。正常路径是
+            # 「待处理 →（算）→ 待秒传」；但异常退避可能把它停在「待重试」而
+            # SHA1 还没算出来 —— 这时若不补算，秒传会拿到空 sha1，永远不可能
+            # 命中，还会白刷 retry_count。所以这里统一补算。
+            # 算 SHA1 要几十秒到几分钟，这段必须让它在界面上「看得见」：置成
+            # 「处理中」（active() 会捞它、前端渲染「计算 SHA1 xx%」，sha1_of
+            # 每秒回写 progress）。否则它既不进「正在处理」区、也不计入概览的
+            # 正在处理数，看起来像卡死。
             self.store.set(path, status="处理中")
             rec = self.store.get(path)
-        if rec["status"] == "处理中":
-            # 已算过就秒回（sha1_of 复用落库的 sha1）；容器重启后残留的「处理中」
-            # 也落到这里，被 dispatch 捞起来接着算完，不会永久悬着。
             sha1 = await sha1_of(path, rec, self.store)
             self.store.set(path, status="待秒传", sha1=sha1)
+            rec = self.store.get(path)
+        elif rec["status"] == "处理中":
+            # SHA1 上一轮已经算完（算完就退避了 / 容器重启时残留）→ 直接推进，
+            # 不必白算一遍。
+            self.store.set(path, status="待秒传")
             rec = self.store.get(path)
 
         # 2) 目录：先建好（保留本地相对结构），秒传/分块上传共用这个 pid

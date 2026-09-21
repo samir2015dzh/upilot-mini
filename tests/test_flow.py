@@ -1058,6 +1058,76 @@ async def case_status_selfheal():
                 "算 SHA1 期间状态为「处理中」且 active() 可见；重启残留的「处理中」被 dispatch 捞回")
 
 
+async def case_unexpected_error_stops_retry():
+    """[22] 未预期异常：置「错误」并停止重复派发。
+
+    以前只写 message、不改状态 → 文件停在「处理中」这类中间态，dispatch 每轮又把它
+    捞回来，于是每轮重试一次：日志一直刷、并发名额一直被占，界面上还看不到「错误」。
+    """
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0)
+    try:
+        path = write_file(src, "坏文件/s01e01.mkv", 2 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        real = upmod.sha1_of
+        calls = {"n": 0}
+
+        async def boom(p, record, st):
+            calls["n"] += 1
+            raise PermissionError("模拟：文件读不了")
+
+        upmod.sha1_of = boom
+        try:
+            # 第 1 次异常：退避重试（不是直接判错）——115 抖一下不该就把文件标死
+            up.dispatch()
+            await asyncio.sleep(0.2)
+            up._active.discard(path)
+            rec = store.get(path)
+            assert calls["n"] == 1, calls
+            assert rec["status"] == "待重试", f"第 1 次异常应退避重试，实得 {rec['status']!r}"
+            assert (rec["next_retry_at"] or 0) > time.time(), "应带退避时间"
+
+            # 退避期内不得重复派发（这是修掉「每轮刷屏、一直占并发」的核心）
+            up.dispatch()
+            await asyncio.sleep(0.2)
+            up._active.discard(path)
+            assert calls["n"] == 1, f"退避期内不该再被派发，实际被处理 {calls['n']} 次"
+
+            # 第 2 次（把退避时间清零，模拟时间到）：仍退避
+            store.set(path, next_retry_at=0)
+            up.dispatch()
+            await asyncio.sleep(0.2)
+            up._active.discard(path)
+            assert calls["n"] == 2, calls
+            assert store.get(path)["status"] == "待重试", store.get(path)
+
+            # 第 3 次：达到上限 → 「错误」，之后不再被派发
+            store.set(path, next_retry_at=0)
+            up.dispatch()
+            await asyncio.sleep(0.2)
+            up._active.discard(path)
+            rec = store.get(path)
+            assert calls["n"] == 3, calls
+            assert rec["status"] == "错误", f"连续 3 次异常应停止自动重试，实得 {rec['status']!r}"
+            assert "文件读不了" in (rec["message"] or ""), rec["message"]
+            up.dispatch()
+            await asyncio.sleep(0.2)
+            up._active.discard(path)
+            assert calls["n"] == 3, f"判「错误」后不该再重试，实际 {calls['n']} 次"
+        finally:
+            upmod.sha1_of = real
+
+        # 错误项走正常恢复路径：界面「失败项重新入队」→ 回到待处理
+        assert store.requeue() >= 1
+        assert store.get(path)["status"] == "待处理", store.get(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[22] 未预期异常：先退避重试（退避期内不重复派发，不再每轮刷屏占并发），"
+                "连续 3 次才置「错误」停止；错误项能被「失败项重新入队」救回")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -1079,6 +1149,7 @@ async def main():
     case_upload_mark()
     case_config_roundtrip()
     await case_status_selfheal()
+    await case_unexpected_error_stops_retry()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

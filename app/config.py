@@ -145,6 +145,7 @@ def ensure_config() -> Path:
             shutil.copyfile(EXAMPLE_PATH, CONFIG_PATH)
         else:
             CONFIG_PATH.write_text(yaml.safe_dump(DEFAULTS, allow_unicode=True), encoding="utf-8")
+    _chmod_private(CONFIG_PATH)
     return CONFIG_PATH
 
 
@@ -541,6 +542,14 @@ def form_payload(cfg: dict) -> dict:
     return {"groups": groups, "path": str(CONFIG_PATH)}
 
 
+def _chmod_private(path, mode: int = 0o600) -> None:
+    """把含凭据的文件收紧到 600（尽力而为；不支持的文件系统上静默跳过）。"""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def save(cfg: dict) -> Path:
     """把当前内存配置落盘（原子写 + 保留一份 .bak）。"""
     ensure_config()
@@ -549,11 +558,15 @@ def save(cfg: dict) -> Path:
             + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False))
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(body, encoding="utf-8")
+    # .tmp 里已经是完整凭据，别等 os.replace 之后才收紧
+    _chmod_private(tmp)
+    backup = path.parent / (path.name + ".bak")
     if path.exists():
-        shutil.copyfile(path, path.parent / (path.name + ".bak"))
+        shutil.copyfile(path, backup)
+        # shutil.copyfile 用默认 umask 建新文件（通常 644），并把 cookie /
+        # 面板密码 / notify 凭据一起复制进去 —— 备份比正本还宽松，
+        # 同机其他进程能直接读到。必须跟着收紧。
+        _chmod_private(backup)
     os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _chmod_private(path)
     return path
