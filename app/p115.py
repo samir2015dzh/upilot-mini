@@ -81,7 +81,26 @@ def is_transient(exc: Exception) -> bool:
 
 
 def normalize_cloud_path(p: str) -> str:
-    return "/" + "/".join(x for x in (p or "").replace("\\", "/").split("/") if x)
+    """云端路径规范化：合并连续 `/`、丢弃 `.` 与 `..` 段。
+
+    必须解析 `..`（不是只折叠 `/`）。本函数是**发给 115 之前的最后一道**，
+    而配置侧有三处能带进 `..`：`paths.map` 的 `to`、`paths.target_root`、
+    以及手改过的 config.yaml。原实现只做 `/` 折叠，`..` 会原样打到云端 ——
+    实测 `TVs => /TVs/../../etc` 会算出目标目录 `/TVs/../../etc/Show`，
+    于是云端建出带 `..` 的怪目录，而 symedia 按正常路径建 strm，
+    **文件传上去了却永远不出现在媒体库**，界面上毫无提示。
+    退到根再遇到 `..` 就忽略（不越界），保证结果始终是绝对的、不含 `.`/`..`。
+    """
+    out: list[str] = []
+    for seg in (p or "").replace("\\", "/").split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    return "/" + "/".join(out)
 
 
 def parse_dir_cid(resp) -> int | None:

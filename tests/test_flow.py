@@ -26,7 +26,7 @@ sys.path.insert(0, APP)
 import config as cfgmod          # noqa: E402
 import scanner                   # noqa: E402
 import webui                     # noqa: E402
-from p115 import P115, StubP115, resolve_upload_target   # noqa: E402
+from p115 import P115, StubP115, normalize_cloud_path, resolve_upload_target   # noqa: E402
 from store import Store          # noqa: E402
 from uploader import Uploader, sha1_of   # noqa: E402
 
@@ -2271,6 +2271,125 @@ def case_coerce_finite_values():
                 "全部文件、正常值与越界校验不受影响、apply_values 拒绝且不脏内存、落盘无 .inf/.nan")
 
 
+def case_cloud_path_dotdot_guard():
+    """[35] 云端路径不许带 `..` 段 —— 两层拦截。
+
+    实测（修复前）：面板 `paths.map` 写 `TVs => /TVs/../../etc` 一路通过
+    `coerce` → `apply_values` → 落盘 → 重载，最后 `resolve_upload_target` 算出
+    目标目录 `/TVs/../../etc/Show`，而 `normalize_cloud_path` **只折叠 `/`、不解析 `..`**
+    → 原样发给 115，云端建出带 `..` 的怪目录；symedia 仍按 `/TVs/...` 建 strm
+    ⇒ **文件传上去了却永远不出现在媒体库**，界面上一点提示都没有。
+
+    两层拦截：
+      1. `coerce(map)` 直接拒绝带 `..` 的 `from`/`to`（给用户明确报错）；
+      2. `normalize_cloud_path` 解析 `..`（兜住「手改 config.yaml」「老配置」「target_root」）。
+    注意第 2 层不能只折叠 `/`：它是发给 115 之前的最后一道。
+    """
+    from pathlib import Path
+
+    # ---- 第 2 层：normalize_cloud_path 必须解析 .. ----
+    norm_cases = [
+        ("/a/../b", "/b"), ("/../b", "/b"), ("a/../../b", "/b"),
+        ("/a/b/../../../c", "/c"), ("//a///b//", "/a/b"),
+        ("/UPILOT-mini/..", "/"), ("/", "/"), ("", "/"),
+        ("/TVs/../../etc/Show", "/etc/Show"), ("/UPILOT-mini/../evil", "/evil"),
+        # 正常路径必须一字不变（回归红线，含中文/空格/点号）
+        ("/UPILOT-mini/TVs/Show", "/UPILOT-mini/TVs/Show"),
+        ("/OtherAnime/葬送的芙莉莲", "/OtherAnime/葬送的芙莉莲"),
+        ("/TVs/甲剧 (2026) [tmdbid=100001]/Season 01",
+         "/TVs/甲剧 (2026) [tmdbid=100001]/Season 01"),
+        ("/a.b/c..d", "/a.b/c..d"),      # 含 .. 但不是独立段 → 保留
+        ("/a/.../b", "/a/.../b"),        # 三个点不是 ..
+    ]
+    for src, want in norm_cases:
+        got = normalize_cloud_path(src)
+        assert got == want, f"normalize_cloud_path({src!r}) → {got!r}，期望 {want!r}"
+    # 结果永远绝对且不含 . / ..
+    for src in ("a", "./a", "a/./b/../c", "../../x"):
+        out = normalize_cloud_path(src)
+        assert out.startswith("/"), f"{src!r} → {out!r} 不是绝对路径"
+        assert not any(s in (".", "..") for s in out.split("/")), \
+            f"{src!r} → {out!r} 仍含 . 或 .."
+
+    # ---- 第 1 层：面板 map 必须明确拒绝 ----
+    field = cfgmod.find_field("paths.map")
+    assert field, "面板里没有 paths.map 字段"
+    for raw in ("TVs => /TVs/../../etc", "TVs => ..", "TVs => /../etc",
+                "../TVs => /Safe", "TVs => /a/../../b", "a/.. => /ok"):
+        try:
+            got = cfgmod.coerce(field, raw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{raw!r} 被接受：{got!r}（会原样传到云端）")
+
+    # 正常映射照旧（不能被这轮改动碰坏）
+    good = [
+        ("TVs => /TVs", [{"from": "TVs", "to": "/TVs"}]),
+        ("Movies/Others => /Movies/Others",
+         [{"from": "Movies/Others", "to": "/Movies/Others"}]),
+        ("Anime => /OtherAnime", [{"from": "Anime", "to": "/OtherAnime"}]),
+        ("TVs => TVs", [{"from": "TVs", "to": "/TVs"}]),              # 自动补前导 /
+        ("TVs => /a.b/c..d", [{"from": "TVs", "to": "/a.b/c..d"}]),   # 非独立 ..
+        ("# 注释\nTVs => /TVs", [{"from": "TVs", "to": "/TVs"}]),
+        ("", []),
+    ]
+    for raw, want in good:
+        got = cfgmod.coerce(field, raw)
+        assert got == want, f"coerce({raw!r}) → {got!r}，期望 {want!r}"
+
+    # ---- 端到端：面板入口拒绝 + 内存不脏 + 手改场景被兜住 ----
+    tmp = tempfile.mkdtemp(prefix="upilot-path-")
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+    cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+    try:
+        cfg = copy.deepcopy(cfgmod.DEFAULTS)
+        cfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        cfg["paths"]["source"] = "/media/source"
+        cfg["paths"]["target_root"] = "/UPILOT-mini"
+        cfgmod.save(cfg)
+
+        before = copy.deepcopy(cfg["paths"]["map"])
+        try:
+            cfgmod.apply_values(cfg, {"paths.map": "TVs => /TVs/../../etc"})
+            raise AssertionError("apply_values 接受了带 .. 的映射")
+        except ValueError:
+            pass
+        assert cfg["paths"]["map"] == before, "非法 map 改到了内存"
+
+        # 手改 config.yaml / 老配置：resolve 出来的路径经 normalize 必须收敛
+        manual = [
+            ("map.to 含 ..", [{"from": "TVs", "to": "/TVs/../../etc"}],
+             "/UPILOT-mini", "/media/source/TVs/Show/S01E01.mkv", "/etc/Show"),
+            ("target_root 含 ..", None, "/UPILOT-mini/../evil",
+             "/media/source/X/a.mkv", "/evil/X"),
+            ("map.from 含 ..", [{"from": "../TVs", "to": "/Safe"}],
+             "/UPILOT-mini", "/media/source/TVs/a.mkv", "/UPILOT-mini/TVs"),
+        ]
+        for label, mapping, root, fp, want in manual:
+            out = resolve_upload_target(fp, cfg["paths"]["source"], root, mapping)
+            safe = normalize_cloud_path(out)
+            assert ".." not in safe.split("/"), f"{label}：{safe!r} 仍含 .."
+            assert safe == want, f"{label}：{safe!r}，期望 {want!r}"
+
+        # 正常映射端到端仍然正确
+        cfgmod.apply_values(cfg, {"paths.map": "TVs => /TVs\nAnime => /OtherAnime"})
+        cfgmod.save(cfg)
+        back = cfgmod.load()
+        out = resolve_upload_target("/media/source/Anime/葬送的芙莉莲/E01.mkv",
+                                    back["paths"]["source"], back["paths"]["target_root"],
+                                    back["paths"]["map"])
+        assert out == "/OtherAnime/葬送的芙莉莲", out
+    finally:
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    PASS.append("[35] 云端路径不许带 ..：面板 map 明确拒绝 6 组注入（from/to 两侧）、"
+                "normalize_cloud_path 解析 ..（16 组，含「含点号但非独立段」必须保留）、"
+                "手改 config.yaml / target_root 带 .. 也被最后一道收敛、"
+                "正常映射与中文/空格路径一字不变")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -2304,6 +2423,7 @@ async def main():
     case_a2a_token_resolution()
     await case_request_body_hardening()
     case_coerce_finite_values()
+    case_cloud_path_dotdot_guard()
     await case_cleanup_previous_versions()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):

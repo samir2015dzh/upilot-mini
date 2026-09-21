@@ -552,6 +552,16 @@ def coerce(field: dict, raw) -> object:
                 raise ValueError(f"{label}：缺少 115 目录 —— {text}")
             if not dst.startswith("/"):
                 dst = "/" + dst
+            # 拒绝 `..` 段（两边都查）。它不会读宿主机文件（那是本地路径的事），
+            # 但会被当成**字面目录名**发给 115：实测 `TVs => /TVs/../../etc` 一路通过
+            # coerce → apply_values → 落盘 → 重载，最后算出目标目录
+            # `/TVs/../../etc/Show`（`normalize_cloud_path` 只折叠 `/`，不解析 `..`）。
+            # 云端于是建出怪目录，而 symedia 按 `/TVs/...` 建 strm
+            # ⇒ **文件传上去了却永远不出现在媒体库**，界面上一点提示都没有。
+            # 同理 `from` 含 `..` 时前缀永不命中，会静默回落到 target_root。
+            if any(seg == ".." for seg in f"{src}/{dst}".split("/")):
+                raise ValueError(
+                    f"{label}：路径里不能出现 ..（会原样传到云端、建出对不上的目录）—— {text}")
             out.append({"from": src, "to": dst})
         return out
     if kind == "select":
