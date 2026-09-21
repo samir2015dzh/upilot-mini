@@ -11,9 +11,15 @@
 ## 0. 部署前状态
 ```bash
 docker inspect upilot-mini --format '镜像={{.Image}} 启动={{.State.StartedAt}}'
-md5sum /home/<user>/upilot-mini/config.yaml
+md5sum /home/<user>/upilot-mini/config/config.yaml
 docker ps --format '{{.Names}}' | wc -l
 ```
+（期望：镜像 `3331d7b9f628…`；md5 `519ff7ac96e6fdc4a2e2d8f8207a03e9`。
+> ⚠️ **路径更正（第二十二轮实测）**：早先写的 `/home/<user>/upilot-mini/config.yaml`
+> 宿主上**不存在**（笔误）。真实路径是 **`/home/<user>/upilot-mini/config/config.yaml`**
+> —— compose 把宿主 `/home/<user>/upilot-mini/config` 挂到容器 `/config`。
+> 另：容器数当时是 **17**（含新增的 `fbq-sandbox`/`fb-sandbox`），不是 15 —— 以
+> 「兄弟容器 uptime 未变」为准，别用绝对条数卡。）
 （期望：镜像 `3331d7b9f628…`；md5 `519ff7ac96e6fdc4a2e2d8f8207a03e9`；15 个容器）
 
 ## 1. 拉镜像
@@ -59,7 +65,7 @@ docker logs --since 12m upilot-mini 2>&1 | grep -ac "has no attribute\|Traceback
 
 ## 7. 部署后核对
 ```bash
-md5sum /home/<user>/upilot-mini/config.yaml
+md5sum /home/<user>/upilot-mini/config/config.yaml
 docker ps --format '{{.Names}} {{.Status}}'
 ```
 （期望：md5 仍为 `519ff7ac96e6fdc4a2e2d8f8207a03e9`；兄弟容器 uptime 未变）
