@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import urllib.error
 import urllib.request
 
 import config as cfgmod
@@ -44,6 +45,11 @@ def main() -> int:
             if body.strip() == b"ok":
                 return 0
             last = f"端口 {port} 返回了非 ok 内容：{body[:60]!r}"
+        except urllib.error.HTTPError as exc:
+            # 503 = 服务在、主循环卡住了（见 webui.health_status）；换端口也没用，直接判失败
+            detail = exc.read()[:120].decode("utf-8", "replace")
+            print(f"health check failed: 端口 {port} 返回 {exc.code}：{detail}")
+            return 1
         except Exception as exc:  # noqa: BLE001
             last = f"端口 {port} 连不上：{exc}"
     print("health check failed:", last)

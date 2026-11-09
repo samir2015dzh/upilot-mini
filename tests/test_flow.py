@@ -4121,6 +4121,317 @@ async def case_oss_endpoint_configurable():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def case_compose_log_rotation():
+    """[58] compose 示例带日志轮转：Docker 默认 json-file 不限大小，纯秒传长期等待时日志会一直涨。"""
+    import yaml
+
+    root = os.path.dirname(APP)
+    doc = yaml.safe_load(open(os.path.join(root, "docker-compose.yml"), encoding="utf-8"))
+    for name, svc in doc["services"].items():
+        lg = svc.get("logging") or {}
+        opts = lg.get("options") or {}
+        assert lg.get("driver") == "json-file", (name, lg)
+        assert str(opts.get("max-size", "")).endswith("m"), (name, opts)
+        assert int(opts.get("max-file", 0)) >= 2, (name, opts)
+    PASS.append("[58] docker-compose.yml 带日志轮转（json-file，max-size 10m × max-file 3）")
+
+
+async def case_rapid_age_backoff():
+    """[59] 纯秒传长间隔按「第一次未命中至今」逐级放慢：15 分钟 → 1 小时（满 1 天）→ 6 小时（满 7 天）。
+
+    原来不管等了多久都固定 long_interval_seconds：挂几周的老片每 15 分钟问一次，
+    1000 个这样的文件就是持续不断的请求流。
+    """
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=60, fail_first=999,
+                                             mode="rapid_only", long_interval=900)
+    try:
+        assert cfg["retry"]["long_backoff"], "默认应带逐级放慢的档位"
+        big = write_file(src, "剧/S01E01.mkv", 2 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        await up._process(big)                         # 第 1 次未命中，记下 first_failed_at
+
+        async def interval_at(age_hours: float, uploader=up) -> int:
+            store.set(big, status="待重试", next_retry_at=0, retry_count=10,
+                      first_failed_at=time.time() - age_hours * 3600)
+            await uploader._process(big)
+            rec = store.get(big)
+            return round(rec["next_retry_at"] - time.time())
+
+        got = {h: await interval_at(h) for h in (1, 25, 24 * 8)}
+        assert abs(got[1] - 900) <= 2, got            # 头 24 小时：仍是 15 分钟
+        assert abs(got[25] - 3600) <= 2, got          # 满 1 天：每小时
+        assert abs(got[24 * 8] - 21600) <= 2, got     # 满 7 天：每 6 小时
+
+        # 用户自己调得比档位更慢：以用户为准（只会更慢，不会更快）
+        cfg["retry"]["long_interval_seconds"] = 7200
+        slow = Uploader(cfg, store, mgr)
+        assert abs(await interval_at(25, slow) - 7200) <= 2
+        # long_backoff: [] → 旧行为：永远按 long_interval_seconds
+        cfg["retry"]["long_interval_seconds"] = 900
+        cfg["retry"]["long_backoff"] = []
+        legacy = Uploader(cfg, store, mgr)
+        assert abs(await interval_at(24 * 30, legacy) - 900) <= 2
+        # 写错的档位被跳过，不会把重试停掉
+        assert upmod.long_retry_interval(900, [{"after_hours": "x"}, [1], None, [-1, 5],
+                                               [2, 0], [float("nan"), 99999], [24, 3600]],
+                                         25 * 3600) == 3600
+        assert upmod.long_retry_interval(900, [[24, 3600]], 3600) == 900
+        PASS.append(f"[59] 纯秒传长间隔按等待时长放慢：1h→{got[1]}s，25h→{got[25]}s，"
+                    f"8 天→{got[24 * 8]}s；用户值更慢时以用户为准；long_backoff: [] 恢复旧行为")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _ListHandler:
+    def __init__(self):
+        import logging
+        self.records: list = []
+        self.h = logging.Handler(level=logging.DEBUG)
+        self.h.emit = self.records.append
+
+    def __enter__(self):
+        import logging
+        self.lg = logging.getLogger("upilot")
+        self.old = self.lg.level
+        self.lg.setLevel(logging.DEBUG)
+        self.lg.addHandler(self.h)
+        return self.records
+
+    def __exit__(self, *exc):
+        self.lg.removeHandler(self.h)
+        self.lg.setLevel(self.old)
+
+
+async def case_miss_logs_summarized():
+    """[60] 重复的「秒传未命中」降为 DEBUG，主循环每轮打一行汇总。
+
+    原来每个待命中文件每次校验一行 INFO：1000 个文件每天约 10 万行。
+    """
+    import logging
+
+    import main as mainmod
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=60, fail_first=999,
+                                             mode="rapid_only", long_interval=900)
+    try:
+        upmod.take_rapid_summary()
+        a = write_file(src, "a/x.mkv", 2 * 1024 * 1024)
+        b = write_file(src, "b/y.mkv", 2 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        with _ListHandler() as recs:
+            for p in (a, b):
+                await up._process(p)                       # 第 1 次未命中 → INFO
+            for _ in range(3):
+                for p in (a, b):
+                    store.set(p, next_retry_at=0)
+                    await up._process(p)                   # 之后的未命中 → DEBUG
+        miss = [r for r in recs if r.name == "upilot.upload" and "未命中" in r.getMessage()]
+        assert len(miss) == 8, [r.getMessage() for r in miss]
+        info = [r for r in miss if r.levelno >= logging.INFO]
+        assert len(info) == 2 and all("第 1 次" in r.getMessage() for r in info), \
+            [r.getMessage() for r in info]
+        s = upmod.take_rapid_summary()
+        assert s == {"checked": 8, "hit": 0, "miss": 8}, s
+        assert upmod.take_rapid_summary()["checked"] == 0, "取走后应清零"
+
+        # 主循环：每轮开头把上一轮的计数打成一行 INFO 汇总
+        for p in (a, b):
+            store.set(p, next_retry_at=0)
+        cfg["scan"]["interval_seconds"] = 2
+        stop = asyncio.Event()
+        with _ListHandler() as recs:
+            svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=True, stop=stop))
+            for _ in range(80):
+                await asyncio.sleep(0.1)
+                if any("秒传校验汇总" in r.getMessage() for r in recs):
+                    break
+            stop.set()
+            await asyncio.wait_for(svc, timeout=15)
+        summ = [r for r in recs if "秒传校验汇总" in r.getMessage()]
+        assert summ and summ[0].levelno == logging.INFO, [r.getMessage() for r in recs][-20:]
+        assert "未命中" in summ[0].getMessage(), summ[0].getMessage()
+        per_file_info = [r for r in recs if r.levelno >= logging.INFO
+                         and "未命中" in r.getMessage() and "汇总" not in r.getMessage()]
+        assert not per_file_info, [r.getMessage() for r in per_file_info]
+        PASS.append(f"[60] 重复的秒传未命中降为 DEBUG（8 次未命中只有首次 2 行 INFO），"
+                    f"主循环每轮一行汇总：「{summ[0].getMessage()}」")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_gzip_and_hidden_pause():
+    """[61] 面板 API 响应 gzip（客户端接受才压）；标签页在后台时前端停止轮询。"""
+    import gzip as gz
+    from pathlib import Path
+
+    js = open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+    assert "visibilitychange" in js, "前端没监听 visibilitychange"
+    assert "if (!S.auto || document.hidden) return;" in js, "轮询没在后台标签页暂停"
+
+    assert webui.accepts_gzip("gzip, deflate, br") and webui.accepts_gzip("br;q=1, *;q=0.5")
+    assert not webui.accepts_gzip("gzip;q=0") and not webui.accepts_gzip("") \
+        and not webui.accepts_gzip(None) and not webui.accepts_gzip("identity")
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    srv = None
+    try:
+        cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+        cfgmod.PORT_FILE = Path(tmp) / ".http_port"
+        for i in range(60):
+            write_file(src, f"剧{i}/S01E{i:02d}.mkv", 1024)
+        scanner.scan_once(store, cfg)
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0, "auth": {"enabled": False}}
+        srv = webui.serve(cfg, store, {"scan_rounds": 0, "dry_run": True})
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def get(path, enc=None):
+            req = urllib.request.Request(base + path)
+            if enc is not None:
+                req.add_header("Accept-Encoding", enc)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.headers, r.read()
+
+        h_plain, plain = get("/api/status")
+        assert h_plain.get("Content-Encoding") is None, dict(h_plain)
+        h_gz, zipped = get("/api/status", "gzip, deflate")
+        assert h_gz.get("Content-Encoding") == "gzip", dict(h_gz)
+        assert "Accept-Encoding" in (h_gz.get("Vary") or ""), dict(h_gz)
+        assert int(h_gz["Content-Length"]) == len(zipped)
+        a, b = json.loads(gz.decompress(zipped)), json.loads(plain)
+        a.pop("now", None), b.pop("now", None)
+        assert a.keys() == b.keys()
+        h_q0, _ = get("/api/status", "gzip;q=0")
+        assert h_q0.get("Content-Encoding") is None
+        h_js, js_body = get("/static/app.js", "gzip")
+        assert h_js.get("Content-Encoding") == "gzip" and b"visibilitychange" in gz.decompress(js_body)
+        h_health, body = get("/health", "gzip")
+        assert h_health.get("Content-Encoding") is None and body == b"ok"     # 太小不压
+        PASS.append(f"[61] 面板响应 gzip：/api/status {len(plain)} → {len(zipped)} 字节；"
+                    f"q=0 / 不带头不压；标签页在后台时前端暂停轮询")
+    finally:
+        if srv:
+            srv.shutdown()
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_health_heartbeat():
+    """[62] /health 带主循环心跳：主循环卡住超过 http.health_stall_seconds 就回 503，
+    Docker HEALTHCHECK（healthcheck.py）随之失败。原来 HTTP 线程活着就永远 ok。"""
+    from pathlib import Path
+
+    import healthcheck
+    import main as mainmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    srv = None
+    try:
+        cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+        cfgmod.PORT_FILE = Path(tmp) / ".http_port"
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": False}, "health_stall_seconds": 60}
+        state = {"scan_rounds": 0, "dry_run": True}
+        srv = webui.serve(cfg, store, state)
+        port = srv.server_address[1]
+        cfgmod.PORT_FILE.write_text(str(port), encoding="utf-8")
+        saved = copy.deepcopy(cfg)
+        saved["http"]["port"] = port
+        cfgmod.save(saved)
+
+        def health():
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read()
+
+        assert health() == (200, b"ok")                     # 还没打过心跳（启动中）
+        mainmod.beat(state)
+        assert health() == (200, b"ok")
+        assert healthcheck.main() == 0
+        state["heartbeat"] = time.monotonic() - 120          # 主循环 2 分钟没动
+        code, body = health()
+        assert code == 503 and body.startswith(b"stalled"), (code, body)
+        assert healthcheck.main() == 1, "主循环卡住时 HEALTHCHECK 必须失败"
+        ok, why = webui.health_status({"http": {"health_stall_seconds": 600}}, state)
+        assert ok, why                                       # 阈值内不误报
+    finally:
+        if srv:
+            srv.shutdown()
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+
+    # 真跑主循环：等待期间心跳也在走（不能只在每轮开头打，否则长扫描间隔会被误判）
+    try:
+        cfg["http"]["enabled"] = False
+        cfg["scan"]["interval_seconds"] = 3600
+        holder: dict = {}
+        real_start = mainmod.start_http
+
+        def spy(c, s, st):
+            holder["state"] = st
+            return None
+
+        mainmod.start_http = spy
+        stop = asyncio.Event()
+        svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=True, stop=stop))
+        await asyncio.sleep(0.5)
+        hb1 = holder["state"]["heartbeat"]
+        await asyncio.sleep(1.2)
+        hb2 = holder["state"]["heartbeat"]
+        stop.set()
+        await asyncio.wait_for(svc, timeout=10)
+        assert hb2 > hb1, "等待下一轮期间心跳没更新"
+        PASS.append("[62] /health 带主循环心跳：卡住超过阈值回 503 且 healthcheck 失败；"
+                    "等待期间每 0.5 秒续一次心跳，长扫描间隔不误报")
+    finally:
+        mainmod.start_http = real_start
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_dockerfile_precompile():
+    """[63] 镜像构建时预编译 app 目录；依赖的 .pyc 保留（不加 --no-compile，否则启动慢 0.45 秒）。"""
+    root = os.path.dirname(APP)
+    df = open(os.path.join(root, "Dockerfile"), encoding="utf-8").read()
+    lines = [ln.strip() for ln in df.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    copy_i = next(i for i, ln in enumerate(lines) if ln.startswith("COPY app/"))
+    comp = [i for i, ln in enumerate(lines) if "compileall" in ln and "/app/app" in ln]
+    assert comp and comp[0] > copy_i, "compileall 必须在 COPY app/ 之后"
+    assert "--no-compile" not in df, "依赖的 .pyc 要保留"
+    assert any(ln.startswith("HEALTHCHECK") for ln in lines) and "healthcheck.py" in df
+    PASS.append("[63] Dockerfile 在 COPY app/ 之后 compileall 预编译 app，依赖 .pyc 保留")
+
+
+def case_stats_covering_index():
+    """[64] 概览统计的聚合查询走覆盖索引（不回表）；老库打开自动补上。"""
+    import sqlite3
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-")
+    try:
+        db = os.path.join(tmp, "old.db")
+        con = sqlite3.connect(db)
+        con.executescript(store_store.DDL.split("-- 面板")[0])
+        con.commit()
+        con.close()
+        st = Store(db)
+        names = {r[0] for r in st.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "idx_stats" in names, names
+        for sql in ("SELECT status, COUNT(*) c, COALESCE(SUM(size),0) b FROM files GROUP BY status",
+                    "SELECT COUNT(*) c, COALESCE(SUM(size),0) b FROM files WHERE upload_mode='rapid'",
+                    "SELECT COALESCE(SUM(retry_count),0) r FROM files"):
+            plan = " ".join(str(tuple(r)) for r in st.db.execute("EXPLAIN QUERY PLAN " + sql))
+            assert "COVERING INDEX idx_stats" in plan, (sql, plan)
+        assert st.stats()["total"]["count"] == 0
+        st.db.close()
+        PASS.append("[64] stats() 的聚合查询走覆盖索引 idx_stats（只扫索引不回表），老库自动补")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -4174,6 +4485,13 @@ async def main():
     await case_scan_batched()
     await case_graceful_shutdown()
     await case_oss_endpoint_configurable()
+    case_compose_log_rotation()
+    await case_rapid_age_backoff()
+    await case_miss_logs_summarized()
+    await case_gzip_and_hidden_pause()
+    await case_health_heartbeat()
+    case_dockerfile_precompile()
+    case_stats_covering_index()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

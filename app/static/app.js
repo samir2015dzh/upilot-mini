@@ -566,8 +566,13 @@ window.addEventListener("hashchange", () => {
 });
 refreshOverview();
 refreshLogs();
+// 标签页切到后台就不再拉数据（每次 /api/status 都要跑一遍统计查询），切回来立刻刷新一次。
+// 做法参考 https://github.com/z3nghoul/z3n1337.dev/blob/0d3c0d6bd4e84e7959e86869e7db464faa6026ba/js/poll.js（visibilitychange + document.hidden）
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && S.auto) S.lastFetch = 0;     // 下一个 1 秒节拍就会刷新
+});
 setInterval(() => {
-  if (!S.auto) return;
+  if (!S.auto || document.hidden) return;
   if (Date.now() - S.lastFetch >= S.refreshMs) {
     S.lastFetch = Date.now();
     if (S.tab === "tasks") loadTasks();
@@ -576,4 +581,4 @@ setInterval(() => {
     renderOverview(S.overview);      // 用缓存重绘，倒计时/相对时间保持鲜活
   }
 }, 1000);
-setInterval(() => { if (S.tab === "settings") refreshLogs(); }, 15000);
+setInterval(() => { if (S.tab === "settings" && !document.hidden) refreshLogs(); }, 15000);

@@ -110,7 +110,12 @@ DEFAULTS: dict = {
         "oss_endpoint": "https://oss-cn-shenzhen.aliyuncs.com",
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
-              "long_interval_seconds": 900},
+              "long_interval_seconds": 900,
+              # 仅 rapid_only：长间隔按「第一次未命中至今」逐级放慢（只会更慢，不会更快）。
+              # 默认：头 24 小时按 long_interval_seconds（15 分钟），满 24 小时每 1 小时，
+              # 满 7 天每 6 小时。设成 [] 恢复旧行为（永远按 long_interval_seconds）。
+              "long_backoff": [{"after_hours": 24, "interval_seconds": 3600},
+                               {"after_hours": 168, "interval_seconds": 21600}]},
     "notify": {
         # 秒传命中 / 分块上传完成后，POST 一个事件给别的程序。默认按 CloudDrive2 的
         # file_notify 契约发，symedia 的「链接同步（Webhook 模式）」就认这个格式：
@@ -137,6 +142,10 @@ DEFAULTS: dict = {
         # 登录页底部显示的对外地址（可选，空 = 不显示）。面板上有这一项，
         # DEFAULTS 里补上，免得 form_payload 每次都要靠 _dig 兜底读空串。
         "public_url": "",
+        # 主循环心跳超过这么多秒没更新，/health 就返回 503（容器变 unhealthy）。
+        # 正常情况下等待期间每 0.5 秒更新一次，一轮扫描+派发通常不到几秒；
+        # 给 10 分钟是为了网络挂载上的大目录扫描不被误判。
+        "health_stall_seconds": 600,
         # 反代/暴露到内网时打开：页面与 /api/* 需要 HTTP Basic 或 ?token=…
         # /health 始终放行（容器 HEALTHCHECK 在容器内直连）
         "auth": {"enabled": False, "mode": "basic", "username": "admin",
@@ -395,7 +404,7 @@ FIELD_GROUPS: list[dict] = [
          "hint": "问完这么多次还没等到，就换成下面的慢节奏继续等"},
         {"key": "retry.long_interval_seconds", "label": "之后每隔几秒问一次", "type": "int",
          "min": 1, "max": 86400,
-         "hint": "默认 900 秒（15 分钟）。「只秒传」模式会一直问下去，不会放弃"},
+         "hint": "默认 900 秒（15 分钟）。「只秒传」模式会一直问下去，不会放弃；等满 1 天自动放慢到每小时、满 7 天每 6 小时（config.yaml 的 retry.long_backoff）"},
         {"key": "retry.max_hours", "label": "最多等多久就放弃（小时）", "type": "float", "min": 0,
          "hint": "只有「先试秒传，等不到就真上传」这种模式用得上"},
     ]},

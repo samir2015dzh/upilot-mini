@@ -70,6 +70,12 @@ retry:
   max_count: 5                  # rapid_only：前 N 轮用短间隔；rapid_then_upload：超过即算重试耗尽
   max_hours: 12                 # 仅 rapid_then_upload：累计超过这么多小时就放弃重试，转普通上传
   long_interval_seconds: 900    # 仅 rapid_only：短间隔用完后改成这个节奏继续等（默认 15 分钟）
+  # 仅 rapid_only：等得越久问得越慢（按第一次未命中至今计算，只会比上一行更慢）。
+  # 不写就用下面这组默认值：头 24 小时每 15 分钟，满 24 小时每 1 小时，满 7 天每 6 小时。
+  # 想要旧行为（永远按 long_interval_seconds）就写 long_backoff: []
+  # long_backoff:
+  #   - {after_hours: 24, interval_seconds: 3600}
+  #   - {after_hours: 168, interval_seconds: 21600}
 
 notify:
   # 秒传命中 / 分块上传完成后，通知别的程序（默认按 CloudDrive2 file_notify 契约，
@@ -90,6 +96,8 @@ http:
   enabled: true                 # Web 仪表盘 + JSON API
   host: "0.0.0.0"
   port: 9844
+  # 主循环卡住超过这么多秒，/health 返回 503，Docker 把容器标成 unhealthy（默认 600）
+  health_stall_seconds: 600
   auth:
     enabled: false              # 要反代/暴露到内网时改成 true
     mode: basic                 # basic = 浏览器弹原生框；form = 站内登录页 /login（反代推荐）
