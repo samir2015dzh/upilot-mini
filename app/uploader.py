@@ -86,11 +86,14 @@ def _same_file(path: str, record: dict) -> bool:
         st = os.stat(path)
     except OSError:
         return False
-    try:
-        return (int(record.get("size") or -1) == int(st.st_size)
-                and abs(float(record.get("mtime") or 0) - st.st_mtime) <= 1e-6)
-    except (TypeError, ValueError):
+    size, mtime = record.get("size"), record.get("mtime")
+    if size is None or mtime is None:
         return True                      # 记录里没有可比的值：不拦（与旧行为一致）
+    try:
+        # 注意别写成 `size or -1`：0 字节文件会被误判成「变了」，永远算不完 SHA1
+        return int(size) == int(st.st_size) and abs(float(mtime) - st.st_mtime) <= 1e-6
+    except (TypeError, ValueError):
+        return True
 
 
 async def sha1_of(path: str, record: dict, store) -> str | None:

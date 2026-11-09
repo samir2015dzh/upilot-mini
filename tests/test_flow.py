@@ -3677,6 +3677,11 @@ async def case_sha1_off_event_loop():
         # 8 块 × 50ms = 0.4s；事件循环没被按住的话 10ms 一跳能跳 20+ 次（按住时只有 1~2 次）
         assert ticks["n"] >= 15, f"算 SHA1 的 {spent:.2f}s 里事件循环只跑了 {ticks['n']} 轮"
 
+        # 0 字节文件：size=0 不能被当成「对不上」（否则永远在重新入队里打转）
+        empty = write_file(src, "剧集/S01/空.mkv", 0)
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(empty, store.get(empty), store) == real_hashlib.sha1(b"").hexdigest()
+
         # 算到一半文件被换掉（洗板重下）：结果不能落库，_process 要按新内容重新入队
         path2 = write_file(src, "剧集/S01/E10.mkv", 4 * 64 * 1024)
         scanner.scan_once(store, cfg)
