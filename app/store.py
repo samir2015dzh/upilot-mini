@@ -35,6 +35,9 @@ CREATE INDEX IF NOT EXISTS idx_status ON files(status, next_retry_at);
 -- 面板的「最近活动 / 任务明细」都按 updated_at 倒序翻页；没有索引时每次轮询全表排序
 -- （2 万条：翻到第 100 页 11ms、首页 1.8ms，面板每 3~5 秒刷一次）。老库在 executescript 时自动补上。
 CREATE INDEX IF NOT EXISTS idx_updated ON files(updated_at);
+-- 概览统计（stats()：按状态计数求和、秒传/普通计数、重试总数）全部只读这四列。
+-- 覆盖索引让这几条聚合只扫索引不回表：2 万条记录 5.1 → 3.0 ms/次（面板每 5 秒一次）。
+CREATE INDEX IF NOT EXISTS idx_stats ON files(status, size, upload_mode, retry_count);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 

@@ -56,7 +56,52 @@ MAX_SWEEP_PAGES = 200
 #   - _err_streak 清空 → 连续异常计数作废，退避重试永远到不了阈值。
 # 所以统一放模块级共享。sem 只在并发数真的变了时重建（容量要跟着配置走）。
 _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
-                 "sem_n": -1, "sweep_running": False}
+                 "sem_n": -1, "sweep_running": False,
+                 # 本轮秒传校验计数（主循环每轮取走一次、打一条汇总；见 take_rapid_summary）
+                 "rapid_round": {"checked": 0, "hit": 0, "miss": 0}}
+
+
+def take_rapid_summary() -> dict:
+    """取走并清零上一轮的秒传校验计数。主循环每轮调一次，有校验才打一行汇总日志 ——
+    逐个文件的「未命中」降成 DEBUG 之后，INFO 里仍能看出调度在正常工作。"""
+    cur = _SHARED["rapid_round"]
+    _SHARED["rapid_round"] = {"checked": 0, "hit": 0, "miss": 0}
+    return cur
+
+
+def _normalize_backoff(steps) -> list[tuple[float, int]]:
+    """retry.long_backoff → [(after_seconds, interval_seconds), …]，按年龄升序。
+
+    接受两种写法：[{after_hours: 24, interval_seconds: 3600}, …] 或 [[24, 3600], …]。
+    非法条目（非数字、负数、0 间隔）直接跳过 —— 配置写错不能把重试停掉。
+    """
+    out: list[tuple[float, int]] = []
+    for item in steps or []:
+        try:
+            if isinstance(item, dict):
+                hours, sec = item.get("after_hours"), item.get("interval_seconds")
+            else:
+                hours, sec = item[0], item[1]
+            hours, sec = float(hours), int(sec)
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if hours >= 0 and sec > 0 and hours == hours:      # hours == hours：排除 NaN
+            out.append((hours * 3600.0, sec))
+    return sorted(out)
+
+
+def long_retry_interval(base: int, steps, age_seconds: float) -> int:
+    """纯秒传长间隔：按「第一次未命中至今」的时长逐级放慢。
+
+    默认 15 分钟 →（满 24 小时）1 小时 →（满 7 天）6 小时。只会比 base 更慢：
+    用户自己把 long_interval_seconds 调得比档位还长时，以用户的为准。
+    retry.long_backoff 设成 [] 即恢复旧行为（永远按 long_interval_seconds）。
+    """
+    interval = int(base)
+    for after, sec in _normalize_backoff(steps):
+        if age_seconds >= after:
+            interval = max(interval, sec)
+    return interval
 
 
 def _sha1_file(path: str, total: int, on_progress, cancel: threading.Event) -> str | None:
@@ -171,6 +216,8 @@ class Uploader:
         self.mode = str(up.get("mode") or "rapid_then_upload")
         self.rapid_only = self.mode == "rapid_only"
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
+        # 长间隔按文件「等了多久」逐级放慢（见 long_retry_interval）。缺省档位见 config.DEFAULTS
+        self.long_backoff = rt.get("long_backoff", [])
         # 传完就删本地源文件（破坏性操作，默认关）
         self.delete_after = bool(up.get("delete_after_upload"))
         # 洗板：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
@@ -840,6 +887,9 @@ class Uploader:
                     await self.mgr.forget_pid(cloud_dir)
                     pid = await self.mgr.ensure_pid(cloud_dir)
                 hit, info = False, {"reason": msg}
+            tally = _SHARED["rapid_round"]
+            tally["checked"] += 1
+            tally["hit" if hit else "miss"] += 1
             if hit:
                 if self._file_changed_on_disk(path, rec):
                     # 命中的是旧内容；本地已是新内容。绝不能写「已上传」——
@@ -870,13 +920,22 @@ class Uploader:
             if self.rapid_only:
                 # 纯秒传：不设上限、不转普通上传。前 max_count 轮按短间隔试，之后放长间隔一直等
                 # （115 秒传是全站 hash 索引，等别人把同 hash 的片源传上云，这里就能零上行命中）
-                interval = self.retry_interval if rc <= self.retry_max_count else self.long_interval
+                # 短间隔用完后的长间隔再按「等了多久」逐级放慢：挂了几周的老片还按
+                # 15 分钟一问，1000 个文件就是持续不断的请求流，最容易招 115 风控。
+                if rc <= self.retry_max_count:
+                    interval = self.retry_interval
+                else:
+                    interval = long_retry_interval(self.long_interval, self.long_backoff,
+                                                   time.time() - first)
                 store.set(path, status="待重试", retry_count=rc, first_failed_at=first,
                           next_retry_at=time.time() + interval,
                           message=f"纯秒传：未命中（{info.get('reason', '')}），"
                                   f"{interval}s 后第 {rc} 次校验（只发校验请求）")
-                logger.info("纯秒传：未命中，%ds 后第 %d 次校验：%s",
-                            interval, rc, os.path.basename(path))
+                # 只有第一次未命中打 INFO；之后每次都一样的「还没有」降成 DEBUG，
+                # 由主循环每轮一行汇总代替（否则 1000 个待命中文件每天约 10 万行）。
+                logger.log(logging.INFO if rc == 1 else logging.DEBUG,
+                           "纯秒传：未命中，%ds 后第 %d 次校验：%s",
+                           interval, rc, os.path.basename(path))
                 return
 
             if rc > self.retry_max_count or aged >= self.retry_max_hours:
@@ -888,8 +947,9 @@ class Uploader:
             store.set(path, status="待重试", retry_count=rc, first_failed_at=first,
                       next_retry_at=nxt,
                       message=f"第 {rc} 次重试已排入队列（只重发校验请求）")
-            logger.info("秒传未命中，安排第 %d 次重试（%ds 后）：%s",
-                        rc, self.retry_interval, os.path.basename(path))
+            logger.log(logging.INFO if rc == 1 else logging.DEBUG,
+                       "秒传未命中，安排第 %d 次重试（%ds 后）：%s",
+                       rc, self.retry_interval, os.path.basename(path))
             return                                       # 到期由调度器重新拾起
 
         # 4) 分块上传（带断点续传）

@@ -956,7 +956,7 @@ class StubP115:
             logger.info("[dry-run] 秒传命中 %s（pid=%s，仅发过 %d 次校验请求）",
                         os.path.basename(file_path), pid, n)
             return True, {"status": 2, "file_id": f"stub{n}"}
-        logger.info("[dry-run] 秒传未命中 %s（第 %d 次，未上传任何数据）",
+        logger.debug("[dry-run] 秒传未命中 %s（第 %d 次，未上传任何数据）",   # 同真实客户端：逐条未命中不进 INFO
                     os.path.basename(file_path), n)
         return False, {"status": 1, "reason": "dry-run 模拟未命中"}
 

@@ -19,7 +19,7 @@ GET  /api/tasks      任务明细（status/q/limit/offset 翻页）
 GET  /api/task       单个文件详情（?path=）
 POST /api/task       单文件操作（retry / retry-now / upload-now / delete）
 GET  /api/logs       最近运行日志（环形缓冲）
-GET  /health         健康检查（供 Docker HEALTHCHECK 用，始终放行）
+GET  /health         健康检查（供 Docker HEALTHCHECK 用，始终放行；主循环心跳超时回 503）
 POST /api/scan       立刻触发一轮扫描
 POST /api/retry-now  把「待重试」的文件提前到期（马上再试秒传）
 POST /api/requeue    把「错误」的文件重新入队
@@ -28,6 +28,7 @@ POST /api/pause /api/resume   暂停 / 恢复调度
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -272,6 +273,56 @@ def _note_success(ip: str) -> None:
         _FAILURES.pop(ip, None)
 
 
+def health_status(cfg: dict, state: dict, now: float | None = None) -> tuple[bool, str]:
+    """(是否健康, 说明)。HTTP 线程活着不代表在干活：主循环心跳（main.beat）超过
+    http.health_stall_seconds 没更新就判不健康。还没打过心跳（启动中 / 单独起 webui
+    的测试）按健康处理。"""
+    hb = state.get("heartbeat")
+    if hb is None:
+        return True, "ok"
+    try:
+        limit = float((cfg.get("http") or {}).get("health_stall_seconds") or 600)
+    except (TypeError, ValueError):
+        limit = 600.0
+    age = (time.monotonic() if now is None else now) - float(hb)
+    if age > max(30.0, limit):
+        return False, f"stalled: main loop heartbeat {int(age)}s ago (limit {int(limit)}s)"
+    return True, "ok"
+
+
+# 响应压缩：/api/status 2 万条记录时 44 KB、gzip 后 1 KB，面板每 5 秒拉一次。
+# 判断方式参考 https://github.com/epheterson/Zimi/blob/045ac9d7444b1a2e53d4ddabe80be27892a9a9b5/zimi/http.py 的 _maybe_gzip
+# （够大、类型可压缩、客户端接受才压）；这里额外处理了 q=0（显式拒绝 gzip）。
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 5            # 1 KB 级的 JSON 压到 6 和 9 几乎没区别，5 更省 CPU
+_COMPRESSIBLE = ("application/json", "text/", "application/javascript")
+
+
+def accepts_gzip(header: str | None) -> bool:
+    """Accept-Encoding 里有 gzip（或 *）且 q 不为 0。"""
+    for part in str(header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip().lower() not in ("gzip", "*"):
+            continue
+        q = 1.0
+        for p in params.split(";"):
+            k, _, v = p.strip().partition("=")
+            if k.strip().lower() == "q":
+                try:
+                    q = float(v)
+                except ValueError:
+                    q = 0.0
+        return q > 0
+    return False
+
+
+def maybe_gzip(body: bytes, ctype: str, accept: str | None) -> tuple[bytes, bool]:
+    if (len(body) >= GZIP_MIN_BYTES and ctype.startswith(_COMPRESSIBLE)
+            and accepts_gzip(accept)):
+        return gzip.compress(body, compresslevel=GZIP_LEVEL), True
+    return body, False
+
+
 def _payload(cfg: dict, store, state: dict) -> dict:
     up, rt, sc = cfg["upload"], cfg["retry"], cfg["scan"]
     a = auth_cfg(cfg)
@@ -408,10 +459,14 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
         # ---- 工具 ----
         def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> bool:
             try:
+                body, zipped = maybe_gzip(body, ctype, self.headers.get("Accept-Encoding"))
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("Vary", "Accept-Encoding")
+                if zipped:
+                    self.send_header("Content-Encoding", "gzip")
                 for k, v in (extra or {}).items():
                     self.send_header(k, v)
                 self.end_headers()
@@ -506,7 +561,8 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             parsed = urlparse(self.path)
             path, query = parsed.path, parsed.query
             if path.startswith("/health"):             # 健康检查豁免：容器内 HEALTHCHECK 直连
-                return self._send(200, b"ok", "text/plain")
+                ok, why = health_status(cfg, state)
+                return self._send(200 if ok else 503, why.encode(), "text/plain")
             a = auth_cfg(cfg)
             if _mode(a) == "form" and _enabled(a):
                 if path == "/login":

@@ -83,7 +83,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 ## 3. 工作流程（与官方行为一致）
 
 ```
-发现新文件 → 等稳定（连续 N 轮 size/mtime 不变）→ 算 SHA1（8MB 分块，算完落库）
+发现新文件 → 等稳定（连续 N 轮 size/mtime 不变）→ 算 SHA1（1MB 分块，算完落库）
    ↓
 建目标目录（fs_makedirs 整条链，保留相对结构，cid 带缓存）
    ↓
@@ -91,6 +91,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
    ├─ 命中（reuse & state 都为真）→ 已上传（不消耗上行流量）
    ├─ upload.mode=rapid_only（默认）→ 未命中一律进「待重试」排队等：
    │     前 max_count 轮每 interval_seconds 一次，之后每 long_interval_seconds 一次，
+   │     等满 24 小时改每 1 小时、满 7 天改每 6 小时（retry.long_backoff），
    │     永远只发校验请求，不普通上传、不消耗上行
    ├─ 未命中 & 文件 < small_file_mb → 直接分块上传      ← 仅 rapid_then_upload
    └─ 未命中 & 大文件 → 待重试（默认 60s 后，最多 max_count 次 / max_hours 小时）
@@ -124,6 +125,8 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `retry.interval_seconds` | 60 | 秒传重试间隔（每轮只发校验请求） |
 | `retry.max_count` | 5 | `rapid_only`：前 N 轮用短间隔；`rapid_then_upload`：超过即算重试耗尽 |
 | `retry.long_interval_seconds` | 900 | 仅 `rapid_only`：短间隔用完后改成这个节奏继续等 |
+| `retry.long_backoff` | 24h→3600s，168h→21600s | 仅 `rapid_only`：按「第一次未命中至今」逐级放慢长间隔（只会更慢）。设成 `[]` 恢复旧行为（永远按 `long_interval_seconds`） |
+| `http.health_stall_seconds` | 600 | 主循环心跳超过这么多秒没更新，`/health` 返回 503，容器变 unhealthy |
 | `retry.max_hours` | 12 | 仅 `rapid_then_upload`：累计超过这么多小时就放弃重试，转分块上传 |
 | `http.enabled` / `port` | true / 9844 | Web 仪表盘与 JSON API |
 
@@ -149,7 +152,7 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/api/status` | 统计、队列、处理中、最近活动、配置摘要 |
-| GET | `/health` | 健康检查（Docker HEALTHCHECK 用的就是它） |
+| GET | `/health` | 健康检查（Docker HEALTHCHECK 用的就是它）。主循环卡住超过 `http.health_stall_seconds` 秒返回 503 |
 | POST | `/api/scan` | 立即扫描一轮 |
 | POST | `/api/retry-now` | 把所有待重试的秒传提前到期 |
 | POST | `/api/requeue` | 失败项重新入队 |
@@ -399,6 +402,8 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **报 10014 / 云端目录不存在**：程序会自动清 cid 缓存并重建目录后重试。
 - **暂停/重启后大文件要重传吗**：不用。分块的 `upload_id` 和当时的分块大小都在库里，重启后 `list_parts` 取回已传分块，本地文件从已传字节处接着读、按原分块大小继续传（中途改了 `partsize_mb` 也不影响续传）。分块上传中途失败（比如断网）会按 30 秒、60 秒退避自动续传，连续 3 次失败才标「错误」。
 - **`docker stop` / 重启时会丢进度吗**：不会。收到退出信号后不再派发新任务，正在做的（秒传请求、SHA1、分块）最多再等 8 秒自然结束（docker 默认 10 秒后强杀），没做完的状态都在库里，下次启动接着做。
+- **日志太多**：compose 示例已带日志轮转（最多 3×10 MB）；自己写 `docker run` 的加 `--log-opt max-size=10m --log-opt max-file=3`。逐个文件的「秒传未命中」只有第一次是 INFO，之后是 DEBUG，每轮另打一行「秒传校验汇总」；要看明细把 `log_level` 改成 `DEBUG`。
+- **容器显示 unhealthy**：`docker inspect --format '{{json .State.Health}}' upilot-mini` 看原因；`stalled: main loop heartbeat …` 表示主循环卡住了，`docker restart upilot-mini` 即可（状态都在库里）。
 - **115 换了 OSS 区域，分块上传连不上**：在 `config.yaml` 的 `upload` 下加 `oss_endpoint: "https://oss-cn-xxx.aliyuncs.com"`，默认是深圳。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。
 - **想临时停一下上传**：界面上点「暂停调度」，在途任务跑完就停；点「恢复调度」继续。

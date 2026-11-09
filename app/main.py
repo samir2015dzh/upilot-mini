@@ -21,7 +21,7 @@ import scanner
 import webui
 from p115 import P115, StubP115
 from store import Store
-from uploader import Uploader
+from uploader import Uploader, take_rapid_summary
 
 logger = logging.getLogger("upilot")
 
@@ -68,6 +68,17 @@ _WAKE_POLL = 0.5
 SWEEP_INTERVAL = 300.0
 
 
+def beat(state: dict) -> None:
+    """主循环心跳（monotonic 秒）。/health 据此判断主循环是不是卡住了（见 webui.health_status）。
+
+    思路参考 https://github.com/a-moiseev/chat_bot_calendar/blob/4674042d30b6ba184925a0f60d4a32c5b0eb7b30/bot/health.py
+    （各子系统 tick、探针按「多久没 tick」判 stale）。HTTP 服务是独立线程，
+    主循环卡死（115 请求挂住、事件循环被同步调用按住）时它照样回 ok —— 原来的
+    /health 发现不了这种「容器 healthy、上传却早停了」的情况。
+    """
+    state["heartbeat"] = time.monotonic()
+
+
 async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) -> None:
     """等到下一轮扫描；期间界面下了指令就立即返回。
 
@@ -79,6 +90,7 @@ async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) ->
     deadline = time.monotonic() + max(0.0, float(interval))
     seen_seq = state.get("wake_seq")
     while not stop.is_set():
+        beat(state)                      # 等待期间也在「活着」：心跳不能只在每轮开头打
         if state.get("scan_now") or state.get("reload"):
             return                       # 界面刚下的指令，别等满整个间隔
         if state.get("wake_seq") != seen_seq:
@@ -131,6 +143,7 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
     uploader = Uploader(cfg, store, manager)
 
     state = {"dry_run": dry_run, "scan_rounds": 0}
+    beat(state)
     http_srv = start_http(cfg, store, state)
 
     stop = stop or asyncio.Event()
@@ -151,6 +164,12 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
     cookie_sig = None        # (mtime_ns, size)：文件没动就连读都不读，只做一次 stat
     try:
         while not stop.is_set():
+            beat(state)
+            summary = take_rapid_summary()
+            if summary["checked"]:
+                # 逐个文件的「未命中」已降为 DEBUG，这里每轮一行汇总，INFO 里照样看得出在干活
+                logger.info("秒传校验汇总：上一轮校验 %d 个，命中 %d 个，未命中 %d 个",
+                            summary["checked"], summary["hit"], summary["miss"])
             try:
                 # 从外部程序（symedia 之类）同步 115 cookie：最多 60 秒看一次，变了才写盘重建
                 src = str((cfg.get("p115") or {}).get("cookie_from") or "").strip()

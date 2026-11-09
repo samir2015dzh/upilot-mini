@@ -23,3 +23,10 @@ services:
     ports:
       # 只在本机开放状态页；不需要可以删掉
       - "127.0.0.1:9844:9844"
+    # 日志轮转：Docker 默认的 json-file 不限大小，纯秒传模式下长期等待的文件多了，
+    # 日志会一直涨。最多留 3 个 10 MB 的文件（docker logs 仍可看最近 30 MB）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
