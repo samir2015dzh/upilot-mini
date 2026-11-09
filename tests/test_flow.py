@@ -3462,7 +3462,7 @@ class _FakeOSS:
         async def part_iter(url, upload_id, fh, part_number_start=1, partsize=0,
                             endpoint="", reporthook=None, async_=True, **kw):
             fake.calls.append({"offset": fh.tell(), "start": part_number_start,
-                               "partsize": partsize})
+                               "partsize": partsize, "endpoint": endpoint})
             n = part_number_start
             sent_parts = 0
             while True:
@@ -3917,6 +3917,210 @@ async def case_csrf_protection():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# [53]~[57]：SHA1 小缓冲 / updated_at 索引 / 扫描批量读写 / 优雅退出 / OSS 地址可配
+# ---------------------------------------------------------------------------
+
+async def case_sha1_small_buffer():
+    """[53] SHA1 改成 1MB 复用缓冲区：结果与 hashlib 一致（各种边界大小），峰值内存不随分块涨。
+
+    实测 8MB 与 1MB 吞吐相同（1.60 GB/s，卡在 OpenSSL），但 8MB 每路哈希峰值多占约 16MB。
+    """
+    import hashlib
+    import tracemalloc
+    import uploader as upmod
+
+    assert upmod.CHUNK <= 1024 * 1024, f"SHA1 分块又变大了：{upmod.CHUNK}"
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        c = upmod.CHUNK
+        for i, size in enumerate([1, c - 1, c, c + 1, 3 * c + c // 2]):
+            p = os.path.join(src, f"b{i}.mkv")
+            data = os.urandom(size)
+            with open(p, "wb") as f:
+                f.write(data)
+            store.add(p, size, os.path.getmtime(p))
+            got = await sha1_of(p, store.get(p), store)
+            assert got == hashlib.sha1(data).hexdigest(), f"{size} 字节的 SHA1 算错了"
+        big = os.path.join(src, "big.mkv")
+        with open(big, "wb") as f:
+            for _ in range(24):
+                f.write(os.urandom(c))
+        store.add(big, 24 * c, os.path.getmtime(big))
+        tracemalloc.start()
+        try:
+            await sha1_of(big, store.get(big), store)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 3 * c, f"哈希 24MB 文件峰值分配 {peak / 2**20:.1f}MB（应 < 3MB）"
+        PASS.append(f"[53] SHA1 读盘改 1MB 复用缓冲：5 种边界大小结果与 hashlib 一致；"
+                    f"哈希 24MB 文件峰值分配 {peak / 2**20:.2f}MB（修复前 8MB 分块 ≥ 8MB）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_updated_at_index():
+    """[54] 面板按 updated_at 倒序翻页要走索引；老库打开时自动补上。"""
+    import sqlite3
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-")
+    try:
+        db = os.path.join(tmp, "old.db")
+        # 模拟老库：只有表和 idx_status
+        con = sqlite3.connect(db)
+        con.executescript(store_store.DDL.split("-- 面板")[0])
+        con.execute("DROP INDEX IF EXISTS idx_updated")
+        con.commit()
+        con.close()
+        st = Store(db)
+        names = {r[0] for r in st.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "idx_updated" in names, f"老库没补上 updated_at 索引：{names}"
+        for sql in ("SELECT path FROM files ORDER BY updated_at DESC LIMIT 20",
+                    "SELECT * FROM files ORDER BY updated_at DESC LIMIT 50 OFFSET 100"):
+            plan = " ".join(str(tuple(r)) for r in st.db.execute("EXPLAIN QUERY PLAN " + sql))
+            assert "idx_updated" in plan and "TEMP B-TREE" not in plan, plan
+        st.db.close()
+        PASS.append("[54] updated_at 索引：新库建表即有、老库打开自动补；「最近活动 / 任务明细」"
+                    "排序走索引不再全表排序")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_scan_batched():
+    """[55] 扫描按目录批量查库、整轮一个事务写回；判断语义逐条不变。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=2)
+    try:
+        a = write_file(src, "A/a.mkv", 2048)
+        b = write_file(src, "B/b.mkv", 2048)
+        c = write_file(src, "C/c.mkv", 2048)
+
+        # 扫描期间不许再走逐条接口
+        def forbid(*a_, **k_):
+            raise AssertionError("扫描不该再逐条 SELECT / 写库")
+
+        saved = {k: getattr(store, k) for k in ("seen", "add", "set")}
+        for k in saved:
+            setattr(store, k, forbid)
+        try:
+            assert scanner.scan_once(store, cfg) == 3           # 3 个新文件入队
+            assert scanner.scan_once(store, cfg) == 3           # 计数 0→1
+        finally:
+            for k, v in saved.items():
+                setattr(store, k, v)
+        assert all(store.get(p)["stable_count"] == 1 for p in (a, b, c))
+
+        store.set(c, status="已上传", sha1="old")                # 终态：不再推进
+        store.set(b, sha1="stale", upload_id="u1")
+        time.sleep(0.01)
+        with open(b, "ab") as f:                                # b 被改写 → 重建记录
+            f.write(b"more")
+
+        # 扫描进行中用户点了「立即处理」（stable_count=999）：不能被快照里的旧值盖回去
+        real_lookup = store.scan_lookup
+
+        def lookup_then_click(paths):
+            snap = real_lookup(paths)
+            store.mark_ready(a)
+            return snap
+
+        store.scan_lookup = lookup_then_click
+        try:
+            scanner.scan_once(store, cfg)
+        finally:
+            store.scan_lookup = real_lookup
+        ra, rb, rc = store.get(a), store.get(b), store.get(c)
+        assert ra["stable_count"] == 999, f"扫描把「立即处理」盖掉了：{ra['stable_count']}"
+        assert rb["stable_count"] == 0 and not rb["sha1"] and not rb["upload_id"], rb
+        assert rb["size"] == os.path.getsize(b)
+        assert rc["status"] == "已上传" and rc["stable_count"] == 1 and rc["sha1"] == "old", rc
+
+        # 一致性：一大批新文件一次提交
+        for i in range(300):
+            write_file(src, f"D/{i}.mkv", 10)
+        before = store.db.total_changes
+        scanner.scan_once(store, cfg)
+        assert store.db.total_changes - before >= 300
+        assert len(store.list_tasks(limit=1000)[0]) == 303
+        PASS.append("[55] 扫描批量化：按目录批量查库、整轮一个事务写回（不再逐条 SELECT/commit）；"
+                    "新文件入队、计数推进、改写重建（SHA1/断点作废）、终态不动与原来一致；"
+                    "扫描中途点「立即处理」不会被旧计数盖回去")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_graceful_shutdown():
+    """[56] 收到退出信号：停止派发，给在途任务 SHUTDOWN_GRACE 秒自然结束，超时的再取消。
+
+    原来 finally 里只 sleep 0.5 秒、日志却写「等待在途任务结束」，然后 asyncio.run 收尾
+    直接取消所有任务（算到一半的 SHA1、传到一半的分块全部白做）。
+    """
+    import main as mainmod
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    real_grace = mainmod.SHUTDOWN_GRACE
+    try:
+        mainmod.SHUTDOWN_GRACE = 1.0
+        flags = {"short_done": False, "long_cancelled": False}
+
+        async def short_job():
+            await asyncio.sleep(0.4)
+            flags["short_done"] = True
+
+        async def long_job():
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                flags["long_cancelled"] = True
+                raise
+
+        stop = asyncio.Event()
+        svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=True, stop=stop))
+        await asyncio.sleep(0.2)
+        for job in (short_job, long_job):
+            t = asyncio.create_task(job())
+            upmod._SHARED["bg"].add(t)
+            t.add_done_callback(upmod._SHARED["bg"].discard)
+        t0 = time.monotonic()
+        stop.set()
+        await asyncio.wait_for(svc, timeout=10)
+        spent = time.monotonic() - t0
+        assert flags["short_done"], "在途任务没等它跑完就退出了"
+        assert flags["long_cancelled"], "超时的任务没被取消"
+        assert spent < 3.0, f"退出耗时 {spent:.2f}s，超出等待上限太多"
+        PASS.append(f"[56] 优雅退出：收到信号后在途任务跑完（0.4s 的任务完成），超过等待上限的被取消，"
+                    f"整体 {spent:.2f}s 退出（修复前只 sleep 0.5s 就全部强制取消）")
+    finally:
+        mainmod.SHUTDOWN_GRACE = real_grace
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_oss_endpoint_configurable():
+    """[57] OSS 地址可配：默认值不变；填了合法地址就用它；填错回落默认值。"""
+    assert cfgmod.DEFAULTS["upload"]["oss_endpoint"] == p115.DEFAULT_OSS_ENDPOINT \
+        == "https://oss-cn-shenzhen.aliyuncs.com"
+    assert p115.oss_endpoint({}) == p115.DEFAULT_OSS_ENDPOINT
+    assert p115.oss_endpoint({"upload": {"oss_endpoint": "https://oss-cn-hangzhou.aliyuncs.com/"}}) \
+        == "https://oss-cn-hangzhou.aliyuncs.com"
+    assert p115.oss_endpoint({"upload": {"oss_endpoint": "oss-cn-hangzhou"}}) == p115.DEFAULT_OSS_ENDPOINT
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        path = os.path.join(src, "e.mkv")
+        with open(path, "wb") as f:
+            f.write(os.urandom(300 * 1024))
+        store.add(path, 300 * 1024, os.path.getmtime(path))
+        m = _bare_p115(store, 1024 * 1024)
+        m.cfg = {"upload": {"oss_endpoint": "https://oss-cn-beijing.aliyuncs.com"}}
+        with _FakeOSS() as oss:
+            await m.multipart(path, 700, "sha", store.get(path))
+            assert oss.calls[0]["endpoint"] == "https://oss-cn-beijing.aliyuncs.com", oss.calls
+        PASS.append("[57] OSS 地址改为 upload.oss_endpoint 可配（默认仍是深圳），分块上传按配置走；"
+                    "非法值回落默认")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -3965,6 +4169,11 @@ async def main():
     await case_scan_off_event_loop()
     await case_multipart_failure_backoff_resume()
     await case_csrf_protection()
+    await case_sha1_small_buffer()
+    case_updated_at_index()
+    await case_scan_batched()
+    await case_graceful_shutdown()
+    await case_oss_endpoint_configurable()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

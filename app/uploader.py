@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import mmap
 import os
 import threading
 import time
@@ -18,7 +19,10 @@ from notify import Notifier
 from p115 import P115 as _P115, episode_key, resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
-CHUNK = 8 * 1024 * 1024
+# SHA1 每次读多少。实测（2GB 热缓存，带 SHA-NI）1MB 与 8MB 吞吐一样（都 1.60 GB/s，
+# 卡在 OpenSSL），但 8MB 每路哈希峰值多占约 16MB 内存（bytes 对象 + 一次临时拷贝），
+# 默认并发 2 就是 32MB。改成 1MB 并复用同一块缓冲区（readinto）。
+CHUNK = 1024 * 1024
 
 # 「同一批」容差（秒）：另一个版本与当前版本的**内容入队时间**（`created_at`）
 # 相差在范围内，才认为两者是「同一批新下的正当版本」，需要互相保护。
@@ -64,19 +68,28 @@ def _sha1_file(path: str, total: int, on_progress, cancel: threading.Event) -> s
     h = hashlib.sha1()
     read = 0
     last = time.monotonic()
-    with open(path, "rb") as f:
-        while True:
-            if cancel.is_set():
-                return None
-            block = f.read(CHUNK)
-            if not block:
-                break
-            h.update(block)
-            read += len(block)
-            now = time.monotonic()
-            if now - last >= 1.0:
-                on_progress(round(read / total * 100, 2))
-                last = now
+    # 缓冲区用匿名 mmap，不用 bytearray：1MB 级的 malloc 会被 glibc 的动态 mmap 阈值
+    # 收进线程池各线程的 arena，用完也不还给系统（实测线程池里常驻多出 5~15MB）；
+    # 匿名 mmap 用完 munmap，内存立刻归还。
+    buf = mmap.mmap(-1, max(1, min(CHUNK, int(total or 1))))
+    view = memoryview(buf)
+    try:
+        with open(path, "rb", buffering=0) as f:
+            while True:
+                if cancel.is_set():
+                    return None
+                n = f.readinto(buf)
+                if not n:
+                    break
+                h.update(view[:n])
+                read += n
+                now = time.monotonic()
+                if now - last >= 1.0:
+                    on_progress(round(read / total * 100, 2))
+                    last = now
+    finally:
+        view.release()
+        buf.close()
     return h.hexdigest()
 
 

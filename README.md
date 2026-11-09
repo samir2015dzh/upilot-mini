@@ -398,6 +398,8 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **大量小文件报 401**：115 限流。把 `upload.init_min_interval` 调大（如 1.0~2.0），或把 `upload.concurrency` 降到 1。
 - **报 10014 / 云端目录不存在**：程序会自动清 cid 缓存并重建目录后重试。
 - **暂停/重启后大文件要重传吗**：不用。分块的 `upload_id` 和当时的分块大小都在库里，重启后 `list_parts` 取回已传分块，本地文件从已传字节处接着读、按原分块大小继续传（中途改了 `partsize_mb` 也不影响续传）。分块上传中途失败（比如断网）会按 30 秒、60 秒退避自动续传，连续 3 次失败才标「错误」。
+- **`docker stop` / 重启时会丢进度吗**：不会。收到退出信号后不再派发新任务，正在做的（秒传请求、SHA1、分块）最多再等 8 秒自然结束（docker 默认 10 秒后强杀），没做完的状态都在库里，下次启动接着做。
+- **115 换了 OSS 区域，分块上传连不上**：在 `config.yaml` 的 `upload` 下加 `oss_endpoint: "https://oss-cn-xxx.aliyuncs.com"`，默认是深圳。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。
 - **想临时停一下上传**：界面上点「暂停调度」，在途任务跑完就停；点「恢复调度」继续。
 - **想重新传某个文件**：删库里那行（`sqlite3 /config/state.db "delete from files where path like '%xxx%'"`），下一轮扫描会重新入队。

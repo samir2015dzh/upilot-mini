@@ -92,7 +92,31 @@ async def _wait_next_round(stop: asyncio.Event, state: dict, interval: float) ->
             pass
 
 
-async def run_service(cfg: dict, dry_run: bool) -> int:
+# 退出时最多等在途任务多少秒（秒传请求、正在算的 SHA1、正在传的分块）。
+# 取 8 秒：docker stop 默认 10 秒后 SIGKILL，留 2 秒给收尾。等不完的就取消 ——
+# 状态都已落库，分块有断点，下次启动 dispatch 会从中间态接着做。
+SHUTDOWN_GRACE = 8.0
+
+
+async def _drain_background(grace: float) -> tuple[int, int]:
+    """等后台任务（上传/秒传/巡检/通知）自然结束，超时的取消。返回 (正常结束数, 被取消数)。"""
+    from uploader import _SHARED
+
+    pending = {t for t in _SHARED["bg"] if not t.done()}
+    if not pending:
+        return 0, 0
+    logger.info("等待 %d 个在途任务结束（最多 %.0f 秒）…", len(pending), grace)
+    done, late = await asyncio.wait(pending, timeout=max(0.0, grace))
+    for t in late:
+        t.cancel()
+    if late:
+        await asyncio.gather(*late, return_exceptions=True)
+        logger.warning("%d 个任务没在 %.0f 秒内结束，已取消（状态已落库，下次启动接着做）",
+                       len(late), grace)
+    return len(done), len(late)
+
+
+async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = None) -> int:
     store = Store(cfg["state"]["db"])
 
     def build_manager():
@@ -109,7 +133,7 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
     state = {"dry_run": dry_run, "scan_rounds": 0}
     http_srv = start_http(cfg, store, state)
 
-    stop = asyncio.Event()
+    stop = stop or asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -206,8 +230,16 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
             interval = max(2, int(cfg["scan"]["interval_seconds"]))
             await _wait_next_round(stop, state, interval)
     finally:
-        logger.info("收到退出信号，等待在途任务结束…")
-        await asyncio.sleep(0.5)
+        # 原来这里只 sleep 0.5 秒、日志却写「等待在途任务结束」，然后 asyncio.run 收尾
+        # 把所有任务直接取消：算到一半的 SHA1 白算、正在传的分块白传。
+        # 现在：主循环已经停了（不再派发新任务），在途的给 SHUTDOWN_GRACE 秒自然结束。
+        # 被外部取消（不是收到退出信号）时不等，直接走取消。
+        if stop.is_set():
+            logger.info("收到退出信号，停止派发新任务")
+            try:
+                await _drain_background(SHUTDOWN_GRACE)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("等待在途任务时出错：%s", exc)
         if http_srv:
             http_srv.shutdown()
     logger.info("已停止。统计：%s", store.counts())
