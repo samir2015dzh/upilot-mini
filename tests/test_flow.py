@@ -12,12 +12,15 @@ import copy
 import gc
 import glob
 import inspect
+import json
 import math
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -3426,6 +3429,494 @@ async def case_sweep_business_error_visible():
         "HTTPError 兼容分支剔除 401/403（认证失败绝不自动重试）")
 
 
+# ---------------------------------------------------------------------------
+# [48]~[52]：断点续传偏移 / 进度节流 / SHA1 与扫描移出事件循环 / 分块失败退避 / CSRF
+# ---------------------------------------------------------------------------
+
+class _FakeOSS:
+    """离线替身：p115client.tool.P115MultipartUpload + p115oss 的分块接口。
+
+    和 StubP115 不同，它**真的从传进来的文件句柄里读数据**，按分块编号存起来，
+    complete 时按编号拼回整份内容 —— 这样续传偏移错了就能被内容比对抓出来。
+    """
+
+    def __init__(self, cloud_parts: dict[int, bytes] | None = None):
+        self.cloud: dict[int, bytes] = dict(cloud_parts or {})
+        self.calls: list[dict] = []
+        self.completed: list[dict] | None = None
+        self.fail_after_parts: int | None = None
+        fake = self
+
+        class MultipartUpload:
+            def __init__(self, url, path, callback, upload_id):
+                self.url, self.path, self.callback, self.upload_id = url, path, callback, upload_id
+
+            async def list_parts(self, async_=True, **kw):
+                return [{"PartNumber": n, "Size": len(b), "ETag": f"e{n}"}
+                        for n, b in sorted(fake.cloud.items())]
+
+            async def complete(self, parts, async_=True, **kw):
+                fake.completed = list(parts)
+                return {"state": True, "file_id": "fid-mp"}
+
+        async def part_iter(url, upload_id, fh, part_number_start=1, partsize=0,
+                            endpoint="", reporthook=None, async_=True, **kw):
+            fake.calls.append({"offset": fh.tell(), "start": part_number_start,
+                               "partsize": partsize})
+            n = part_number_start
+            sent_parts = 0
+            while True:
+                if fake.fail_after_parts is not None and sent_parts >= fake.fail_after_parts:
+                    raise ConnectionResetError("模拟：上传中途断网")
+                buf = b""
+                while len(buf) < partsize:
+                    piece = fh.read(min(64 * 1024, partsize - len(buf)))
+                    if not piece:
+                        break
+                    buf += piece
+                    if reporthook:
+                        reporthook(len(piece))           # 与 p115oss 一样按 64KB 回调
+                if not buf:
+                    break
+                fake.cloud[n] = buf
+                yield {"PartNumber": n, "Size": len(buf), "ETag": f"e{n}"}
+                sent_parts += 1
+                if len(buf) < partsize:
+                    break
+                n += 1
+
+        async def oss_init(**kw):
+            return {"data": {"bucket": "b", "object": "o", "callback": {"cb": 1}},
+                    "url": "https://oss.example/o"}
+
+        async def mp_init(url, **kw):
+            return "upload-new"
+
+        self.mods = {
+            "p115client": types.ModuleType("p115client"),
+            "p115client.tool": types.ModuleType("p115client.tool"),
+            "p115oss": types.ModuleType("p115oss"),
+            "p115oss.oss": types.ModuleType("p115oss.oss"),
+        }
+        self.mods["p115client.tool"].P115MultipartUpload = MultipartUpload
+        self.mods["p115oss"].oss_multipart_upload_init = mp_init
+        self.mods["p115oss"].oss_multipart_upload_part_iter = part_iter
+        self.mods["p115oss"].upload_file_init = oss_init
+        self.mods["p115oss.oss"].oss_url = lambda *a, **k: "https://oss.example/o"
+
+    def __enter__(self):
+        self.saved = {k: sys.modules.get(k) for k in self.mods}
+        sys.modules.update(self.mods)
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def assembled(self) -> bytes:
+        assert self.completed is not None, "没有调用 complete"
+        nums = [int(p["PartNumber"]) for p in self.completed]
+        assert nums == list(range(1, len(nums) + 1)), f"complete 的分块编号不连续：{nums}"
+        return b"".join(self.cloud[n] for n in nums)
+
+
+def _bare_p115(store, partsize: int) -> P115:
+    """不联网地造一个真实 P115（跳过 __init__ 里的 P115Client 构造）。"""
+    m = P115.__new__(P115)
+    m.store = store
+    m.partsize = partsize
+    m.client = types.SimpleNamespace(cookies="UID=x; CID=y")
+
+    async def passthrough(fn, what):
+        return await fn()
+
+    m._retry_transient = passthrough
+    return m
+
+
+def _count_progress_writes(store) -> list:
+    writes: list = []
+    real_set = store.set
+
+    def spy(path, **kv):
+        if "progress" in kv:
+            writes.append(kv["progress"])
+        return real_set(path, **kv)
+
+    store.set = spy
+    return writes
+
+
+async def case_multipart_resume_offset():
+    """[48] 断点续传必须从**已传字节**处接着读，且用建断点时的 partsize；进度写库要节流。
+
+    根因（真实 I/O 路径，StubP115 覆盖不到）：p115oss 的 `oss_multipart_upload_part_iter`
+    不会自己跳过已传数据（文档原话「如果需要跳过一定的数据，请提前处理好」），而这里
+    句柄停在偏移 0、分块编号却从 len(parts)+1 开始 ⇒ 第 3 块上传的是文件开头的数据，
+    云端拼出来是坏文件。另外续传用的是当前配置的 partsize（用户改过就错位），
+    reporthook 每 64KB 写一次 SQLite（10GB ≈ 16 万次 UPDATE+commit）。
+    """
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        ps = 1024 * 1024
+        path = os.path.join(src, "电影/大文件.mkv")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        content = os.urandom(6 * ps + 12345)
+        with open(path, "wb") as f:
+            f.write(content)
+        store.add(path, len(content), os.path.getmtime(path))
+        # 上次跑到一半：云端已有前 2 块（按当时的 1MB 分块），断点在库里
+        store.set(path, upload_id="upload-old", upload_oss_url="https://oss.example/o",
+                  upload_callback=json.dumps({"cb": 1}), upload_partsize=ps)
+        # 之后用户把分块大小改成了 4MB —— 续传仍必须按断点里的 1MB 切
+        m = _bare_p115(store, 4 * ps)
+        with _FakeOSS({1: content[:ps], 2: content[ps:2 * ps]}) as oss:
+            writes = _count_progress_writes(store)
+            result = await m.multipart(path, 700, "sha", store.get(path))
+            call = oss.calls[0]
+            assert call["offset"] == 2 * ps, f"续传没跳过已传部分：从偏移 {call['offset']} 开始读"
+            assert call["start"] == 3, call
+            assert call["partsize"] == ps, f"续传没用断点里的 partsize：{call['partsize']}"
+            assert oss.assembled() == content, "续传拼出来的云端内容与本地文件不一致"
+            assert result.get("file_id") == "fid-mp", result
+            callbacks = (len(content) - 2 * ps + 64 * 1024 - 1) // (64 * 1024)
+            assert len(writes) <= 4, f"进度写库没节流：{callbacks} 次回调写了 {len(writes)} 次"
+            assert writes[0] >= 30.0, f"续传起点进度应反映已传部分：{writes[0]}"
+            assert writes[-1] == 99.9, f"收尾进度不对：{writes[-1]}"
+
+        # 全新上传：从 0 开始、按当前 partsize、断点落库
+        path2 = os.path.join(src, "电影/新文件.mkv")
+        content2 = os.urandom(3 * ps + 7)
+        with open(path2, "wb") as f:
+            f.write(content2)
+        store.add(path2, len(content2), os.path.getmtime(path2))
+        m2 = _bare_p115(store, ps)
+        with _FakeOSS() as oss2:
+            await m2.multipart(path2, 700, "sha", store.get(path2))
+            assert oss2.calls[0]["offset"] == 0 and oss2.calls[0]["start"] == 1, oss2.calls
+            assert oss2.assembled() == content2
+        rec2 = store.get(path2)
+        assert rec2["upload_id"] == "upload-new" and rec2["upload_partsize"] == ps, rec2
+
+        # resume_prefix 边界：缺块 / 大小不对 / 最后一块正好收尾
+        rp = p115.resume_prefix
+        mk = lambda n, s: {"PartNumber": n, "Size": s}          # noqa: E731
+        assert rp([mk(1, ps), mk(3, ps)], ps, 10 * ps)[1] == ps, "中间缺块只能沿用连续前缀"
+        assert rp([mk(2, ps), mk(1, ps)], ps, 10 * ps)[1] == 2 * ps, "乱序要先排序"
+        assert rp([mk(1, ps // 2)], ps, 10 * ps) == ([], 0), "大小对不上的不能沿用"
+        assert rp([mk(1, ps), mk(2, 5)], ps, ps + 5)[1] == ps + 5, "末块正好收尾应沿用"
+        assert rp([mk(1, ps)], ps, ps // 2) == ([], 0), "云端比本地还大：断点作废"
+        assert rp([], ps, 10) == ([], 0)
+
+        # 节流器本身：16 万次回调（10GB / 64KB）在 1 秒内只写首尾两次
+        got: list = []
+        th = p115.ProgressThrottle(got.append)
+        for i in range(160_000):
+            th.update(i / 160_000 * 100)
+        th.update(100, force=True)
+        assert len(got) <= 3 and got[-1] == 99.9, (len(got), got[-3:])
+        PASS.append(f"[48] 断点续传从已传偏移（{2 * ps} 字节、第 3 块）接着读、按断点里的 "
+                    f"partsize 切块，云端拼回内容与本地逐字节一致（修复前从偏移 0 重读 ⇒ 坏文件）；"
+                    f"进度写库节流：{callbacks} 次回调只写 {len(writes)} 次，16 万次回调写 {len(got)} 次")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_sha1_off_event_loop():
+    """[49] 算 SHA1 不再按住事件循环；算的过程中文件被换掉时结果不落库。
+
+    原来 `sha1_of` 是 async 函数里的同步读盘循环，没有任何 await：算 20GB 原盘时
+    秒传、巡检、主循环全停（NAS 机械盘约 3 分钟）。
+    """
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    real_chunk, real_hashlib = upmod.CHUNK, upmod.hashlib
+    try:
+        path = write_file(src, "剧集/S01/E09.mkv", 8 * 64 * 1024)
+        scanner.scan_once(store, cfg)
+
+        class SlowSha1:
+            """每块额外「卡」50ms（同步 sleep，模拟机械盘读一块的耗时）。"""
+
+            def __init__(self):
+                self.h = real_hashlib.sha1()
+
+            def update(self, b):
+                time.sleep(0.05)
+                self.h.update(b)
+
+            def hexdigest(self):
+                return self.h.hexdigest()
+
+        upmod.CHUNK = 64 * 1024
+        upmod.hashlib = types.SimpleNamespace(sha1=SlowSha1)
+        ticks = {"n": 0}
+        done = asyncio.Event()
+
+        async def ticker():
+            while not done.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        async def hash_it():
+            try:
+                return await sha1_of(path, store.get(path), store)
+            finally:
+                done.set()
+
+        t0 = time.monotonic()
+        digest, _ = await asyncio.gather(hash_it(), ticker())
+        spent = time.monotonic() - t0
+        expect = real_hashlib.sha1(open(path, "rb").read()).hexdigest()
+        assert digest == expect, "SHA1 算错了"
+        assert store.get(path)["sha1"] == expect
+        # 8 块 × 50ms = 0.4s；事件循环没被按住的话 10ms 一跳能跳 20+ 次（按住时只有 1~2 次）
+        assert ticks["n"] >= 15, f"算 SHA1 的 {spent:.2f}s 里事件循环只跑了 {ticks['n']} 轮"
+
+        # 0 字节文件：size=0 不能被当成「对不上」（否则永远在重新入队里打转）
+        empty = write_file(src, "剧集/S01/空.mkv", 0)
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(empty, store.get(empty), store) == real_hashlib.sha1(b"").hexdigest()
+
+        # 算到一半文件被换掉（洗板重下）：结果不能落库，_process 要按新内容重新入队
+        path2 = write_file(src, "剧集/S01/E10.mkv", 4 * 64 * 1024)
+        scanner.scan_once(store, cfg)
+        store.set(path2, status="待处理", stable_count=5)
+
+        class SwapSha1(SlowSha1):
+            swapped = False
+
+            def update(self, b):
+                if not SwapSha1.swapped:
+                    SwapSha1.swapped = True
+                    with open(path2, "ab") as f:
+                        f.write(b"new-content")
+                super().update(b)
+
+        upmod.hashlib = types.SimpleNamespace(sha1=SwapSha1)
+        await up._process(path2)
+        rec2 = store.get(path2)
+        assert not rec2["sha1"], f"文件已被换掉，旧摘要不该落库：{rec2['sha1']}"
+        assert rec2["status"] == "待处理" and rec2["stable_count"] == 0, rec2
+        assert rec2["size"] == os.path.getsize(path2), "应按新内容重新入队"
+
+        # 取消（容器退出）时线程尽快收手，不拖住 asyncio.run 的收尾
+        upmod.hashlib = types.SimpleNamespace(sha1=SlowSha1)
+        path3 = write_file(src, "剧集/S01/E11.mkv", 40 * 64 * 1024)
+        scanner.scan_once(store, cfg)
+        task = asyncio.create_task(sha1_of(path3, store.get(path3), store))
+        await asyncio.sleep(0.12)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        t1 = time.monotonic()
+        while threading.active_count() > 1 and any(
+                th.name.startswith("asyncio_") and th.is_alive() for th in threading.enumerate()):
+            if time.monotonic() - t1 > 1.0:
+                break
+            await asyncio.sleep(0.02)
+        assert not store.get(path3)["sha1"], "被取消的哈希不该落库"
+        PASS.append(f"[49] SHA1 移到线程池：慢盘模拟下哈希 {spent:.2f}s 期间事件循环照跑 "
+                    f"{ticks['n']} 轮（修复前被按住、只跑 1~2 轮）；算的过程中文件被换掉 ⇒ 摘要丢弃、"
+                    f"按新内容重新入队；取消时不落库")
+    finally:
+        upmod.CHUNK, upmod.hashlib = real_chunk, real_hashlib
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_scan_off_event_loop():
+    """[50] 主循环里的目录扫描放到线程里跑：慢扫描期间，在途任务（秒传/SHA1/巡检）照常推进。"""
+    import main as mainmod
+
+    src_txt = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+    assert "await asyncio.to_thread(scanner.scan_once, store, cfg)" in src_txt, \
+        "主循环里的 scan_once 又变回同步调用了"
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    real_scan = mainmod.scanner.scan_once
+    try:
+        scans = {"n": 0}
+
+        def slow_scan(store_, cfg_):
+            scans["n"] += 1
+            time.sleep(0.4)                     # 模拟几万个文件 / 网络挂载上的 os.walk
+            return real_scan(store_, cfg_)
+
+        mainmod.scanner.scan_once = slow_scan
+        ticks = {"n": 0}
+
+        async def ticker():
+            while True:
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=True))
+        tk = asyncio.create_task(ticker())
+        await asyncio.sleep(0.3)               # 落在第一轮扫描的 0.4s 里
+        mid = ticks["n"]
+        for t in (svc, tk):
+            t.cancel()
+        for t in (svc, tk):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        assert scans["n"] >= 1, "主循环没扫描"
+        assert mid >= 15, f"扫描期间事件循环只跑了 {mid} 轮（被同步扫描按住）"
+        PASS.append(f"[50] 目录扫描移到线程：0.4s 的慢扫描期间事件循环照跑 {mid} 轮"
+                    f"（修复前只有 1 轮），先扫后派发的顺序不变")
+    finally:
+        mainmod.scanner.scan_once = real_scan
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_multipart_failure_backoff_resume():
+    """[51] 分块上传中途失败：不再一次就判「错误」，走统一退避，到期后从断点续传。"""
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, small_file_mb=100.0)
+    try:
+        ps = 1024 * 1024
+        path = os.path.join(src, "电影/断网.mkv")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        content = os.urandom(4 * ps + 99)
+        with open(path, "wb") as f:
+            f.write(content)
+        scanner.scan_once(store, cfg)
+        m = _bare_p115(store, ps)
+
+        async def miss(*a, **k):
+            return False, {"reason": "未命中"}
+
+        async def ensure_pid(cloud_dir):
+            return 701
+
+        m.rapid = miss
+        m.ensure_pid = ensure_pid
+        up.mgr = m
+        with _FakeOSS() as oss:
+            oss.fail_after_parts = 2
+            up.spawn(path)
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if path not in up._active:
+                    break
+            rec = store.get(path)
+            assert rec["status"] == "待重试", f"一次断网就判死了：{rec['status']} {rec['message']}"
+            assert "分块上传失败" in (rec["message"] or "") and rec["next_retry_at"] > time.time()
+            assert sorted(oss.cloud) == [1, 2] and rec["upload_id"], "断点应保留"
+
+            # 退避到期：直接续传（不再绕回秒传），从第 3 块、偏移 2MB 接着传
+            oss.fail_after_parts = None
+            rapid_calls = {"n": 0}
+
+            async def miss_count(*a, **k):
+                rapid_calls["n"] += 1
+                return False, {"reason": "未命中"}
+
+            m.rapid = miss_count
+            store.set(path, next_retry_at=0)
+            await up._process(path)
+            rec = store.get(path)
+            assert rec["status"] == "已上传", (rec["status"], rec["message"])
+            assert rapid_calls["n"] == 0, "带断点的「待重试」应直接续传，不该再发秒传"
+            assert oss.calls[-1]["offset"] == 2 * ps and oss.calls[-1]["start"] == 3, oss.calls
+            assert oss.assembled() == content
+        up._err_streak.clear()
+        PASS.append("[51] 分块上传中途断网：转「待重试」退避（断点保留，不再一次就判「错误」），"
+                    "到期后直接从第 3 块续传，云端内容与本地一致")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_csrf_protection():
+    """[52] 改状态的 POST 防跨站伪造：默认不开鉴权时，任意网页都能让本机浏览器
+    往面板提交表单（打开「传完删本地」、改通知地址、删记录、暂停调度）。"""
+    import urllib.parse
+    from pathlib import Path
+
+    js = open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+    assert '"Content-Type": "application/json"' in js, "面板 POST 必须发 JSON（否则会被自己拦掉）"
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    srv = None
+    try:
+        cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+        cfgmod.PORT_FILE = Path(tmp) / ".http_port"
+        cfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                       "auth": {"enabled": False}}
+        state = {"scan_rounds": 0, "dry_run": True}
+        srv = webui.serve(cfg, store, state)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        evil = json.dumps({"values": {"upload.delete_after_upload": True}}).encode()
+
+        def post(path, data=b"", ctype="application/json", **hdr):
+            req = urllib.request.Request(base + path, data=data, method="POST")
+            if data:
+                req.add_header("Content-Type", ctype)
+            for k, v in hdr.items():
+                req.add_header(k.replace("_", "-"), v)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+
+        form = urllib.parse.urlencode(
+            {"values": json.dumps({"upload.delete_after_upload": True})}).encode()
+        # 跨站表单（经典 CSRF）：Origin 是别的站
+        assert post("/api/config", form, "application/x-www-form-urlencoded",
+                    Origin="http://evil.example") == 403
+        # 现代浏览器：Sec-Fetch-Site=cross-site，哪怕是 JSON 也拦
+        assert post("/api/config", evil, Sec_Fetch_Site="cross-site",
+                    Origin="http://evil.example") == 403
+        assert post("/api/config", evil, Sec_Fetch_Site="same-site") == 403
+        # 沙箱 iframe / data: 页面：Origin: null
+        assert post("/api/config", evil, Origin="null") == 403
+        # 没有 Origin 的老浏览器：看 Referer
+        assert post("/api/config", evil, Referer="http://evil.example/x.html") == 403
+        # text/plain 伪装 JSON（跨站表单 enctype=text/plain 的老招数）
+        assert post("/api/config", evil, "text/plain") == 403
+        # 不带请求体的动作同样拦
+        assert post("/api/pause", Origin="http://evil.example") == 403
+        assert post("/api/task", json.dumps({"path": "x", "action": "delete"}).encode(),
+                    Sec_Fetch_Site="cross-site") == 403
+        assert cfg["upload"]["delete_after_upload"] is False, "跨站请求改到了配置"
+        assert not state.get("paused"), "跨站请求暂停了调度"
+
+        # 放行：自带面板（同源 fetch + JSON）
+        ok = json.dumps({"values": {"scan.interval_seconds": 45}}).encode()
+        assert post("/api/config", ok, Sec_Fetch_Site="same-origin", Origin=base) == 200
+        assert int(cfg["scan"]["interval_seconds"]) == 45
+        # 放行：脚本 / curl（没有任何浏览器头）
+        assert post("/api/pause") == 200 and state.get("paused") is True
+        assert post("/api/resume") == 200
+        # 放行：反代（Host 被改写成内网地址，Origin 是公网域名）
+        assert post("/api/scan", Origin="https://nas.example.com",
+                    X_Forwarded_Host="nas.example.com") == 200
+        cfg["http"]["public_url"] = "https://media.example.org/"
+        assert post("/api/scan", Origin="https://media.example.org") == 200
+        assert post("/api/scan", Referer=f"{base}/") == 200
+        # 反代改写 Host 且没配 public_url，但浏览器给了 Sec-Fetch-Site=same-origin：放行
+        assert post("/api/scan", Origin="https://other.example", Sec_Fetch_Site="same-origin") == 200
+        # 脚本发表单体到 /api/*：现在只收 JSON
+        assert post("/api/config", form, "application/x-www-form-urlencoded") == 403
+        PASS.append("[52] CSRF：跨站表单 / Sec-Fetch-Site 跨站 / Origin:null / 外站 Referer / "
+                    "text/plain 伪装 JSON 一律 403 且配置与调度不受影响；自带面板、curl 脚本、"
+                    "反代（X-Forwarded-Host / public_url / Sec-Fetch-Site）照常放行")
+    finally:
+        if srv is not None:
+            srv.shutdown()
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -3469,6 +3960,11 @@ async def main():
     await case_cloud_only_episode_cleanup()
     await case_cleanup_previous_versions()
     await case_sweep_business_error_visible()
+    await case_multipart_resume_offset()
+    await case_sha1_off_event_loop()
+    await case_scan_off_event_loop()
+    await case_multipart_failure_backoff_resume()
+    await case_csrf_protection()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

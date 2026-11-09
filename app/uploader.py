@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import threading
 import time
 
 from notify import Notifier
@@ -54,16 +55,19 @@ _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  "sem_n": -1, "sweep_running": False}
 
 
-async def sha1_of(path: str, record: dict, store) -> str:
-    """算过就直接复用（重启/重试都不再读盘）；没算过则 8MB 分块流式算。"""
-    if record.get("sha1"):
-        return record["sha1"]
+def _sha1_file(path: str, total: int, on_progress, cancel: threading.Event) -> str | None:
+    """同步读盘 + 算 SHA1（在线程池里跑，不占事件循环）。
+
+    `cancel` 被置位（等它的协程被取消，比如容器退出）就尽快收手返回 None，
+    免得 asyncio.run 收尾时 shutdown_default_executor 被一个 20GB 的哈希拖住。
+    """
     h = hashlib.sha1()
     read = 0
-    total = record["size"] or 1
     last = time.monotonic()
     with open(path, "rb") as f:
         while True:
+            if cancel.is_set():
+                return None
             block = f.read(CHUNK)
             if not block:
                 break
@@ -71,9 +75,57 @@ async def sha1_of(path: str, record: dict, store) -> str:
             read += len(block)
             now = time.monotonic()
             if now - last >= 1.0:
-                store.set(path, progress=round(read / total * 100, 2))
+                on_progress(round(read / total * 100, 2))
                 last = now
-    digest = h.hexdigest()
+    return h.hexdigest()
+
+
+def _same_file(path: str, record: dict) -> bool:
+    """磁盘上的文件是否还是 record 记下的那份（size + mtime 都对得上）。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    size, mtime = record.get("size"), record.get("mtime")
+    if size is None or mtime is None:
+        return True                      # 记录里没有可比的值：不拦（与旧行为一致）
+    try:
+        # 注意别写成 `size or -1`：0 字节文件会被误判成「变了」，永远算不完 SHA1
+        return int(size) == int(st.st_size) and abs(float(mtime) - st.st_mtime) <= 1e-6
+    except (TypeError, ValueError):
+        return True
+
+
+async def sha1_of(path: str, record: dict, store) -> str | None:
+    """算过就直接复用（重启/重试都不再读盘）；没算过则 8MB 分块流式算。
+
+    读盘 + 哈希放到线程池里跑：原来是 async 函数里的同步循环，算一个 20GB 原盘时
+    整个事件循环停住（秒传、巡检、主循环扫描全部停摆，机械盘上约 3 分钟）。
+
+    返回 None 表示**算的过程中文件被换掉了**（洗板重下 / 还在写）：算出来的值
+    不属于库里那条记录，绝不能落库；调用方应把记录按新内容重新入队。
+    """
+    if record.get("sha1"):
+        return record["sha1"]
+    total = record["size"] or 1
+    cancel = threading.Event()
+
+    def on_progress(pct: float) -> None:
+        store.set(path, progress=pct)
+
+    try:
+        digest = await asyncio.to_thread(_sha1_file, path, total, on_progress, cancel)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
+    if digest is None:
+        return None
+    # 线程里算的这段时间，主循环可能已经扫描过、发现文件变了并重建了记录：
+    # 磁盘或库里的 size/mtime 任何一个对不上，都说明这个摘要不属于当前记录。
+    cur = store.get(path) or {}
+    if not _same_file(path, record) or not _same_file(path, cur or record):
+        logger.warning("算 SHA1 期间文件被改动，丢弃结果：%s", os.path.basename(path))
+        return None
     store.set(path, sha1=digest, progress=0.0)
     logger.info("SHA1 计算完成：%s → %s", os.path.basename(path), digest)
     return digest
@@ -544,7 +596,7 @@ class Uploader:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同集巡检：遍历 %s 失败：%s", td, exc)
                 continue
-            for dcid, items in tree:
+            for _dcid, items in tree:
                 scanned += 1
                 files = [r for r in items if r.get("fid") not in (None, "")]
                 groups: dict[str, list[dict]] = {}
@@ -731,6 +783,10 @@ class Uploader:
             self.store.set(path, status="处理中")
             rec = self.store.get(path)
             sha1 = await sha1_of(path, rec, self.store)
+            if not sha1:
+                # 算的过程中文件被换掉 / 还在写：按新内容重新入队、重新等稳定
+                self._requeue_changed_file(path)
+                return
             self.store.set(path, status="待秒传", sha1=sha1)
             rec = self.store.get(path)
         elif rec["status"] == "处理中":
@@ -752,9 +808,13 @@ class Uploader:
         # 「上传中」再去传分块，SIGKILL 下 except 不会执行 —— 那条记录就永远停在
         # 「上传中」。重新被派发时若重走秒传：云端不会有完整文件（本来就传一半），
         # 必然未命中 → 被推回「待重试」白等好几轮才转回分块。断点齐全就直接续传。
-        resume_upload = (rec["status"] == "上传中"
-                         and all(rec.get(k) for k in
-                                 ("upload_id", "upload_oss_url", "upload_callback")))
+        # 分块上传中途失败会经 spawn() 的退避落到「待重试」（见下面 4) 的说明），
+        # 这种带完整断点的「待重试」到期后同样直接续传，不再先绕一圈秒传。
+        has_breakpoint = all(rec.get(k) for k in
+                             ("upload_id", "upload_oss_url", "upload_callback"))
+        resume_upload = has_breakpoint and (
+            rec["status"] == "上传中"
+            or (rec["status"] == "待重试" and not self.rapid_only))
         if resume_upload:
             logger.info("恢复被打断的分块上传（断点续传）：%s", os.path.basename(path))
         while not resume_upload:
@@ -835,6 +895,9 @@ class Uploader:
             self._notify(cloud_dir, "uploaded", path)
             await self._cleanup_prev_versions(cloud_dir, pid, path)
             self._delete_source(path, rec)
-        except Exception as exc:  # noqa: BLE001
-            store.set(path, status="错误", message=f"分块上传失败：{exc}")
-            logger.error("分块上传失败：%s：%s", path, exc)
+        except Exception as exc:
+            # 原来这里一次失败就直接判「错误」，绕过了 spawn() 的退避：几 GB 的上传
+            # 中途网络抖一下就得人工点重试。现在交给 spawn() 统一退避（30s/60s…，
+            # 连续 error_max_attempts 次才判「错误」）；断点还在库里，到期后从断点续传。
+            logger.warning("分块上传失败（断点已保留，将退避后续传）：%s：%s", path, exc)
+            raise RuntimeError(f"分块上传失败：{exc}") from exc
