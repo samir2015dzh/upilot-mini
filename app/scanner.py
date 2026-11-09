@@ -9,6 +9,14 @@ logger = logging.getLogger("upilot.scan")
 TERMINAL = {"已上传", "错误"}
 # 扫描写库每攒够这么多条提交一次（见 scan_once 末尾）
 FLUSH_EVERY = 500
+# 每轮「发现新文件 / 文件已稳定」逐条打 INFO 的上限，超出的降为 DEBUG，末尾打一行汇总。
+# 首次扫一个 2 万集的片库原来会刷出 4 万行 INFO，把真正的问题淹掉。
+LOG_EACH_MAX = 20
+
+
+def file_ino(st: os.stat_result) -> str | None:
+    """设备:inode，用来认出「同一个文件换了路径」（见 Store.find_sha1）。拿不到就 None。"""
+    return f"{st.st_dev}:{st.st_ino}" if getattr(st, "st_ino", 0) else None
 
 
 def scan_once(store, cfg: dict) -> int:
@@ -35,8 +43,9 @@ def scan_once(store, cfg: dict) -> int:
 
     # 按目录批量查库 + 整轮一个事务写回（见 Store.scan_lookup / apply_scan）：
     # 原来每个文件一次 SELECT、每次推进一次 commit。判断逻辑逐条不变。
-    new_files: list[tuple[str, int, float]] = []
+    new_files: list[tuple] = []
     bumps: list[tuple[str, int]] = []
+    n_new = n_stable = 0
 
     for root, dirs, names in os.walk(src):
         rel_root = os.path.relpath(root, src).replace("\\", "/")
@@ -73,8 +82,10 @@ def scan_once(store, cfg: dict) -> int:
             rec = known.get(full)
             if rec is None or rec[0] != st.st_size or rec[1] != st.st_mtime:
                 # 新文件，或同路径内容被改写（size/mtime 变了）→ 重建记录
-                new_files.append((full, st.st_size, st.st_mtime))
-                logger.info("发现新文件：%s (%.1f MB)", full, st.st_size / 1024 / 1024)
+                new_files.append((full, st.st_size, st.st_mtime, file_ino(st)))
+                n_new += 1
+                logger.log(logging.INFO if n_new <= LOG_EACH_MAX else logging.DEBUG,
+                           "发现新文件：%s (%.1f MB)", full, st.st_size / 1024 / 1024)
                 touched += 1
                 continue
 
@@ -85,7 +96,9 @@ def scan_once(store, cfg: dict) -> int:
                 new_count = stable_count + 1
                 bumps.append((full, new_count))
                 if new_count >= stable_rounds:
-                    logger.info("文件已稳定：%s", os.path.basename(full))
+                    n_stable += 1
+                    logger.log(logging.INFO if n_stable <= LOG_EACH_MAX else logging.DEBUG,
+                               "文件已稳定：%s", os.path.basename(full))
                 touched += 1
         if len(new_files) + len(bumps) >= FLUSH_EVERY:
             # 分批提交：首轮扫一个大片库时别把几万条写入攒在内存里一次性写
@@ -94,4 +107,7 @@ def scan_once(store, cfg: dict) -> int:
             new_files, bumps = [], []
 
     store.apply_scan(new_files, bumps)
+    if n_new > LOG_EACH_MAX or n_stable > LOG_EACH_MAX:
+        logger.info("本轮扫描：发现新文件 %d 个、文件已稳定 %d 个（逐条只列前 %d 个，其余见 DEBUG 日志）",
+                    n_new, n_stable, LOG_EACH_MAX)
     return touched
