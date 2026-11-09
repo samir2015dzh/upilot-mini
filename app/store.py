@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS files(
   created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_status ON files(status, next_retry_at);
+-- 面板的「最近活动 / 任务明细」都按 updated_at 倒序翻页；没有索引时每次轮询全表排序
+-- （2 万条：翻到第 100 页 11ms、首页 1.8ms，面板每 3~5 秒刷一次）。老库在 executescript 时自动补上。
+CREATE INDEX IF NOT EXISTS idx_updated ON files(updated_at);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -90,6 +93,54 @@ class Store:
             )
             row = cur.fetchone()
             return dict(row) if row else None
+
+    def scan_lookup(self, paths: list[str]) -> dict[str, tuple]:
+        """扫描用：批量查 path → (size, mtime, status, stable_count)，只返回库里有的。
+
+        原来扫描对每个文件单独 SELECT 一次（2 万个文件 = 2 万次查询，占一轮扫描 CPU 的
+        八成以上）。现在按目录批量查（每批最多 500 个，避开 SQLite 变量个数上限）。
+        不一次性读全表：实测 2 万条全表快照会让常驻内存涨约 20MB（每轮扫描都建一次）。
+        """
+        out: dict[str, tuple] = {}
+        with self.lock:
+            for i in range(0, len(paths), 500):
+                batch = paths[i:i + 500]
+                marks = ",".join("?" * len(batch))
+                for r in self.db.execute(
+                        f"SELECT path, size, mtime, status, stable_count FROM files WHERE path IN ({marks})",
+                        batch):
+                    out[r[0]] = (r[1], r[2], r[3], r[4])
+        return out
+
+    def apply_scan(self, new_files: list[tuple[str, int, float]],
+                   bumps: list[tuple[str, int]]) -> None:
+        """扫描结果**一个事务**写回：新文件/被改写的文件入队、未稳定文件推进计数。
+
+        原来每个文件一次 UPDATE/INSERT + commit（2 万个新文件 = 2 万次提交）。
+        语义与逐条写入相同：新文件 INSERT OR REPLACE（旧 SHA1/断点作废）；
+        推进计数只改 stable_count（并刷新 updated_at），绝不碰 status。
+        bumps 里是 (path, 新计数)，要求库里当前值 = 新计数 - 1。
+        """
+        if not new_files and not bumps:
+            return
+        now = time.time()
+        with self.lock:
+            try:
+                if new_files:
+                    self.db.executemany(
+                        "INSERT OR REPLACE INTO files(path,size,mtime,status,created_at,updated_at)"
+                        " VALUES(?,?,?,'待处理',?,?)",
+                        [(p, sz, mt, now, now) for p, sz, mt in new_files])
+                if bumps:
+                    # 只在计数还是快照里那个值时才推进：扫描期间用户点了「立即处理」
+                    # （mark_ready / reset_one 把它置成 999）就别拿旧值把它盖回去。
+                    self.db.executemany(
+                        "UPDATE files SET stable_count=?, updated_at=? WHERE path=? AND stable_count=?",
+                        [(n, now, p, n - 1) for p, n in bumps])
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
 
     def add(self, path: str, size: int, mtime: float) -> dict:
         now = time.time()

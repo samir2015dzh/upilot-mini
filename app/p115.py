@@ -257,6 +257,19 @@ def resume_prefix(parts: list[dict], partsize: int, file_size: int) -> tuple[lis
     return keep, skip
 
 
+DEFAULT_OSS_ENDPOINT = "https://oss-cn-shenzhen.aliyuncs.com"
+
+
+def oss_endpoint(cfg: dict) -> str:
+    """分块上传的 OSS 地址：取 `upload.oss_endpoint`，没填或不是 http(s) 地址就用默认值。"""
+    raw = str(((cfg or {}).get("upload") or {}).get("oss_endpoint") or "").strip().rstrip("/")
+    if raw.startswith(("https://", "http://")) and len(raw) > len("https://"):
+        return raw
+    if raw:
+        logger.warning("upload.oss_endpoint 不是 http(s) 地址（%s），改用默认 %s", raw, DEFAULT_OSS_ENDPOINT)
+    return DEFAULT_OSS_ENDPOINT
+
+
 class ProgressThrottle:
     """进度写库节流：距上次写入不足 interval 秒就只记在内存里，不写库。
 
@@ -804,7 +817,7 @@ class P115:
                              upload_file_init as oss_upload_file_init)
         from p115oss.oss import oss_url
 
-        endpoint = "https://oss-cn-shenzhen.aliyuncs.com"
+        endpoint = oss_endpoint(getattr(self, "cfg", None) or {})
         headers = {"cookie": self.client.cookies}
 
         up, parts = None, []

@@ -1,9 +1,12 @@
 FROM python:3.12-slim
 
+# MALLOC_ARENA_MAX=2：glibc 默认每个线程最多建 8×CPU 个内存 arena，Web 线程 + 哈希/扫描线程
+# 一多，空闲内存还回不去、RSS 慢慢涨。限成 2 个对这种 I/O 密集的小服务没有性能影响。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 

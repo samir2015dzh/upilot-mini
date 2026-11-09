@@ -106,6 +106,8 @@ DEFAULTS: dict = {
         "cleanup_previous_versions": False,
         # 单次最多删几个：同集旧版本超过这个数就不动手（防命名意外导致批量误删）
         "cleanup_max_delete": 3,
+        # 分块上传用的阿里云 OSS 地址。115 换了存储桶区域时改这里即可，不用等发版。
+        "oss_endpoint": "https://oss-cn-shenzhen.aliyuncs.com",
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
               "long_interval_seconds": 900},
