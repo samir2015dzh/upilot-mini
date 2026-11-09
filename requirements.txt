@@ -1,4 +1,9 @@
 # UPilot-mini 依赖（Python >= 3.12）
-# p115client 自带 p115oss / p115pickcode / p115cipher 等子依赖
-p115client>=0.0.9.4,<0.1
+# p115client 自带 p115oss / p115pickcode / p115cipher 等子依赖。
+# 固定到验证过的版本：p115client 是 0.0.x 快速迭代的库，不锁的话每次 CI 重建都可能拿到
+# 行为不同的新版本（分块续传就依赖 p115oss 的 part_iter 语义）。实测旧的 0.0.9.6.5.1
+# 配今天的子依赖已经 import 失败（concurrenttools 改了接口），所以全部子依赖另由
+# constraints.txt 锁死。升级：改这里 + 重新生成 constraints.txt + 真机跑一次清单。
+p115client==0.0.9.7.2
+p115oss==0.1.2
 PyYAML>=6.0

@@ -7,8 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt constraints.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt -c /app/constraints.txt
 
 COPY app/ /app/app/
 COPY config/config.example.yaml /app/config/config.example.yaml

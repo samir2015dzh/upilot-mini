@@ -1,0 +1,6 @@
+# CI 里跑 `ruff check app`。只开 pyflakes(F) + bugbear(B)：抓未定义名、未用变量、
+# 可变默认参数这类真 bug，不做风格类检查。
+target-version = "py312"
+
+[lint]
+select = ["F", "B"]
