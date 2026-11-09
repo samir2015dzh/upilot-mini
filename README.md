@@ -13,7 +13,9 @@ docker pull samir2013dzh/upilot-mini:latest     # Docker Hub，amd64 + arm64
 docker pull ghcr.io/samir2015dzh/upilot-mini:latest   # 备用：GHCR
 ```
 
-镜像由本仓库的 GitHub Actions 在每次推送到 `main` 时自动构建（多架构），源代码在
+镜像由本仓库的 GitHub Actions 在每次推送到 `main` 时自动构建（多架构）：**先跑 lint 和离线测试，
+全部通过才构建、推送**。每次推送除了 `:latest` 还有 `:<运行编号>` 和 `:sha-<提交前 7 位>` 两个固定标签，
+出问题时把 compose 里的 `:latest` 换成上一个能用的 `:sha-xxxxxxx` 就能回滚。源代码在
 `https://github.com/samir2015dzh/upilot-mini`（私有仓库）。
 
 用镜像跑（不本地构建）：
@@ -160,6 +162,17 @@ JSON 接口（脚本、监控、HomeAssistant 都能用）：
 | POST | `/api/config` | 保存设置（写回 config.yaml 并立即生效） |
 | GET | `/api/logs` | 最近的运行日志（内存环形缓冲，不落盘） |
 | GET | `/static/*` | 前端静态资源（白名单：app.css / app.js） |
+
+**跨站请求防护（CSRF）**：所有 POST 都会检查是不是别的网站借你的浏览器发的——浏览器带的
+`Sec-Fetch-Site` 必须是 `same-origin`；老浏览器没有这个头时看 `Origin` / `Referer`，必须是本服务自己
+（请求的 Host、反代转发的 `X-Forwarded-Host`、或 `http.public_url`）。curl / 监控脚本不带这些头，照常放行。
+另外 `/api/*` 带请求体时**只收 JSON**（`Content-Type: application/json`），例如：
+
+```bash
+curl -X POST http://host:9844/api/scan                                   # 无请求体，直接发
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"path":"/media/source/a.mkv","action":"retry"}' http://host:9844/api/task
+```
 
 ### 界面能改什么（三页布局）
 
@@ -384,7 +397,7 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **秒传总不命中**：正常。115 只对「网盘里已有完全相同文件（SHA1 一致）」的才秒传；第一次上传必然走流量。
 - **大量小文件报 401**：115 限流。把 `upload.init_min_interval` 调大（如 1.0~2.0），或把 `upload.concurrency` 降到 1。
 - **报 10014 / 云端目录不存在**：程序会自动清 cid 缓存并重建目录后重试。
-- **暂停/重启后大文件要重传吗**：不用。分块的 `upload_id` 等一直在库里，重启后 `list_parts` 校验后从已传分块继续。
+- **暂停/重启后大文件要重传吗**：不用。分块的 `upload_id` 和当时的分块大小都在库里，重启后 `list_parts` 取回已传分块，本地文件从已传字节处接着读、按原分块大小继续传（中途改了 `partsize_mb` 也不影响续传）。分块上传中途失败（比如断网）会按 30 秒、60 秒退避自动续传，连续 3 次失败才标「错误」。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。
 - **想临时停一下上传**：界面上点「暂停调度」，在途任务跑完就停；点「恢复调度」继续。
 - **想重新传某个文件**：删库里那行（`sqlite3 /config/state.db "delete from files where path like '%xxx%'"`），下一轮扫描会重新入队。
@@ -393,6 +406,13 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 ## 9. 本地（不进容器）跑测试
 
 ```bash
-pip install -r requirements.txt        # 需要 Python >= 3.12
-python tests/test_flow.py              # 5 个离线用例：目录保留 / 秒传重试 / SHA1 复用 / 小文件直传 / 去重
+pip install PyYAML ruff                # 离线测试只需要 PyYAML（115 客户端全部用替身）；Python >= 3.12
+ruff check app                         # 与 CI 同一套规则（ruff.toml：F + B）
+python tests/test_flow.py              # 47 个离线用例，约 30 秒；CI 在构建镜像之前跑同一套
+```
+
+要装完整运行依赖（真跑服务）：
+
+```bash
+pip install -r requirements.txt -c constraints.txt   # constraints.txt 锁死全部子依赖
 ```
