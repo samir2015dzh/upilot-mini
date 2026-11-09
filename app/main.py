@@ -159,7 +159,10 @@ async def run_service(cfg: dict, dry_run: bool) -> int:
                     logger.info("配置已更新：重建 115 客户端与调度器")
                     manager = build_manager()
                     uploader = Uploader(cfg, store, manager)
-                scanner.scan_once(store, cfg)
+                # 扫描放到线程里：os.walk + 逐个 stat 在几万个文件 / 网络挂载上要几秒到
+                # 几十秒，原来同步跑在事件循环里，期间在途的秒传、SHA1、巡检全被按住。
+                # 仍然 await 它跑完再 dispatch，所以「先扫后派发」的顺序不变。
+                await asyncio.to_thread(scanner.scan_once, store, cfg)
                 state["scan_rounds"] += 1
                 state["last_scan"] = time.time()
                 if state.get("paused"):

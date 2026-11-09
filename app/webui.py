@@ -8,6 +8,9 @@
 GET  /               单页界面（app/static/index.html）
 GET  /login          登录页（form 模式）
 POST /login          提交登录（application/x-www-form-urlencoded 或 JSON）
+
+所有 POST 都过 CSRF 检查（csrf_reject_reason）：浏览器发起的必须同源；
+/api/* 的请求体只收 application/json。
 GET  /logout         退出登录，清 Cookie
 GET  /api/status     状态：统计、正在处理、最近活动、配置摘要
 GET  /api/config     设置页表单结构（密钥字段只回脱敏状态）
@@ -331,6 +334,63 @@ def _fill_login(tpl: str, next_url: str, error: str, user: str, site: str) -> by
     return html.encode("utf-8")
 
 
+def _origin_of(url: str) -> str:
+    """'https://a.b:8443/x?y' → 'https://a.b:8443'；解析不了返回空串。"""
+    try:
+        u = urlparse(str(url or "").strip())
+    except ValueError:
+        return ""
+    if u.scheme not in ("http", "https") or not u.netloc:
+        return ""
+    return f"{u.scheme}://{u.netloc}".lower()
+
+
+def _allowed_origins(cfg: dict, headers) -> set[str]:
+    """本服务自己的源：请求的 Host、反代转发的 X-Forwarded-Host、配置的 public_url。"""
+    out: set[str] = set()
+    for raw in (headers.get("Host"), (headers.get("X-Forwarded-Host") or "").split(",")[0]):
+        host = str(raw or "").strip().lower()
+        if host:
+            out.update({f"http://{host}", f"https://{host}"})
+    site = _origin_of((cfg.get("http") or {}).get("public_url") or "")
+    if site:
+        out.add(site)
+    return out
+
+
+def csrf_reject_reason(cfg: dict, headers, path: str, has_body: bool) -> str:
+    """改状态的 POST 是否像跨站伪造（CSRF）。放行返回空串，否则返回拒绝原因。
+
+    默认不开鉴权、basic 模式下浏览器又会自动带上缓存的凭据，所以任何网页都能
+    让本机浏览器往面板 POST 一个表单（比如打开「传完删本地」）。三道判断：
+      1) 浏览器给的 `Sec-Fetch-Site`（网页伪造不了）：只认 same-origin / none；
+         反代把 Host 改写了也不影响这一条。
+      2) 老浏览器没有 Sec-Fetch-Site 时看 `Origin`，再没有就看 `Referer`：
+         必须是本服务自己的源（Host / X-Forwarded-Host / http.public_url）。
+      3) 三个头都没有 ⇒ 不是浏览器发起的（curl / 监控脚本），照旧放行。
+    另外 `/api/*` 带请求体时只收 `application/json`：跨站表单发不出 JSON，
+    想发就得过 CORS 预检，而本服务不回 CORS 头。自带的面板本来就全用 JSON。
+    """
+    sfs = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if sfs:
+        if sfs not in ("same-origin", "none"):
+            return f"拒绝跨站请求（Sec-Fetch-Site={sfs}）"
+    else:
+        origin = str(headers.get("Origin") or "").strip()
+        referer = str(headers.get("Referer") or "").strip()
+        if origin:
+            if origin.lower() == "null" or _origin_of(origin) not in _allowed_origins(cfg, headers):
+                return f"拒绝跨站请求（Origin={origin[:100]}）"
+        elif referer:
+            if _origin_of(referer) not in _allowed_origins(cfg, headers):
+                return "拒绝跨站请求（Referer 不是本站）"
+    if path.startswith("/api/") and has_body:
+        ctype = str(headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return "接口只接受 application/json 请求体"
+    return ""
+
+
 def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
     http_cfg = cfg.get("http") or {}
     if not http_cfg.get("enabled", True):
@@ -564,6 +624,17 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             parsed = urlparse(self.path)
             path = parsed.path
             a = auth_cfg(cfg)
+            try:
+                has_body = int(self.headers.get("Content-Length") or 0) > 0
+            except ValueError:
+                has_body = False
+            why = csrf_reject_reason(cfg, self.headers, path, has_body)
+            if why:
+                logger.warning("拦截可疑 POST %s：%s（来源 %s）", path, why, self._client_ip())
+                self.close_connection = True          # 请求体没读，别让它错位到下一个请求
+                if path.startswith("/api/"):
+                    return self._json({"ok": False, "error": why}, 403)
+                return self._send(403, why.encode("utf-8"), "text/plain; charset=utf-8")
             if path == "/login" and _mode(a) == "form" and _enabled(a):
                 return self._do_login(parsed)
             if not self._guard():

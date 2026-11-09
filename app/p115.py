@@ -221,6 +221,69 @@ def resolve_upload_target(file_path: str, source_path: str, target_root: str,
     return normalize_cloud_path(root)
 
 
+def _part_field(part: dict, *names: str) -> int:
+    for n in names:
+        v = part.get(n)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def resume_prefix(parts: list[dict], partsize: int, file_size: int) -> tuple[list[dict], int]:
+    """从云端已传分块里挑出**可以直接沿用**的那一段，返回 (分块列表, 已传字节数)。
+
+    只认从 1 开始、编号连续、每块恰好 partsize 字节的前缀（最后一块可以更短，但那样
+    必须正好到文件末尾）。中间缺块、大小对不上的都不沿用 —— 之后的数据按原编号重传
+    （OSS 同编号重传会覆盖旧分块）。返回的字节数就是本地文件要 seek 到的偏移。
+    """
+    ordered = sorted(parts or [], key=lambda p: _part_field(p, "PartNumber", "part_number"))
+    keep: list[dict] = []
+    skip = 0
+    for i, p in enumerate(ordered, start=1):
+        if _part_field(p, "PartNumber", "part_number") != i:
+            break
+        size = _part_field(p, "Size", "size")
+        if size == partsize and skip + size <= file_size:
+            keep.append(p)
+            skip += size
+            continue
+        if 0 < size < partsize and skip + size == file_size:
+            keep.append(p)               # 最后一块（不满 partsize），正好收尾
+            skip += size
+        break
+    return keep, skip
+
+
+class ProgressThrottle:
+    """进度写库节流：距上次写入不足 interval 秒就只记在内存里，不写库。
+
+    分块上传的回调粒度是 64KB，逐次写 SQLite（UPDATE + commit，抢同一把锁）
+    在 10GB 文件上是十几万次写入，还会拖慢面板查询。面板本来就是轮询刷新，
+    每秒一次足够（与 sha1_of 的进度回写同一口径）；收尾用 force=True 写最终值。
+    """
+
+    def __init__(self, write, interval: float = 1.0, cap: float = 99.9):
+        self.write = write
+        self.interval = interval
+        self.cap = cap
+        self.last_t = float("-inf")
+        self.last_pct: float | None = None
+
+    def update(self, pct: float, force: bool = False) -> None:
+        pct = round(min(max(float(pct), 0.0), self.cap), 2)
+        if pct == self.last_pct:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_t < self.interval:
+            return
+        self.write(pct)
+        self.last_t = now
+        self.last_pct = pct
+
+
 class P115:
     """真实 115 客户端。"""
 
@@ -672,8 +735,8 @@ class P115:
                     if mark in (str(r.get("pc") or ""), str(r.get("fid") or ""))]
             if mine and max(mine) < newest:
                 return {"deleted": [],
-                        "note": (f"本次上传那条不是云端最新的（同集另有更晚上传的版本），"
-                                 f"交给它处理，本次不动手")}
+                        "note": ("本次上传那条不是云端最新的（同集另有更晚上传的版本），"
+                                 "交给它处理，本次不动手")}
         victims = [(str(r.get("n") or r.get("name") or ""),
                     str(r.get("fid") or r.get("file_id") or ""))
                    for t, r in ts if t < newest]
@@ -774,22 +837,40 @@ class P115:
                            upload_callback=json.dumps(callback), upload_partsize=self.partsize)
             parts = []
 
-        done = list(parts)
-        total = max(os.path.getsize(file_path), 1)
-        sent = sum(int(p.get("size") or 0) for p in done)
+        # 续传必须用**建断点时**的分块大小：两次运行之间用户改了 partsize_mb，
+        # 按新值切块会让已传分块与本地偏移对不上。
+        partsize = self.partsize
+        if parts:
+            partsize = int(record.get("upload_partsize") or 0) or self.partsize
+        file_size = os.path.getsize(file_path)
+        done, skip = resume_prefix(parts, partsize, file_size)
+        if parts and len(done) != len(parts):
+            logger.warning("断点续传：%s 云端 %d 个分块里只有前 %d 个连续可用，其余重传",
+                           os.path.basename(file_path), len(parts), len(done))
+        total = max(file_size, 1)
+        sent = skip
+        progress = ProgressThrottle(lambda pct: self.store.set(record["path"], progress=pct))
+        progress.update(sent / total * 100, force=bool(skip))
 
         def reporthook(delta: int):
+            # p115oss 每读 64KB 回调一次：10GB ≈ 16 万次。只在内存里累加，
+            # 由 ProgressThrottle 按时间/百分比节流后才写库。
             nonlocal sent
             sent += int(delta or 0)
-            self.store.set(record["path"], progress=round(min(sent / total * 100, 99.9), 2))
+            progress.update(sent / total * 100)
 
         with open(file_path, "rb") as fh:
+            # 【第 48 处】p115oss 的 part_iter 不会自己跳过已传数据（其文档原话：
+            # 「如果需要跳过一定的数据，请提前处理好」）。原来句柄停在偏移 0、分块编号却
+            # 从 len(parts)+1 开始 ⇒ 第 N+1 块传的是文件开头的数据，云端拼出来是坏文件。
+            fh.seek(skip)
             async for part in oss_multipart_upload_part_iter(
                 up.url, up.upload_id, fh,
-                part_number_start=len(parts) + 1, partsize=self.partsize,
+                part_number_start=len(done) + 1, partsize=partsize,
                 endpoint=endpoint, reporthook=reporthook, async_=True, headers=headers,
             ):
                 done.append(part)
+        progress.update(sent / total * 100, force=True)
 
         result = await up.complete(done, async_=True, headers=headers)
         if not isinstance(result, dict):
