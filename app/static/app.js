@@ -244,9 +244,11 @@ function renderOverview(d) {
   const activeCount = (by["处理中"]?.count || 0) + (by["秒传中"]?.count || 0)
     + (by["上传中"]?.count || 0) + (by["待重试"]?.count || 0);
 
-  $("#env-pill").innerHTML = d.dry_run
-    ? '<span class="dot amber"></span>dry-run 离线自检 · 数字为模拟'
-    : '<span class="dot"></span>在线运行';
+  const env = $("#env-pill");
+  const envLabel = d.dry_run ? "dry-run 离线自检 · 数字为模拟" : "在线运行";
+  env.className = d.dry_run ? "env-dot amber" : "env-dot";
+  env.title = envLabel;
+  env.setAttribute("aria-label", envLabel);
   const au = d.auth || {};
   const useSession = !!(au.enabled && au.mode === "form");
   $("#btn-logout").style.display = useSession ? "" : "none";

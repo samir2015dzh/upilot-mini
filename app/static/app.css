@@ -79,6 +79,11 @@ h1{font-size:18px;margin:0;font-weight:650;letter-spacing:-.02em;display:flex;al
 .dot{width:6px;height:6px;border-radius:50%;background:var(--emerald);flex:none}
 .dot.off{background:var(--rose)}
 .dot.amber{background:var(--amber)}
+/* 顶栏环境指示：标题旁小圆点，文案只放 title / aria-label，悬停或长按可见 */
+.env-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--emerald);
+  box-shadow:0 0 0 3px var(--ok-soft);flex:none;position:relative;cursor:default;vertical-align:middle}
+.env-dot.amber{background:var(--amber);box-shadow:0 0 0 3px var(--warn-soft)}
+.env-dot::after{content:"";position:absolute;inset:-8px}
 .spacer{flex:1}
 .btns{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line-2);
