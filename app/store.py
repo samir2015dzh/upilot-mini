@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS files(
   message TEXT,
   upload_mode TEXT,
   source_deleted INTEGER NOT NULL DEFAULT 0,
+  ino TEXT,
   created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_status ON files(status, next_retry_at);
@@ -39,6 +40,14 @@ CREATE INDEX IF NOT EXISTS idx_updated ON files(updated_at);
 -- 覆盖索引让这几条聚合只扫索引不回表：2 万条记录 5.1 → 3.0 ms/次（面板每 5 秒一次）。
 CREATE INDEX IF NOT EXISTS idx_stats ON files(status, size, upload_mode, retry_count);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+# 依赖「老库补列」之后才存在的列的索引：必须在 _migrate 之后建，
+# 放进 DDL 会让老库在 executescript 时就报 no such column。
+POST_MIGRATE_DDL = """
+-- 「同一个文件换了路径」（改名 / 移动 / 硬链接）复用已算好的 SHA1：按 设备:inode 找。
+CREATE INDEX IF NOT EXISTS idx_ino ON files(ino);
 """
 
 
@@ -65,6 +74,7 @@ class Store:
             self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(DDL)
             self._migrate()
+            self.db.executescript(POST_MIGRATE_DDL)
             self.db.commit()
 
     def _migrate(self) -> None:
@@ -115,7 +125,23 @@ class Store:
                     out[r[0]] = (r[1], r[2], r[3], r[4])
         return out
 
-    def apply_scan(self, new_files: list[tuple[str, int, float]],
+    def find_sha1(self, ino: str | None, size: int, mtime: float, exclude_path: str) -> str | None:
+        """同一个文件（设备:inode + size + mtime 都相同）在别的路径下已经算好的 SHA1。
+
+        改名 / 移动目录 / 硬链接时路径变了，库里会新建一条记录；原来会把整个文件
+        重新读一遍（20GB 原盘在机械盘上约 2 分钟）。inode 相同说明是同一份数据，
+        再加 size + mtime 双保险，排除 inode 被删后复用给别的文件。
+        """
+        if not ino:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT sha1 FROM files WHERE ino=? AND size=? AND abs(mtime-?)<=1e-6"
+                " AND sha1 IS NOT NULL AND sha1<>'' AND path<>? LIMIT 1",
+                (ino, size, mtime, exclude_path)).fetchone()
+        return row[0] if row else None
+
+    def apply_scan(self, new_files: list[tuple],
                    bumps: list[tuple[str, int]]) -> None:
         """扫描结果**一个事务**写回：新文件/被改写的文件入队、未稳定文件推进计数。
 
@@ -130,10 +156,12 @@ class Store:
         with self.lock:
             try:
                 if new_files:
+                    # new_files 里是 (path, size, mtime[, ino])；老调用方不带 ino 也能用
                     self.db.executemany(
-                        "INSERT OR REPLACE INTO files(path,size,mtime,status,created_at,updated_at)"
-                        " VALUES(?,?,?,'待处理',?,?)",
-                        [(p, sz, mt, now, now) for p, sz, mt in new_files])
+                        "INSERT OR REPLACE INTO files(path,size,mtime,ino,status,created_at,updated_at)"
+                        " VALUES(?,?,?,?,'待处理',?,?)",
+                        [(f[0], f[1], f[2], f[3] if len(f) > 3 else None, now, now)
+                         for f in new_files])
                 if bumps:
                     # 只在计数还是快照里那个值时才推进：扫描期间用户点了「立即处理」
                     # （mark_ready / reset_one 把它置成 999）就别拿旧值把它盖回去。

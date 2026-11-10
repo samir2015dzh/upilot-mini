@@ -154,8 +154,31 @@ def _same_file(path: str, record: dict) -> bool:
         return True
 
 
+def _reuse_sha1(path: str, record: dict, store) -> str | None:
+    """同一个文件换了路径（改名 / 移动目录 / 硬链接）：直接用另一条记录里算好的 SHA1。
+
+    只在磁盘上的文件此刻仍是记录里那份（设备:inode、size、mtime 全对得上）时复用。
+    """
+    ino = record.get("ino")
+    if not ino or not hasattr(store, "find_sha1"):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if f"{st.st_dev}:{st.st_ino}" != ino or not _same_file(path, record):
+        return None
+    digest = store.find_sha1(ino, int(record["size"]), float(record["mtime"]), path)
+    if not digest:
+        return None
+    store.set(path, sha1=digest, progress=0.0)
+    logger.info("SHA1 复用（同一文件换了路径/硬链接，不再读盘）：%s → %s",
+                os.path.basename(path), digest)
+    return digest
+
+
 async def sha1_of(path: str, record: dict, store) -> str | None:
-    """算过就直接复用（重启/重试都不再读盘）；没算过则 8MB 分块流式算。
+    """算过就直接复用（重启/重试都不再读盘）；没算过则 1MB 分块流式算；同一文件换了路径时复用已有结果。
 
     读盘 + 哈希放到线程池里跑：原来是 async 函数里的同步循环，算一个 20GB 原盘时
     整个事件循环停住（秒传、巡检、主循环扫描全部停摆，机械盘上约 3 分钟）。
@@ -165,6 +188,9 @@ async def sha1_of(path: str, record: dict, store) -> str | None:
     """
     if record.get("sha1"):
         return record["sha1"]
+    reused = _reuse_sha1(path, record, store)
+    if reused:
+        return reused
     total = record["size"] or 1
     cancel = threading.Event()
 

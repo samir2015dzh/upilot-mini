@@ -83,7 +83,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 ## 3. 工作流程（与官方行为一致）
 
 ```
-发现新文件 → 等稳定（连续 N 轮 size/mtime 不变）→ 算 SHA1（1MB 分块，算完落库）
+发现新文件 → 等稳定（连续 N 轮 size/mtime 不变）→ 算 SHA1（1MB 分块，算完落库；同一文件改名/移动/硬链接时直接复用，不再读盘）
    ↓
 建目标目录（fs_makedirs 整条链，保留相对结构，cid 带缓存）
    ↓
@@ -97,7 +97,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
    └─ 未命中 & 大文件 → 待重试（默认 60s 后，最多 max_count 次 / max_hours 小时）
           每次重试只重发校验请求，不重传数据            ← 仅 rapid_then_upload
    ↓
-分块上传（10MB 分块，OSS 多段上传；upload_id / callback / oss_url 落库 → 暂停或重启后从已传分块继续）
+分块上传（默认 10MB 分块，超过 97.6 GiB 的文件自动放大分块、保证不超过 OSS 的 10000 片；OSS 多段上传；upload_id / callback / oss_url 落库 → 暂停或重启后从已传分块继续）
 ```
 
 不重复读盘的四道防线：秒传命中根本不读文件 → SHA1 落库后不再重算 → 同 path+size+mtime 的扫描去重 → 稳定判定（避免文件还在写就上传）。

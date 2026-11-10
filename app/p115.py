@@ -232,6 +232,22 @@ def _part_field(part: dict, *names: str) -> int:
     return 0
 
 
+# 阿里云 OSS 分片上传最多 10000 片。固定 10MB 分块时，超过 97.6 GiB 的文件（4K 原盘
+# remux / ISO，115 单文件上限约 115GB）会在第 10001 片被 OSS 拒绝，并且每次续传都卡在
+# 同一处。参考 https://github.com/orzogc/fake115uploader/blob/40b9b5a76675e52527bab3e10639198b64facad0/multipart.go
+# （大文件按片数切，最多 10000 片）。这里保持配置的分块大小为下限，只在会超片数时放大。
+OSS_MAX_PARTS = 10000
+_MIB = 1024 * 1024
+
+
+def part_size_for(file_size: int, base: int) -> int:
+    """分块大小：至少 base；会超过 OSS_MAX_PARTS 片时放大到刚好够（按 1MiB 向上取整）。"""
+    base = max(_MIB, int(base))
+    need = -(-int(file_size) // OSS_MAX_PARTS)          # ceil
+    need = -(-need // _MIB) * _MIB
+    return max(base, need)
+
+
 def resume_prefix(parts: list[dict], partsize: int, file_size: int) -> tuple[list[dict], int]:
     """从云端已传分块里挑出**可以直接沿用**的那一段，返回 (分块列表, 已传字节数)。
 
@@ -846,16 +862,17 @@ class P115:
             callback = data.get("callback") or resp.get("callback")
             upload_id = await oss_multipart_upload_init(url, async_=True, headers=headers)
             up = P115MultipartUpload(url, file_path, callback, upload_id)
+            fresh_size = part_size_for(os.path.getsize(file_path), self.partsize)
             self.store.set(record["path"], upload_id=upload_id, upload_oss_url=url,
-                           upload_callback=json.dumps(callback), upload_partsize=self.partsize)
+                           upload_callback=json.dumps(callback), upload_partsize=fresh_size)
             parts = []
 
         # 续传必须用**建断点时**的分块大小：两次运行之间用户改了 partsize_mb，
         # 按新值切块会让已传分块与本地偏移对不上。
-        partsize = self.partsize
-        if parts:
-            partsize = int(record.get("upload_partsize") or 0) or self.partsize
         file_size = os.path.getsize(file_path)
+        partsize = part_size_for(file_size, self.partsize)
+        if parts:
+            partsize = int(record.get("upload_partsize") or 0) or partsize
         done, skip = resume_prefix(parts, partsize, file_size)
         if parts and len(done) != len(parts):
             logger.warning("断点续传：%s 云端 %d 个分块里只有前 %d 个连续可用，其余重传",
@@ -962,9 +979,10 @@ class StubP115:
 
     async def multipart(self, file_path: str, pid: int, sha1: str, record: dict) -> dict:
         size = os.path.getsize(file_path)
-        blocks = max(1, (size + self.partsize - 1) // self.partsize)
+        ps = part_size_for(size, self.partsize)
+        blocks = max(1, (size + ps - 1) // ps)
         logger.info("[dry-run] 分块上传 %s：%d 块 × %dMB → pid=%s",
-                    os.path.basename(file_path), blocks, self.partsize // 1024 // 1024, pid)
+                    os.path.basename(file_path), blocks, ps // 1024 // 1024, pid)
         for i in range(blocks):
             self.store.set(record["path"], progress=round((i + 1) / blocks * 100, 2))
             await asyncio.sleep(0)

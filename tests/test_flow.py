@@ -4432,6 +4432,153 @@ def case_stats_covering_index():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_sha1_reuse_same_inode():
+    """[65] 同一个文件换了路径（改名 / 移动目录 / 硬链接）复用已算好的 SHA1，不再整份读盘。
+
+    原来路径一变就新建记录、从头算：给剧集目录改个名，整季几十 GB 全部重读一遍。
+    """
+    import sqlite3
+
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    real = upmod._sha1_file
+    reads: list[str] = []
+
+    def counting(path, total, on_progress, cancel):
+        reads.append(os.path.basename(path))
+        return real(path, total, on_progress, cancel)
+
+    upmod._sha1_file = counting
+    try:
+        a = write_file(src, "旧名/S01E01.mkv", 3 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        rec = store.get(a)
+        assert rec["ino"], rec
+        d1 = await sha1_of(a, rec, store)
+        assert reads == ["S01E01.mkv"], reads
+
+        # 1) 改名整个目录：新路径新记录，SHA1 直接复用
+        os.rename(os.path.join(src, "旧名"), os.path.join(src, "新名"))
+        b = os.path.normpath(os.path.join(src, "新名", "S01E01.mkv"))
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(b, store.get(b), store) == d1
+        assert len(reads) == 1, f"改名后又读了一遍盘：{reads}"
+        assert store.get(b)["sha1"] == d1
+
+        # 2) 硬链接：同一份数据第二个路径
+        c = os.path.normpath(os.path.join(src, "链接", "S01E01.mkv"))
+        os.makedirs(os.path.dirname(c))
+        os.link(b, c)
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(c, store.get(c), store) == d1 and len(reads) == 1, reads
+
+        # 3) 拷贝（不同 inode）→ 照常算
+        cp = write_file(src, "拷贝/S01E01.mkv", 0)
+        shutil.copyfile(b, cp)
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(cp, store.get(cp), store) == d1 and len(reads) == 2, reads
+
+        # 4) 同 inode 但内容变了（size/mtime 变）→ 不复用
+        with open(c, "ab") as f:
+            f.write(b"more")
+        scanner.scan_once(store, cfg)
+        d_new = await sha1_of(c, store.get(c), store)
+        assert d_new != d1 and len(reads) == 3, (reads, d_new)
+
+        # 5) 老库（没有 ino 列）打开时自动补列 + 建索引
+        db = os.path.join(tmp, "old.db")
+        con = sqlite3.connect(db)
+        con.executescript(store_store.DDL.replace("  ino TEXT,\n", ""))
+        con.commit()
+        con.close()
+        st = Store(db)
+        cols = {r[1] for r in st.db.execute("PRAGMA table_info(files)")}
+        idx = {r[0] for r in st.db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "ino" in cols and "idx_ino" in idx, (cols, idx)
+        st.db.close()
+        PASS.append("[65] 同一文件换路径复用 SHA1：目录改名、硬链接都不再读盘；拷贝、内容变了照常算；"
+                    "老库自动补 ino 列和索引")
+    finally:
+        upmod._sha1_file = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_partsize_oss_limit():
+    """[66] 分块大小不超过 OSS 的 10000 片上限：固定 10MB 时 >97.6 GiB 的文件传不上去。"""
+    import p115 as p115mod
+
+    MiB, GiB = 1024 * 1024, 1024 ** 3
+    ps = p115mod.part_size_for
+    assert ps(20 * GiB, 10 * MiB) == 10 * MiB                    # 普通大小：不变
+    assert ps(0, 10 * MiB) == 10 * MiB
+    for size in (97 * GiB, 98 * GiB, 110 * GiB, 115 * 10 ** 9, 200 * GiB):
+        got = ps(size, 10 * MiB)
+        assert got % MiB == 0 and -(-size // got) <= p115mod.OSS_MAX_PARTS, (size, got)
+    assert ps(110 * GiB, 64 * MiB) == 64 * MiB                    # 用户设得更大：以用户为准
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    try:
+        path = os.path.join(src, "huge.iso")
+        size = 110 * GiB
+        with open(path, "wb") as f:                                 # 稀疏文件，不真占盘
+            f.truncate(size)
+        store.add(path, size, os.path.getmtime(path))
+        m = _bare_p115(store, 10 * MiB)
+        with _FakeOSS() as oss:
+            oss.fail_after_parts = 0                                # 记下参数就断开，不真读 110GB
+            try:
+                await m.multipart(path, 700, "sha", store.get(path))
+            except ConnectionResetError:
+                pass
+        used = oss.calls[0]["partsize"]
+        assert -(-size // used) <= 10000, used
+        assert store.get(path)["upload_partsize"] == used, "断点里要记下实际用的分块大小"
+        # 续传按断点里记的大小走，即使配置变了
+        with _FakeOSS({1: b"\0" * used}) as oss2:
+            oss2.fail_after_parts = 0
+            m.partsize = 32 * MiB
+            try:
+                await m.multipart(path, 700, "sha", store.get(path))
+            except ConnectionResetError:
+                pass
+        assert oss2.calls[0]["partsize"] == used and oss2.calls[0]["offset"] == used, oss2.calls
+        PASS.append(f"[66] 110 GiB 文件分块自动放大到 {used // MiB} MB（{-(-size // used)} 片 ≤ 10000），"
+                    f"断点记下实际分块大小、续传沿用")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_scan_log_capped():
+    """[67] 一轮扫描逐条 INFO 最多 20 条，其余 DEBUG，外加一行汇总（首扫 2 万个文件原来刷 4 万行）。"""
+    import logging
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    try:
+        for i in range(30):
+            write_file(src, f"剧/E{i:02d}.mkv", 1024)
+        with _ListHandler() as recs:
+            scanner.scan_once(store, cfg)                        # 30 个新文件
+            scanner.scan_once(store, cfg)                        # 30 个变稳定
+        allinfo = [r.getMessage() for r in recs if r.levelno >= logging.INFO]
+        info = [m for m in allinfo if not m.startswith("本轮扫描")]
+        dbg = [r.getMessage() for r in recs if r.levelno == logging.DEBUG]
+        assert sum("发现新文件" in m for m in info) == 20, info
+        assert sum("文件已稳定" in m for m in info) == 20, info
+        assert sum("发现新文件" in m for m in dbg) == 10 and sum("文件已稳定" in m for m in dbg) == 10
+        summ = [m for m in allinfo if m.startswith("本轮扫描")]
+        assert len(summ) == 2 and "30" in summ[0], summ
+        # 少量文件：照旧逐条 INFO，不打汇总
+        write_file(src, "新/E99.mkv", 1024)
+        with _ListHandler() as recs:
+            scanner.scan_once(store, cfg)
+        info = [r.getMessage() for r in recs if r.levelno >= logging.INFO]
+        assert sum("发现新文件" in m for m in info) == 1 and not any(m.startswith("本轮扫描") for m in info)
+        PASS.append("[67] 扫描日志：每轮逐条 INFO 最多 20 条，其余降 DEBUG，超出时打一行汇总；少量文件照旧")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -4492,6 +4639,9 @@ async def main():
     await case_health_heartbeat()
     case_dockerfile_precompile()
     case_stats_covering_index()
+    await case_sha1_reuse_same_inode()
+    await case_partsize_oss_limit()
+    case_scan_log_capped()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
