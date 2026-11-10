@@ -332,6 +332,15 @@ def _auth_failed() -> dict | None:
         return None
 
 
+def _rate_limited_status() -> dict | None:
+    """115 限流 / 风控冷却（uploader.rate_status）。不要和登录页的 _rate_limited(ip) 搞混。"""
+    try:
+        from uploader import rate_status
+        return rate_status()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _replacements() -> list[dict]:
     """最近的洗板替换记录（uploader 里记的，最新在前）；取不到就当没有。"""
     try:
@@ -350,6 +359,7 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "dry_run": bool(state.get("dry_run")),
         "paused": bool(state.get("paused")),
         "auth_failed": _auth_failed(),
+        "rate_limited": _rate_limited_status(),
         "replacements": _replacements(),
         "scan_rounds": state.get("scan_rounds", 0),
         "last_scan": state.get("last_scan"),

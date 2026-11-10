@@ -140,6 +140,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 
 - 从 `rapid_then_upload` 切回来时，没传完的分块记录不会续传，统一回到秒传队列。
 - 云端一直没有的文件会一直留在「待重试」，只占一条记录。想让它最终真传，把 `upload.mode` 换成 `rapid_then_upload`。
+- 如果 115 返回限流或风控（429、访问上限、操作太频繁），不会当成「没秒传到」去加次数。程序会暂停向 115 发请求，先等大约 1 分钟，不行再加倍，最长 1 小时，到点只放 1 个文件去试。面板上会有黄色提示。上一个删除还没做完这种「正忙」，只推迟这一个文件。
 
 ## 5. 界面（Web 仪表盘）
 
@@ -397,6 +398,7 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **容器显示 unhealthy**：用 `docker inspect --format '{{json .State.Health}}' upilot-mini` 看原因。如果是 `stalled: main loop heartbeat …`，说明程序卡住了，`docker restart upilot-mini` 即可，状态都在库里。
 - **分块上传断网抖一下就等半分钟**：不会。单个分块失败会原地重试 3 次（2/4/8 秒），只重传失败那一块。
 - **cookie 过期了会怎样**：程序会暂停向 115 发请求，每 5 分钟只放 1 个文件去试探，面板上有红色提示，文件不会被标成「错误」。在「115 账号」换上新 cookie，下一轮自动恢复。
+- **面板提示「115 暂时限制访问」**：被限流或风控了，不是文件的问题，也不会加重视试次数。过几分钟到一小时会自动再试，一般不用改设置。如果经常出现，可以把 `upload.init_min_interval` 调大一点，或把 `upload.concurrency` 降到 1。
 - **状态库备份**：每 24 小时自动备份一份 `state.db.bak`。库丢了，把它改名回 `state.db` 就行，省得重算全部 SHA1。
 - **115 换了 OSS 区域，分块上传连不上**：在 `config.yaml` 的 `upload` 下加 `oss_endpoint: "https://oss-cn-xxx.aliyuncs.com"`，默认是深圳。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。

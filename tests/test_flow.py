@@ -5316,6 +5316,287 @@ def case_hint_tone():
     PASS.append("[77] 设置页每项说明 ≤ 80 字、警示语 ≤ 60 字（防止再写成小作文）")
 
 
+
+async def case_delete_after_keeps_local_mtime():
+    """[78] 生产配置（传完删本地 + ignore 剧名 + 只秒传）下，旧版本地文件已经没了，
+    仍按库里记下的本地下载时间判新旧。
+
+    真机已经验证过「先 1080p、后 2160p」这一路。
+    这里补上更刁的反向：后下载的 2160p 先秒传命中，先下载的 1080p 更晚才命中，
+    云端上传时间会骗人，必须靠库里的 mtime 才能留对那份。
+    """
+    import uploader as upmod
+    from p115 import StubP115 as _Stub
+
+    class TsStub(_Stub):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.te: dict[str, int] = {}
+            self.gone: list[str] = []
+
+        async def list_dir(self, pid, use_cache=True):
+            rows = await super().list_dir(pid, use_cache)
+            out = []
+            for r in rows:
+                if r["fid"] in self.gone:
+                    continue
+                r = dict(r)
+                if r["n"] in self.te:
+                    r["te"] = self.te[r["n"]]
+                out.append(r)
+            return out
+
+        async def delete_file(self, file_id):
+            self.gone.append(file_id)
+            return True
+
+    now = time.time()
+    D = "乙剧样例 (2026) [tmdbid=100002]/Season 01"
+    OLD = "乙剧样例 (2026) [tmdbid=100002] S01E19 [1080p H265 AAC WEB-DL TX DemoWeb].mkv"
+    NEW = "乙剧样例 (2026) [tmdbid=100002] S01E19 [2160p H265 DDP 2.0 WEB-DL TX DemoWeb].mkv"
+    cfg, store, _m, _u, tmp, src = make_env(mode="rapid_only", fail_first=0, delete_after=True)
+    try:
+        cfg["upload"]["cleanup_previous_versions"] = True
+        cfg["upload"]["cleanup_title_match"] = "ignore"
+        cfg["upload"]["cleanup_dry_run"] = False
+        mgr = TsStub(cfg, store, fail_first=0)
+        up = Uploader(cfg, store, mgr)
+        p_old = write_file(src, f"{D}/{OLD}", 2 * 1024 * 1024)
+        p_new = write_file(src, f"{D}/{NEW}", 3 * 1024 * 1024)
+        os.utime(p_old, (now - 3600, now - 3600))
+        os.utime(p_new, (now, now))
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        # 云端时间故意写反：1080p 后秒传上去，te 更大
+        mgr.te = {NEW: 1000, OLD: 9000}
+        upmod._SHARED["replaced"].clear()
+        r_new = await drive(up, store, p_new)
+        assert r_new["status"] == "已上传" and not os.path.exists(p_new)
+        assert int(store.get(p_new).get("source_deleted") or 0) == 1
+        assert store.get(p_new).get("mtime")  # 本地没了，库里 mtime 还在
+        assert mgr.gone == [], "新版先就位时不应删任何东西"
+        r_old = await drive(up, store, p_old)
+        assert r_old["status"] == "已上传" and not os.path.exists(p_old)
+        assert int(store.get(p_old).get("source_deleted") or 0) == 1
+        assert mgr.gone == [f"stub-{p_old}"], f"应删先下载的 1080p：{mgr.gone}"
+        ev = list(upmod._SHARED["replaced"])
+        assert ev and ev[0]["kept"] == NEW and ev[0]["removed"] == [OLD]
+        assert ev[0]["basis"] == "本地下载时间", ev
+        # 两条本地都没了，库里记录都在，判据仍然是本地下载时间
+        assert store.get(p_old)["status"] == "已上传" and store.get(p_new)["status"] == "已上传"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    PASS.append("[78] 传完删本地时旧文件已经不在：反向秒传顺序仍按库里的本地下载时间留 2160p、"
+                "把 1080p 移进回收站；source_deleted 落库，mtime 还在")
+
+
+async def case_rate_limit_breaker():
+    """[79] 115 硬限流 / 风控：不当「秒传未命中」，共享冷却 + 封顶退避 + jitter；
+    软忙只推迟这一个文件。"""
+    import errno as _e
+    import urllib.error
+    import p115 as p115mod
+    import uploader as upmod
+
+    # ---- A) 分类与退避公式 ----
+    assert p115mod.is_rate_limited({"state": False, "errno": 590075,
+                                    "error": "操作太频繁，请稍候再试"})
+    assert p115mod.is_rate_limited({"state": False, "error": "已达到当前访问上限"})
+    assert p115mod.is_rate_limited({"state": False, "errno": 990009, "error": "触发风控"})
+    assert p115mod.is_rate_limited(p115mod.RateLimitedError("x"))
+    assert p115mod.is_rate_limited(urllib.error.HTTPError("http://x", 429, "n", hdrs=None, fp=None))
+    assert p115mod.is_rate_limited(urllib.error.HTTPError("http://x", 405, "n", hdrs=None, fp=None))
+    wrapped = RuntimeError("wrap")
+    wrapped.__cause__ = p115mod.RateLimitedError("已达到当前访问上限")
+    assert p115mod.is_rate_limited(wrapped)
+    soft = {"state": False, "errno": 990009, "error": "删除操作尚未执行完成，请稍后再试！"}
+    assert p115mod.is_soft_busy(soft) and not p115mod.is_rate_limited(soft)
+    assert p115mod.is_soft_busy(OSError(_e.EBUSY, "busy"))
+    assert p115mod.is_soft_busy(OSError(_e.EAGAIN, "again"))
+    assert not p115mod.is_soft_busy(p115mod.RateLimitedError("x"))
+    assert not p115mod.is_rate_limited({"state": True, "reuse": False, "message": "未命中"})
+    assert upmod.rate_limit_backoff(0, rng=lambda: 0.0) == 30.0
+    assert upmod.rate_limit_backoff(0, rng=lambda: 1.0) == 60.0
+    assert upmod.rate_limit_backoff(1, rng=lambda: 0.0) == 60.0
+    assert upmod.rate_limit_backoff(20, rng=lambda: 1.0) == upmod.RATE_LIMIT_CAP
+    mid = upmod.rate_limit_backoff(2, rng=lambda: 0.5)
+    assert 120.0 <= mid <= 240.0
+
+    # ---- B) rapid() 拿到限流正文 / 429：立刻上抛，不当未命中，也不短间隔连试 ----
+    calls = {"n": 0}
+
+    class _Client:
+        def __init__(self, maker):
+            self._maker = maker
+
+        async def upload_file_init(self, **kw):
+            calls["n"] += 1
+            return self._maker()
+
+    async def _try_rapid(maker, retries=2):
+        m = p115mod.P115.__new__(p115mod.P115)
+        m.min_interval = 0.0
+        m.transient_retries = retries
+        m._last_init = 0.0
+        m._init_lock = asyncio.Lock()
+        m.client = _Client(maker)
+        tmp = tempfile.mkdtemp(prefix="upilot-test-79-")
+        path = os.path.join(tmp, "a.mkv")
+        open(path, "wb").write(b"x" * 16)
+        try:
+            return await m.rapid(path, 16, "a" * 40, 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    calls["n"] = 0
+    try:
+        await _try_rapid(lambda: {"state": False, "error": "已达到当前访问上限"})
+        raise AssertionError("限流正文应抛 RateLimitedError")
+    except p115mod.RateLimitedError:
+        pass
+    assert calls["n"] == 1, f"限流正文不该短重试：{calls['n']}"
+
+    def boom():
+        raise urllib.error.HTTPError("http://x", 429, "Too Many", hdrs=None, fp=None)
+
+    calls["n"] = 0
+    try:
+        await _try_rapid(boom)
+        raise AssertionError("429 应立刻上抛")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 429
+    assert calls["n"] == 1, f"429 不该短间隔连试：{calls['n']}"
+
+    # 软忙（EBUSY）仍走原来的短重试（把 sleep 垫掉，免得单测白等 6 秒）
+    def busy():
+        raise OSError(_e.EBUSY, "操作尚未执行完成")
+
+    real_sleep = asyncio.sleep
+
+    async def no_sleep(_=0):
+        return None
+
+    asyncio.sleep = no_sleep
+    calls["n"] = 0
+    try:
+        try:
+            await _try_rapid(busy, retries=2)
+            raise AssertionError("软忙用尽后应上抛")
+        except OSError as exc:
+            assert exc.errno == _e.EBUSY
+        assert calls["n"] == 3, f"软忙应短重试 2 次（共 3 次调用），实际 {calls['n']}"
+    finally:
+        asyncio.sleep = real_sleep
+
+    # ---- C) 端到端：不当未命中、共享冷却、只放 1 个试探、成功后解除 ----
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=60, fail_first=0,
+                                             mode="rapid_only", long_interval=900)
+    try:
+        upmod._SHARED["auth_fail"] = None
+        upmod._SHARED["rate_limit"] = None
+        paths = [write_file(src, f"剧/E{i:02d}.mkv", 1024 * 1024) for i in range(4)]
+        scanner.scan_once(store, cfg)
+        for pth in paths:
+            await sha1_of(pth, store.get(pth), store)
+            store.set(pth, status="待秒传")
+
+        n115 = {"n": 0}
+        real = mgr.rapid
+
+        async def limited(*a, **k):
+            n115["n"] += 1
+            raise p115mod.RateLimitedError("已达到当前访问上限")
+
+        mgr.rapid = limited
+        for _ in range(5):
+            for pth in paths:
+                store.set(pth, next_retry_at=0, status="待重试")
+            up.dispatch()
+            for _ in range(80):
+                await asyncio.sleep(0.02)
+                if not up._active:
+                    break
+            upmod._SHARED["rate_limit"]["next_probe"] = 0
+        for pth in paths:
+            r = store.get(pth)
+            assert r["status"] == "待重试", r
+            assert (r["retry_count"] or 0) == 0 and r["first_failed_at"] is None, r
+            assert "限制访问" in (r["message"] or ""), r
+        assert upmod._SHARED["rate_limit"], "断路器没记下"
+        payload = webui._payload(cfg, store, {})
+        assert payload["rate_limited"] and payload["rate_limited"]["retry_in"] >= 0, payload.get("rate_limited")
+        js = open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+        assert "d.rate_limited" in js
+
+        # 冷却期间不再打 115；到期只放 1 个文件
+        n0 = n115["n"]
+        for pth in paths:
+            store.set(pth, next_retry_at=0, status="待重试")
+        upmod._SHARED["rate_limit"]["next_probe"] = time.time() + 300
+        up.dispatch()
+        await asyncio.sleep(0.2)
+        assert n115["n"] == n0, "冷却期间还在打 115"
+        upmod._SHARED["rate_limit"]["next_probe"] = 0
+        up.dispatch()
+        for _ in range(80):
+            await asyncio.sleep(0.02)
+            if not up._active:
+                break
+        assert n115["n"] == n0 + 1, f"试探应只放 1 个文件，实际 {n115['n'] - n0}"
+
+        # 限流解除：正常命中，断路器清除；真正未命中仍加 retry_count
+        mgr.rapid = real
+        up2 = Uploader(cfg, store, mgr)
+        assert upmod._SHARED["rate_limit"] is None
+        for pth in paths:
+            store.set(pth, next_retry_at=0, status="待重试")
+        up2.dispatch()
+        for _ in range(120):
+            await asyncio.sleep(0.02)
+            if not up2._active:
+                break
+        assert all(store.get(pth)["status"] == "已上传" for pth in paths), [
+            store.get(pth)["status"] for pth in paths]
+        assert upmod._SHARED["rate_limit"] is None
+
+        # 真正未命中仍按原逻辑加次数
+        cfg2, store2, mgr2, up3, tmp2, src2 = make_env(stable_rounds=0, retry_interval=60,
+                                                       fail_first=99, mode="rapid_only")
+        try:
+            pmiss = write_file(src2, "剧/miss.mkv", 1024 * 1024)
+            scanner.scan_once(store2, cfg2)
+            rec = await drive(up3, store2, pmiss, rounds=2)
+            assert rec["status"] == "待重试" and (rec["retry_count"] or 0) >= 1, rec
+            assert "未命中" in (rec["message"] or ""), rec
+            assert upmod._SHARED["rate_limit"] is None
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        # 软忙：不加 retry_count，不拉总闸
+        async def busy(*a, **k):
+            raise OSError(_e.EBUSY, "删除操作尚未执行完成，请稍后再试！")
+
+        pbusy = write_file(src, "剧/busy.mkv", 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        await sha1_of(pbusy, store.get(pbusy), store)
+        store.set(pbusy, status="待秒传", retry_count=0)
+        up3b = Uploader(cfg, store, mgr)
+        mgr.rapid = busy
+        upmod._SHARED["rate_limit"] = None
+        await up3b._process(pbusy)
+        rb = store.get(pbusy)
+        assert rb["status"] == "待重试" and (rb["retry_count"] or 0) == 0, rb
+        assert "正忙" in (rb["message"] or ""), rb
+        assert upmod._SHARED["rate_limit"] is None, "软忙不该拉总闸"
+        PASS.append("[79] 115 硬限流/风控：不当未命中（retry_count 不涨）、共享冷却只放 1 个试探、"
+                    "退避有上限和 jitter、面板有提示、成功后自动恢复；429 不短间隔连试；"
+                    "软忙只推迟该文件；真正未命中仍加次数")
+    finally:
+        upmod._SHARED["auth_fail"] = None
+        upmod._SHARED["rate_limit"] = None
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5389,6 +5670,8 @@ async def main():
     await case_sweep_local_order()
     case_panel_lightweight()
     case_hint_tone()
+    await case_delete_after_keeps_local_mtime()
+    await case_rate_limit_breaker()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

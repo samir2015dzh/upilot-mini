@@ -13,13 +13,15 @@ import hashlib
 import logging
 import mmap
 import os
+import random
 import threading
 import time
 
 import config as cfgmod
 from notify import Notifier
 import episode
-from p115 import P115 as _P115, episode_key, is_auth_error, resolve_upload_target
+from p115 import (P115 as _P115, episode_key, is_auth_error,
+                  is_rate_limited, is_soft_busy, resolve_upload_target)
 
 logger = logging.getLogger("upilot.upload")
 # SHA1 每次读多少。实测（2GB 热缓存，带 SHA-NI）1MB 与 8MB 吞吐一样（都 1.60 GB/s，
@@ -65,11 +67,20 @@ _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  # 115 登录失效断路器：None = 正常；否则 {"since","message","next_probe"}。
                  # 失效期间 dispatch 只放行「不联网」的状态，每 AUTH_PROBE_SECONDS 才试探一次。
                  "auth_fail": None,
+                 # 115 硬限流 / 风控断路器：None = 正常；否则
+                 # {"since","message","next_probe","streak"}。冷却期间 dispatch 只放行
+                 # 不联网的状态，到期只放 1 个文件去试探（与 auth_fail 同一套节奏）。
+                 "rate_limit": None,
                  # 最近的洗板替换记录（面板「最近洗板替换」；重启即清空，完整历史在日志里）
                  "replaced": collections.deque(maxlen=30)}
 
 # 登录失效后多久再试探一次 115（同时也是该文件下次重试的间隔）
 AUTH_PROBE_SECONDS = 300.0
+# 硬限流冷却：起步 60 秒，每次再触发翻倍，封顶 1 小时（MoviePilot 对「访问上限」
+# 用的就是 3600 秒）。equal jitter 把等待打散，避免冷却结束时所有文件一起冲出去。
+# https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+RATE_LIMIT_BASE = 60.0
+RATE_LIMIT_CAP = 3600.0
 # 失效期间仍然照常派发的状态：只算 SHA1、不碰 115
 _OFFLINE_STATES = ("待处理", "处理中")
 
@@ -78,6 +89,38 @@ def auth_status() -> dict | None:
     """给面板用：115 登录当前是否失效（None = 正常）。"""
     cur = _SHARED["auth_fail"]
     return None if not cur else {"since": cur["since"], "message": cur["message"]}
+
+
+def rate_limit_backoff(streak: int, rng=None) -> float:
+    """硬限流冷却秒数：min(cap, base * 2^streak) 再套 equal jitter（一半固定 + 一半随机）。
+
+    streak 从 0 起：第 1 次约 30–60 秒，第 2 次 60–120 秒，以此类推，封顶 1 小时。
+    `rng` 可注入（测试用），默认 random.random，返回 [0, 1)。
+    """
+    try:
+        n = max(0, int(streak))
+    except (TypeError, ValueError):
+        n = 0
+    if n > 16:
+        n = 16
+    raw = min(RATE_LIMIT_CAP, RATE_LIMIT_BASE * (2 ** n))
+    pick = (rng or random.random)()
+    try:
+        pick = float(pick)
+    except (TypeError, ValueError):
+        pick = 0.5
+    pick = min(1.0, max(0.0, pick))
+    return raw / 2.0 + pick * (raw / 2.0)
+
+
+def rate_status() -> dict | None:
+    """给面板用：115 是否处于限流冷却（None = 正常）。"""
+    cur = _SHARED["rate_limit"]
+    if not cur:
+        return None
+    left = max(0.0, float(cur.get("next_probe") or 0) - time.time())
+    return {"since": cur["since"], "message": cur["message"],
+            "retry_in": left, "streak": cur.get("streak") or 0}
 
 
 def take_rapid_summary() -> dict:
@@ -281,6 +324,7 @@ class Uploader:
         self.notifier = Notifier(cfg)
         # 改配置 / 换 cookie 会重建 Uploader：把断路器放开，让下一轮立刻重新试探一次
         _SHARED["auth_fail"] = None
+        _SHARED["rate_limit"] = None
         # 同样跨实例共享：旧实例被覆盖后，它派发的后台任务若只被实例持有的 set 引用，
         # 会被 GC 回收（跑到一半消失）；异常计数清空则让退避重试永远到不了阈值。
         self._bg: set = _SHARED["bg"]          # 后台任务强引用，防止跑到一半被回收
@@ -301,7 +345,7 @@ class Uploader:
         async def run():
             try:
                 async with self.sem:
-                    if self._hold_for_auth(path):
+                    if self._hold_for_auth(path) or self._hold_for_rate_limit(path):
                         return
                     await self._process(path)
                 self._err_streak.pop(path, None)       # 跑通一轮 → 清掉异常计数
@@ -311,6 +355,14 @@ class Uploader:
                     # 也不当「秒传未命中」（会推高 retry_count、把长间隔越拖越长）。
                     # 记下断路器，文件 5 分钟后再来；cookie 更新后 dispatch 立刻放开。
                     self._on_auth_failure(path, exc)
+                    return
+                if is_rate_limited(exc):
+                    # 硬限流 / 风控同样不是文件的错：不加 retry_count、不标「错误」，
+                    # 全体暂停向 115 发请求，按封顶退避再试。
+                    self._on_rate_limited(path, exc)
+                    return
+                if is_soft_busy(exc):
+                    self._defer_soft_busy(path, exc)
                     return
                 # 只记 message、不改状态是不行的：文件会停在「处理中」「待处理」这类
                 # 中间态，而 dispatch 每轮又把它捞回来 → 每轮重试一次、日志一直刷、
@@ -373,6 +425,71 @@ class Uploader:
         if _SHARED["auth_fail"] is not None:
             _SHARED["auth_fail"] = None
             logger.info("115 登录已恢复")
+
+    def _hold_for_rate_limit(self, path: str) -> bool:
+        """限流冷却期间，排队的联网任务别再去撞 115。返回 True 表示已推迟。"""
+        rf = _SHARED["rate_limit"]
+        if not rf or path == rf.get("probe_path"):
+            return False
+        rec = self.store.get(path)
+        if not rec or rec["status"] in _OFFLINE_STATES or rec["status"] in ("已上传", "错误"):
+            return False
+        wait = max(0, int((rf.get("next_probe") or time.time()) - time.time()))
+        self.store.set(path, status="待重试",
+                       next_retry_at=max(rf["next_probe"], time.time()),
+                       message=f"115 暂时限制访问：已暂停请求，约 {max(1, (wait + 59) // 60)} 分钟后自动再试（不算重试次数）")
+        return True
+
+    def _on_rate_limited(self, path: str, exc) -> None:
+        """记下硬限流断路器：全体暂停，冷却按次数加倍，封顶 1 小时。
+
+        已经是「已上传」的文件状态不动（洗板清理碰到限流时不能把成功记录打回去）。
+        """
+        now = time.time()
+        prev = _SHARED["rate_limit"] or {}
+        streak = int(prev.get("streak") or 0)
+        if prev:
+            streak += 1
+        wait = rate_limit_backoff(streak)
+        msg = str(getattr(exc, "strerror", None) or exc)[:200]
+        _SHARED["rate_limit"] = {
+            "since": prev.get("since", now),
+            "message": msg,
+            "next_probe": now + wait,
+            "streak": streak,
+        }
+        if not prev:
+            logger.warning("115 暂时限制访问（限流或风控）：%s。已暂停向 115 发请求，"
+                           "约 %d 分钟后自动再试一次（不算重试次数）",
+                           msg, max(1, int((wait + 59) // 60)))
+        else:
+            logger.warning("115 仍在限制访问（第 %d 次），约 %d 分钟后再试：%s",
+                           streak + 1, max(1, int((wait + 59) // 60)), msg)
+        rec = self.store.get(path) or {} if path else {}
+        if not path or rec.get("status") in ("已上传", "错误"):
+            return
+        minutes = max(1, int((wait + 59) // 60))
+        self.store.set(path, status="待重试", next_retry_at=now + wait,
+                       message=f"115 暂时限制访问：约 {minutes} 分钟后自动再试（不算重试次数）")
+
+    def _rate_ok(self) -> None:
+        """一次正常的 115 响应（秒传命中或真正未命中）= 限流已解除。"""
+        if _SHARED["rate_limit"] is not None:
+            _SHARED["rate_limit"] = None
+            logger.info("115 访问限制已解除，继续秒传")
+
+    def _defer_soft_busy(self, path: str, exc) -> None:
+        """上一个操作还没做完：只推迟这一个文件，不加 retry_count，不停掉其它任务。"""
+        rec = self.store.get(path) or {}
+        if rec.get("status") in ("已上传", "错误"):
+            logger.warning("115 正忙（不影响已完成的上传）：%s：%s",
+                           os.path.basename(path), exc)
+            return
+        wait = 60.0 + random.uniform(0, 30.0)
+        logger.warning("115 正忙，%d 秒后重试 %s：%s", int(wait),
+                       os.path.basename(path), exc)
+        self.store.set(path, status="待重试", next_retry_at=time.time() + wait,
+                       message=f"115 正忙（上一个操作还没做完），{int(wait)} 秒后再试（不算重试次数）")
 
     def _file_changed_on_disk(self, path: str, rec: dict) -> bool:
         """上传结束前确认磁盘上还是当初那个文件。
@@ -628,6 +745,8 @@ class Uploader:
                      "show_dir": 1, "cur": 1}, async_=True)
             except Exception as exc:
                 logger.warning("同集巡检：列云端目录 %s 失败：%s", cid, exc)
+                if is_rate_limited(exc):
+                    self._on_rate_limited("", exc)
                 return None                                # 失败 ≠ 空目录
             d = resp if isinstance(resp, dict) else {}
             # ★ 115 的业务错误是 **HTTP 200 + `state: false`（带 `errno`/`error`）**，
@@ -642,6 +761,8 @@ class Uploader:
                 logger.warning(
                     "同集巡检：列云端目录 %s 被拒绝（state=%s errno=%s）：%s",
                     cid, d.get("state"), d.get("errno"), d.get("error"))
+                if is_rate_limited(d):
+                    self._on_rate_limited("", d)
                 return None                                # 业务错误 ≠ 空目录
             data = d.get("data")
             if isinstance(data, dict):
@@ -738,6 +859,10 @@ class Uploader:
         scanned = 0
         lookup = self._local_lookup()
         for td in roots:
+            rf = _SHARED.get("rate_limit")
+            if rf and time.time() < float(rf.get("next_probe") or 0):
+                logger.warning("同集巡检：115 正在限制访问，其余目录等冷却后再扫")
+                break
             # ★ 只查缓存、**不建目录**：巡检对「云端早已不存在的 target_dir」不能
             # 触发 fs_makedirs（那会凭空建出空目录树）。拿不到 cid 说明这目录从没被
             # 本程序传过东西，跳过即可。
@@ -981,20 +1106,26 @@ class Uploader:
                 ("秒传中", False), ("待上传", False), ("上传中", False),
                 ("待重试", True)]
         af = _SHARED["auth_fail"]
+        rf = _SHARED["rate_limit"]
         limit_net = 100
-        if af:
-            # 登录失效断路器：平时只放行不联网的状态（算 SHA1）；到了试探时间只放 1 个文件去试，
-            # 它成功（_auth_ok）就整体放开，失败则继续等下一个 AUTH_PROBE_SECONDS。
+        hold = af or rf
+        if hold:
+            # 登录失效或硬限流：平时只放行不联网的状态（算 SHA1）；到了试探时间只放 1 个文件去试。
+            # 登录失效优先（cookie 都无效时试限流没有意义）。
             todo = [(st, d) for st, d in todo if st in _OFFLINE_STATES]
-            if time.time() >= af["next_probe"]:
-                af["next_probe"] = time.time() + AUTH_PROBE_SECONDS
+            gate = af or rf
+            if time.time() >= gate["next_probe"]:
+                # 先把下次试探推后，避免同一轮 dispatch 放出去一堆；成功会在 _auth_ok/_rate_ok 清掉。
+                default_gap = AUTH_PROBE_SECONDS if af else RATE_LIMIT_BASE
+                gate["next_probe"] = time.time() + default_gap
                 todo.append(("待重试", True))
                 limit_net = 1
         for status, due in todo:
             n = 100 if status in _OFFLINE_STATES else limit_net
             for rec in self.store.by_status(status, limit=n, due=due):
-                if af and status not in _OFFLINE_STATES:
-                    af["probe_path"] = rec["path"]           # 指定这一个去试探
+                if hold and status not in _OFFLINE_STATES:
+                    gate = af or rf
+                    gate["probe_path"] = rec["path"]         # 指定这一个去试探
                 self.spawn(rec["path"])
 
     # ---------- 状态机 ----------
@@ -1042,8 +1173,8 @@ class Uploader:
             self.store.set(path, status="待秒传")
             rec = self.store.get(path)
 
-        # 115 登录失效期间，刚算完 SHA1 的文件也别急着联网（见 _hold_for_auth）
-        if self._hold_for_auth(path):
+        # 登录失效 / 限流冷却期间，刚算完 SHA1 的文件也别急着联网
+        if self._hold_for_auth(path) or self._hold_for_rate_limit(path):
             return
 
         # 2) 目录：先建好（保留本地相对结构），秒传/分块上传共用这个 pid
@@ -1076,6 +1207,12 @@ class Uploader:
             except Exception as exc:  # noqa: BLE001
                 if is_auth_error(exc):
                     raise                          # 登录失效不是「未命中」：交给 spawn 的断路器
+                if is_rate_limited(exc):
+                    self._on_rate_limited(path, exc)
+                    return                         # 限流不是「未命中」：不加 retry_count
+                if is_soft_busy(exc):
+                    self._defer_soft_busy(path, exc)
+                    return
                 msg = str(exc)
                 if "10014" in msg or "目录不存在" in msg:
                     await self.mgr.forget_pid(cloud_dir)
@@ -1083,6 +1220,7 @@ class Uploader:
                 hit, info = False, {"reason": msg}
             else:
                 self._auth_ok()                    # 秒传请求正常返回（命中或未命中）= 登录有效
+                self._rate_ok()                    # 同样说明限流已经解除
             tally = _SHARED["rapid_round"]
             tally["checked"] += 1
             tally["hit" if hit else "miss"] += 1
