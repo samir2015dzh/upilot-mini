@@ -5925,6 +5925,50 @@ def case_retry_status_copy():
                 "面板在有待重试时不再写「队列为空」，idle 时才说没有待处理文件")
 
 
+def case_mobile_panel_buttons():
+    """[86] 手机面板按钮易用：44px 点击区、底栏、任务卡片、危险操作要确认、桌面布局保持原样。"""
+    import gzip
+    import re as _re
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "static")
+    css = open(os.path.join(root, "app.css"), encoding="utf-8").read()
+    html = open(os.path.join(root, "index.html"), encoding="utf-8").read()
+    js = open(os.path.join(root, "app.js"), encoding="utf-8").read()
+    login = open(os.path.join(root, "login.html"), encoding="utf-8").read()
+
+    assert 'viewport-fit=cover' in html and 'viewport-fit=cover' in login
+    for sid in ('id="btn-more"', 'id="dock"', 'id="sheet"', 'id="confirm"', 'id="tasks-cards"'):
+        assert sid in html, f"缺 {sid}"
+    assert "--tap:44px" in css and "min-height:var(--tap)" in css
+    # 桌面默认藏起手机专用控件，避免顶栏变样
+    assert _re.search(r"#btn-more,\s*\.dock,\s*\.sheet,\s*\.confirm,\s*\.task-cards\{display:none\}", css)
+    assert "@media (max-width:620px)" in css
+    assert "header .btns > #btn-scan" in css and "header .btns > #btn-more" in css
+    assert "nav.tabs{display:none}" in css.replace(" ", "") or "nav.tabs{display:none}" in css
+    assert ".table-scroll{display:none}" in css
+    assert ".task-cards{display:flex" in css
+    assert ".dock{display:flex" in css
+    assert "visualViewport" in js and "askConfirm" in js and "renderTaskCards" in js and "openMore" in js
+    assert 'title: "核对同集？"' in js and 'title: "删除这条记录？"' in js
+    assert "window.confirm(" not in js and 'confirm("删掉这条记录' not in js
+    assert "font-size:16px" in css and "min-height:44px" in login and "font-size:16px" in login
+    assert "infinite" not in css and "backdrop-filter" not in css
+    # 不引入重型依赖（注释里可以提到参考项目，但不能真的引用它们的脚本）
+    joined = html + css + js
+    assert "<script" in html  # 只有本地 app.js
+    assert "node_modules" not in joined and "cdn.jsdelivr" not in joined and "unpkg.com" not in joined
+    assert "bootstrap.min" not in joined and "ionic.bundle" not in joined and "jquery.min" not in joined
+
+    raw = sum(os.path.getsize(os.path.join(root, n)) for n in ("app.css", "app.js"))
+    gz = 0
+    for n in ("app.css", "app.js"):
+        with open(os.path.join(root, n), "rb") as f:
+            gz += len(gzip.compress(f.read(), compresslevel=9))
+    # 改前 css+js gzip 约 17.5 KB；允许轻量增长，但不准膨胀成框架级体积
+    assert gz < 25 * 1024, f"css+js gzip 过大：{gz} B"
+    PASS.append("[86] 手机按钮：点击区 44px、底栏切换、任务改卡片、核对同集/删除要确认、"
+                f"输入框 16px 防缩放；桌面顶栏/表格保持原样；css+js gzip {gz} B")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -6006,6 +6050,7 @@ async def main():
     case_config_startup_validation()
     case_scan_large_library_sidecars()
     case_retry_status_copy()
+    case_mobile_panel_buttons()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

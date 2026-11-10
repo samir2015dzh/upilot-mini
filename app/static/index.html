@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="robots" content="noindex, nofollow" />
 <title>UPilot-mini · 秒传优先上传器</title>
 <meta name="color-scheme" content="dark light" />
@@ -55,6 +55,10 @@
       <button id="btn-theme" class="mini icon" title="切换主题：跟随系统 / 深色 / 浅色" aria-label="切换主题">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
         <span id="theme-label">自动</span>
+      </button>
+      <button id="btn-more" class="mini icon" type="button" title="更多操作" aria-label="更多操作" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="6" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="12" cy="18" r="1.2"/></svg>
+        更多
       </button>
       <button id="btn-logout" class="mini" title="退出登录" style="display:none">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>
@@ -176,7 +180,7 @@
       <button id="t-refresh" class="mini">刷新</button>
     </div>
     <div class="card tasks-card">
-      <div class="scroll" style="max-height:60vh">
+      <div class="scroll table-scroll" style="max-height:60vh">
         <table>
           <thead>
             <tr>
@@ -194,6 +198,7 @@
           <tbody id="tasks-body"></tbody>
         </table>
       </div>
+      <div id="tasks-cards" class="task-cards"></div>
       <div class="pager">
         <span id="t-range"></span>
         <span id="t-pageinfo"></span>
@@ -217,9 +222,10 @@
     <div id="settings-msg"></div>
 
     <div class="form-grid" id="settings-groups" style="margin-top:14px"></div>
-    <div class="settings-bar" style="margin-top:14px;justify-content:flex-end">
+    <div class="settings-bar save-bar" style="margin-top:14px;justify-content:flex-end">
       <span style="color:var(--dim);font-size:12px">带「需重建容器」标记的字段要重建容器才生效</span>
       <div class="spacer"></div>
+      <button id="btn-reload-config-bottom" class="mini">重新读取</button>
       <button id="btn-save-settings-bottom" class="primary">保存设置</button>
     </div>
     <div class="card" style="margin-top:14px">
@@ -233,15 +239,60 @@
 
 <div id="drawer" class="drawer">
   <div class="panel">
-    <button id="d-close" class="mini close">关闭</button>
-    <h3 id="d-title">文件</h3>
-    <div class="path" id="d-path"></div>
+    <div class="drawer-head">
+      <div>
+        <h3 id="d-title">文件</h3>
+        <div class="path" id="d-path"></div>
+      </div>
+      <button id="d-close" class="mini close" type="button">关闭</button>
+    </div>
     <div id="d-body"></div>
-    <div class="btns" style="margin-top:18px;flex-wrap:wrap">
-      <button id="d-upload" class="primary">立即处理</button>
-      <button id="d-requeue">重新排队</button>
-      <button id="d-retrynow">提前重试秒传</button>
-      <button id="d-delete" class="danger">删除记录</button>
+    <div class="drawer-actions">
+      <button id="d-upload" class="primary" type="button">立即处理</button>
+      <button id="d-requeue" type="button">重新排队</button>
+      <button id="d-retrynow" type="button">提前重试秒传</button>
+      <button id="d-delete" class="danger" type="button">删除记录</button>
+    </div>
+  </div>
+</div>
+
+<!-- 来源：底部标签栏 / 操作表结构参考 Ionic tab-bar 与 action-sheet（只借布局，不引入框架）
+     https://github.com/ionic-team/ionic-framework/blob/main/core/src/components/action-sheet/action-sheet.ios.vars.scss
+     点击区不小于 44px，见 Apple HIG / WCAG 2.5.5。 -->
+<nav class="dock" id="dock" aria-label="页面切换">
+  <button type="button" class="dock-item on" data-tab="overview" id="dock-overview">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    概览
+  </button>
+  <button type="button" class="dock-item" data-tab="tasks" id="dock-tasks">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>
+    任务<span class="cnt" id="dock-tasks-cnt"></span>
+  </button>
+  <button type="button" class="dock-item" data-tab="settings" id="dock-settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    设置
+  </button>
+</nav>
+
+<div id="sheet" class="sheet" hidden>
+  <button type="button" class="sheet-backdrop" id="sheet-backdrop" aria-label="关闭菜单"></button>
+  <div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div class="sheet-handle" aria-hidden="true"></div>
+    <div class="sheet-title" id="sheet-title">操作</div>
+    <div class="sheet-group" id="sheet-actions"></div>
+    <div class="sheet-group sheet-danger" id="sheet-danger"></div>
+    <button type="button" class="sheet-cancel" id="sheet-cancel">取消</button>
+  </div>
+</div>
+
+<div id="confirm" class="confirm" hidden>
+  <button type="button" class="confirm-backdrop" id="confirm-backdrop" aria-label="取消"></button>
+  <div class="confirm-panel" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <h3 id="confirm-title">确认</h3>
+    <p id="confirm-body"></p>
+    <div class="confirm-btns">
+      <button type="button" id="confirm-cancel">取消</button>
+      <button type="button" id="confirm-ok" class="danger">确定</button>
     </div>
   </div>
 </div>

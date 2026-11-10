@@ -71,6 +71,9 @@ button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(
   padding:7px 12px;border-radius:9px;cursor:pointer;transition:background .12s,border-color .12s;display:inline-flex;align-items:center;gap:7px}
 button:hover{background:var(--hover-2);border-color:var(--line-3)}
 button:disabled{opacity:.5;cursor:default}
+button:active{filter:brightness(.96)}
+button[aria-busy=true]{opacity:.65;cursor:wait}
+button{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 button.primary{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
 button.primary:hover{filter:brightness(1.08);background:var(--indigo)}
 button svg{width:15px;height:15px}
@@ -257,7 +260,12 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
   box-shadow:-8px 0 24px rgba(0,0,0,.2)}
 .drawer .panel h3{margin:0 0 4px;font-size:17px}
 .drawer .panel .path{color:var(--dim);font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;margin-bottom:14px}
-.drawer .panel .close{position:absolute;top:16px;right:18px}
+.drawer-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:10px}
+.drawer-head > div{min-width:0;flex:1}
+.drawer-head h3{margin:0 0 4px;font-size:17px;line-height:1.35;word-break:break-word}
+.drawer-head .path{margin-bottom:0}
+.drawer .panel .close,.drawer-head .close{position:static;flex:none}
+.drawer-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px;position:sticky;bottom:0;background:var(--surface);padding-top:12px}
 .dl{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line);font-size:12.5px}
 .dl:first-of-type{border-top:0}
 .dl span:first-child{color:var(--muted);flex:none}
@@ -265,14 +273,11 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
 @media (max-width:620px){
   .filters input[type=text]{min-width:0}
   .grid-stats{grid-template-columns:1fr 1fr}
-  .wrap{padding:14px 12px 36px}
+  .wrap{padding:14px 12px 24px}
   .stat .v{font-size:22px}
   header .sub{display:none}
-  .btns{width:100%;overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}
-  .btns button{flex:none}
   .scroll{overflow-x:auto}
   .scroll table{min-width:640px}
-  .tasks-card table{min-width:980px}
 }
 
 /* ---------- 目录映射（多行）与登录槽位 ---------- */
@@ -326,3 +331,117 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
 .season .sub{font-size:12px;color:var(--muted);margin-top:2px}
 .season .rep{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.45}
 
+
+/* ---------- 手机按钮、底栏、操作表（桌面端这些默认隐藏，不影响现有布局） ---------- */
+#btn-more,.dock,.sheet,.confirm,.task-cards{display:none}
+.sheet[hidden],.confirm[hidden]{display:none}
+
+@media (max-width:620px){
+  :root{--dock-h:56px;--tap:44px}
+  html,body{padding-bottom:0}
+  .wrap{padding:12px 12px calc(20px + var(--dock-h) + env(safe-area-inset-bottom,0px) + var(--kb,0px))}
+
+  /* 顶栏只留主操作：立即扫描 + 更多；其余进操作表 */
+  header{margin-bottom:10px;gap:10px}
+  header .btns{width:100%;margin-left:0;overflow:visible;flex-wrap:nowrap;gap:8px;padding:0}
+  header .btns > button{display:none}
+  header .btns > #btn-scan,
+  header .btns > #btn-more{display:inline-flex;min-height:var(--tap);min-width:var(--tap);padding:8px 12px;font-size:14px;flex:none;justify-content:center}
+  header .btns > #btn-scan{flex:1}
+  header .btns > #btn-scan span,
+  header .btns > #btn-more span{white-space:nowrap}
+  .settings-bar:not(.save-bar) button{display:none}
+
+  /* 顶部分类改到底栏，拇指够得着 */
+  nav.tabs{display:none}
+
+  button,button.mini,button.icon,button.primary,.seg button,.pager button,
+  .ops button,.dd-btn,.f .clear,.drawer-actions button,.save-bar button{
+    min-height:var(--tap);padding:8px 12px;font-size:14px
+  }
+  button.icon{min-width:var(--tap)}
+  .seg{gap:8px}
+  .seg button{padding:8px 14px}
+  .filters{gap:8px}
+  .filters input[type=text]{width:100%;flex:1 1 100%;min-height:var(--tap);font-size:16px}
+  .filters .dd{width:auto;flex:1;min-width:140px}
+  #t-refresh{flex:none}
+
+  /* 防止 iOS 聚焦输入框时整页缩放 */
+  input[type=text],input[type=number],input[type=password],select,textarea,.dd-btn{font-size:16px;min-height:var(--tap)}
+  input,textarea,select{scroll-margin-bottom:calc(var(--dock-h) + 24px + env(safe-area-inset-bottom,0px))}
+
+  /* 任务改卡片，不再左右横滑找操作按钮 */
+  .table-scroll{display:none}
+  .task-cards{display:flex;flex-direction:column;gap:10px}
+  .task-card{display:flex;flex-direction:column;gap:6px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--card);text-align:left}
+  .task-card .top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+  .task-card .name{min-width:0;flex:1;font-weight:600;word-break:break-all;line-height:1.35}
+  .task-card .path{color:var(--dim);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+  .task-card .meta-row{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums}
+  .task-card .act{min-width:var(--tap);flex:none}
+
+  .pager{justify-content:space-between;gap:8px}
+  .pager button{flex:1;justify-content:center}
+
+  /* 设置页保存条贴在底栏上方 */
+  .settings-bar{gap:8px}
+  .save-bar{position:sticky;bottom:calc(var(--dock-h) + env(safe-area-inset-bottom,0px));z-index:15;
+    background:var(--bg);margin:12px -4px 0;padding:8px 4px calc(8px + var(--kb,0px));
+    border-top:1px solid var(--line);justify-content:stretch}
+  .save-bar button{flex:1;justify-content:center}
+  .save-bar .spacer{display:none}
+  .save-bar > span{display:none}
+
+  /* 详情改为底部面板，操作键分层：主操作、次要、危险 */
+  .drawer .panel{top:auto;right:0;left:0;bottom:0;width:100%;max-height:min(92dvh,92vh);
+    border-left:0;border-top:1px solid var(--line-2);border-radius:16px 16px 0 0;
+    padding:14px 16px calc(16px + env(safe-area-inset-bottom,0px));
+    box-shadow:0 -8px 24px rgba(0,0,0,.2)}
+  .drawer-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-bottom:4px}
+  .drawer-actions #d-upload{grid-column:1 / -1}
+  .drawer-actions #d-delete{grid-column:1 / -1;margin-top:2px}
+
+  /* 底部标签栏 */
+  .dock{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:25;
+    height:auto;min-height:var(--dock-h);padding:4px 6px env(safe-area-inset-bottom,0px);
+    background:var(--surface);border-top:1px solid var(--line);gap:4px}
+  .dock-item{flex:1;min-height:48px;flex-direction:column;justify-content:center;gap:2px;
+    background:transparent;border:0;border-radius:10px;color:var(--muted);font-size:11px;font-weight:600;padding:4px 6px}
+  .dock-item svg{width:20px;height:20px}
+  .dock-item .cnt{margin-left:2px;font-size:10px;color:var(--dim);font-weight:500}
+  .dock-item.on{color:var(--indigo);background:var(--sel);border:0}
+  .dock-item:hover{background:var(--hover);color:var(--fg);border:0}
+
+  #toast{bottom:calc(12px + var(--dock-h) + env(safe-area-inset-bottom,0px))}
+
+  /* 开关外层可点区域加大 */
+  .switch{width:44px;height:24px}
+  .switch i{top:4px;left:4px;width:16px;height:16px}
+  .switch.on i{left:24px}
+}
+
+/* 操作表、确认框（打开后在任何宽度都居中/贴底；主要由手机「更多」和危险操作使用） */
+.sheet.on{display:block;position:fixed;inset:0;z-index:50}
+.sheet-backdrop,.confirm-backdrop{position:absolute;inset:0;background:rgba(8,10,16,.55);border:0;border-radius:0;padding:0;width:100%;height:100%}
+.sheet-panel{position:absolute;left:8px;right:8px;bottom:0;max-height:min(80dvh,80vh);overflow:auto;
+  padding:8px 8px calc(10px + env(safe-area-inset-bottom,0px));
+  background:transparent}
+.sheet-handle{width:36px;height:4px;border-radius:999px;background:var(--line-3);margin:4px auto 8px}
+.sheet-title{text-align:center;color:var(--muted);font-size:12.5px;font-weight:600;margin:0 0 8px}
+.sheet-group{background:var(--pop);border:1px solid var(--line-2);border-radius:14px;overflow:hidden;margin-bottom:8px}
+.sheet-group button,.sheet-cancel{display:flex;width:100%;min-height:52px;padding:12px 16px;border:0;border-radius:0;
+  border-bottom:1px solid var(--line);background:var(--pop);color:var(--fg);justify-content:center;font-size:16px}
+.sheet-group button:last-child{border-bottom:0}
+.sheet-group button.primary{color:#fff;background:var(--indigo);font-weight:600}
+.sheet-danger button,.sheet-group button.danger{color:var(--err-fg);background:var(--pop)}
+.sheet-cancel{border:1px solid var(--line-2);border-radius:14px;background:var(--pop);font-weight:600;margin-bottom:0}
+.sheet-group button:active,.sheet-cancel:active{filter:brightness(.96)}
+
+.confirm.on{display:block;position:fixed;inset:0;z-index:60}
+.confirm-panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(360px,calc(100vw - 32px));
+  background:var(--pop);border:1px solid var(--line-2);border-radius:16px;padding:18px 16px 14px;box-shadow:0 12px 32px rgba(0,0,0,.28)}
+.confirm-panel h3{margin:0 0 8px;font-size:17px}
+.confirm-panel p{margin:0 0 16px;color:var(--muted);font-size:14px;line-height:1.55}
+.confirm-btns{display:flex;gap:8px}
+.confirm-btns button{flex:1;min-height:44px;justify-content:center;font-size:14px}
