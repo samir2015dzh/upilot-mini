@@ -1075,8 +1075,23 @@ def case_episode_key():
     finally:
         epmod.set_title_match("auto")
     assert epmod.cn_to_int("十二") == 12 and epmod.cn_to_int("二十") == 20 and epmod.cn_to_int("一百零五") == 105
+    assert epmod.cn_to_int("一千零一") == 1001 and epmod.cn_to_int("一千一百") == 1100
+    assert K("某剧 第一百零五集.mkv") == "e105" and K("某剧 第一千零一集.mkv") == "e1001"
+    # S00 / SP：特别篇
+    assert K("Show.S00E01.mkv") == "s00e001" != K("Show.S01E01.mkv")
+    assert K("Show.SP01.mkv") == K("Show.Special.01.mkv") == "s00e001"
+    # 不带季号的多集区间
+    assert K("Show.E01-E02.mkv") == K("Show EP01-EP02.mkv") == "e001-e002"
+    assert K("Show.E01-E02.mkv") != K("Show.E01.mkv")
+    # 修订标记不进同一集键
+    assert K("Show.S01E01.PROPER.mkv") == K("Show.S01E01.REPACK.mkv") == K("Show.S01E01.v2.mkv") == "s01e001"
+    assert epmod.version_score("Show.S01E01.mkv") == 0
+    assert epmod.version_score("Show.S01E01.PROPER.mkv") == 2
+    assert epmod.version_score("Show.S01E01.v3.mkv") == 3
+    assert epmod.version_score("[ANi] Show - 05v2 [1080p].mkv") == 2
     PASS.append("[17] 同集归一化：画质标签与扩展名都不参与（S01E01 mkv/mp4/ts 同一集）；认得 1x01 / Season N Episode M / "
-                "EP01 / 第十二集 / 动漫「 - 05 」；多集区间单独成键；年份/分辨率不误判；auto 下多部剧同集号不混")
+                "EP01 / 第十二集 / 第一百零五集 / 第一千零一集 / 动漫「 - 05 」/ S00 与 SP 特别篇；"
+                "多集区间单独成键；PROPER/REPACK/v2 不进键；年份/分辨率不误判；auto 下多部剧同集号不混")
 
 
 async def case_cleanup_previous_versions():
@@ -5670,6 +5685,54 @@ async def case_season_panel_history():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def case_version_tiebreak():
+    """[81] 洗板时间并列时，PROPER/REPACK/v2 算更新的那份；后下载的仍然优先。"""
+    from p115 import P115 as _P115
+
+    def rows(*names_and_te):
+        out = []
+        for i, (name, te) in enumerate(names_and_te, 1):
+            out.append({"fid": str(i), "n": name, "s": i * 10, "pc": f"p{i}", "te": te, "ico": "mkv"})
+        return out
+
+    plain = "Show.S01E01.1080p.mkv"
+    proper = "Show.S01E01.1080p.PROPER.mkv"
+    v3 = "Show.S01E01.1080p.v3.mkv"
+
+    # 云端时间相同 → PROPER 赢
+    r = _P115.rank_same_episode(rows((plain, 1000), (proper, 1000)))
+    assert "ranks" in r and r["basis"] == "版本标记（PROPER/REPACK/v2）", r
+    assert r["ranks"].index(max(r["ranks"])) == 1
+
+    # v3 比 PROPER（当作 v2）更新
+    r = _P115.rank_same_episode(rows((proper, 1000), (v3, 1000)))
+    assert r["ranks"].index(max(r["ranks"])) == 1, r
+
+    # 两个都没有修订标记、时间并列 → 仍然不动手
+    r = _P115.rank_same_episode(rows((plain, 1000), ("Show.S01E01.2160p.mkv", 1000)))
+    assert "ranks" not in r and "并列" in r["note"], r
+
+    # 本地下载时间更晚的无标记版，仍然赢过更早的 PROPER（后下载优先）
+    def lookup(row):
+        return {"Show.S01E01.1080p.mkv": (5000.0, 1.0),
+                "Show.S01E01.1080p.PROPER.mkv": (1000.0, 1.0)}[row["n"]]
+
+    r = _P115.rank_same_episode(rows((plain, 9000), (proper, 1000)), lookup)
+    assert r["basis"] == "本地下载时间", r
+    assert r["ranks"].index(max(r["ranks"])) == 0
+
+    # 本地时间并列 → 走版本标记
+    def lookup2(row):
+        return (2000.0, 1.0)
+
+    r = _P115.rank_same_episode(rows((plain, 1), (proper, 1)), lookup2)
+    assert r["basis"] == "版本标记（PROPER/REPACK/v2）", r
+    assert r["ranks"].index(max(r["ranks"])) == 1
+    PASS.append("[81] 洗板时间并列时 PROPER/REPACK/v2 算更新；后下载的无标记版仍然优先；"
+                "两个都没修订标记且时间并列则不动手")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5746,6 +5809,7 @@ async def main():
     await case_delete_after_keeps_local_mtime()
     await case_rate_limit_breaker()
     await case_season_panel_history()
+    case_version_tiebreak()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

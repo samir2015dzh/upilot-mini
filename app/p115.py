@@ -53,7 +53,7 @@ MAX_DIR_ITEMS = 50000
 
 # 视频扩展名与「同一集」识别都在 episode.py（扩展名不参与：同一集的 mkv / mp4 是同一集）。
 from episode import (  # noqa: E402
-    VIDEO_SUFFIXES, episode_key, parse_episode, titles_compatible,
+    VIDEO_SUFFIXES, episode_key, parse_episode, titles_compatible, version_score,
 )
 
 __all__ = ["VIDEO_SUFFIXES", "episode_key", "RateLimitedError", "is_rate_limited", "is_soft_busy"]
@@ -858,22 +858,50 @@ class P115:
         老版本的秒传先命中，或者老版本被重新排队，都会让「后秒传上去」的反而是旧的。
         只要有一条对不上（别的工具传的、库里没有）/ 时间并列，就退回 115 条目自带的
         上传时间（原先的判据）；再拿不到就保守不动手。
+        时间仍然并列时，PROPER / REPACK / v2 这类修订标记算更新的那份。
         """
+        def _name(row: dict) -> str:
+            return str(row.get("n") or row.get("name") or "")
+
+        def _ver(row: dict) -> int:
+            return version_score(_name(row))
+
         if local_lookup:
             locs = [local_lookup(r) for r in rows]
             if all(x is not None for x in locs):
-                top = max(locs)
-                if locs.count(top) == 1:
-                    return {"ranks": locs, "basis": "本地下载时间"}
+                # local_lookup 仍返回 (mtime, created_at)；这里把修订标记插在中间，
+                # 后下载的照旧赢，只有时间并列才比 v2/PROPER/REPACK。
+                ranks = []
+                for loc, row in zip(locs, rows, strict=True):
+                    try:
+                        mt, created = float(loc[0]), float(loc[1] if len(loc) > 1 else 0.0)
+                    except (TypeError, ValueError, IndexError):
+                        mt, created = 0.0, 0.0
+                    ranks.append((mt, _ver(row), created))
+                top = max(ranks)
+                if ranks.count(top) == 1:
+                    i = ranks.index(top)
+                    mt_top = ranks[i][0]
+                    if sum(1 for r in ranks if r[0] == mt_top) == 1:
+                        basis = "本地下载时间"
+                    elif sum(1 for r in ranks if r[0] == mt_top and r[1] == ranks[i][1]) == 1 and ranks[i][1]:
+                        basis = "版本标记（PROPER/REPACK/v2）"
+                    else:
+                        basis = "本地下载时间"
+                    return {"ranks": ranks, "basis": basis}
         ts = [cls.cloud_ts(r) for r in rows]
         newest = max(ts) if ts else 0
         if newest <= 0:
             return {"note": (f"云端同集 {len(rows)} 条，但条目没有可用时间字段，"
                              f"分不清哪条是后传的，本次不动手")}
-        if ts.count(newest) != 1:
+        ranks = [(t, _ver(r)) for t, r in zip(ts, rows, strict=True)]
+        top = max(ranks)
+        if ranks.count(top) != 1:
             return {"note": (f"云端同集 {len(rows)} 条，最新那条的时间不唯一"
                              f"（{ts.count(newest)} 条并列），本次不动手")}
-        return {"ranks": ts, "basis": "云端上传时间"}
+        if ts.count(newest) == 1:
+            return {"ranks": ranks, "basis": "云端上传时间"}
+        return {"ranks": ranks, "basis": "版本标记（PROPER/REPACK/v2）"}
 
     async def cleanup_episode_newest(self, pid: int, keep_name: str,
                                      max_delete: int = 0, keep_fid: str = "",
