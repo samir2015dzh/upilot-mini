@@ -12,16 +12,18 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">
-      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 19V6"/><path d="M6 12l6-6 6 6"/><path d="M4 21h16"/>
-      </svg>
-    </div>
-    <div>
-      <h1>UPilot-mini
-        <span class="pill" id="env-pill">…</span>
-      </h1>
-      <div class="sub">监控本地目录 · SHA1 秒传优先 · 重试不重传 · 保留目录结构</div>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 19V6"/><path d="M6 12l6-6 6 6"/><path d="M4 21h16"/>
+        </svg>
+      </div>
+      <div>
+        <h1>UPilot-mini
+          <span class="pill" id="env-pill">…</span>
+        </h1>
+        <div class="sub">监控本地目录 · SHA1 秒传优先 · 重试不重传 · 保留目录结构</div>
+      </div>
     </div>
     <div class="spacer"></div>
     <div class="btns">
@@ -56,7 +58,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
         <span id="theme-label">自动</span>
       </button>
-      <button id="btn-more" class="mini icon" type="button" title="更多操作" aria-label="更多操作" aria-haspopup="dialog">
+      <button id="btn-more" class="ghost icon" type="button" title="更多操作" aria-label="更多操作" aria-haspopup="dialog">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="6" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="12" cy="18" r="1.2"/></svg>
         更多
       </button>
@@ -77,22 +79,22 @@
   <section id="view-overview">
     <div class="grid-stats">
       <div class="card stat">
-        <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>文件总数</div>
+        <div class="k"><span class="stat-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg></span>文件总数</div>
         <div class="v" id="s-total">–</div>
         <div class="s" id="s-total-size">–</div>
       </div>
       <div class="card stat">
-        <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>已上传</div>
+        <div class="k"><span class="stat-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg></span>已上传</div>
         <div class="v accent-e" id="s-done">–</div>
         <div class="s" id="s-done-size">–</div>
       </div>
       <div class="card stat">
-        <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg>秒传命中</div>
+        <div class="k"><span class="stat-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg></span>秒传命中</div>
         <div class="v accent-s" id="s-rapid">–</div>
         <div class="s" id="s-rapid-size">–</div>
       </div>
       <div class="card stat">
-        <div class="k"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>处理中 / 待重试</div>
+        <div class="k"><span class="stat-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>处理中 / 待重试</div>
         <div class="v accent-i" id="s-active">–</div>
         <div class="s" id="s-retry">–</div>
       </div>
@@ -136,7 +138,7 @@
                 <circle id="ring-fg" cx="48" cy="48" r="40" stroke="url(#g1)" stroke-width="9" fill="none"
                         stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="251.2"/>
                 <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0%" stop-color="#6366f1"/><stop offset="100%" stop-color="#34d399"/></linearGradient></defs>
+                  <stop offset="0%" stop-color="#5E6AD2"/><stop offset="100%" stop-color="#3dcf8e"/></linearGradient></defs>
               </svg>
               <div class="val" id="ring-val">–</div>
             </div>
@@ -256,9 +258,15 @@
   </div>
 </div>
 
-<!-- 来源：底部标签栏 / 操作表结构参考 Ionic tab-bar 与 action-sheet（只借布局，不引入框架）
+<!-- 来源（只借令牌/布局，不引入框架或字体文件）：
+     底部标签栏 / 操作表：Ionic tab-bar 与 action-sheet
      https://github.com/ionic-team/ionic-framework/blob/main/core/src/components/action-sheet/action-sheet.ios.vars.scss
-     点击区不小于 44px，见 Apple HIG / WCAG 2.5.5。 -->
+     点击区不小于 44px，见 Apple HIG / WCAG 2.5.5。
+     设计令牌：Pico CSS 变量与过渡 https://picocss.com/docs/css-variables
+     Open Props 圆角/阴影阶梯 https://github.com/argyleink/open-props
+     shadcn/ui zinc 中性色 https://ui.shadcn.com/docs/theming
+     Linear 强调色 #5E6AD2（公开品牌色，不是框架）。
+     底栏图标路径抄自 Lucide（LayoutGrid / List / Settings）https://lucide.dev -->
 <nav class="dock" id="dock" aria-label="页面切换">
   <button type="button" class="dock-item on" data-tab="overview" id="dock-overview">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>

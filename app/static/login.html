@@ -6,20 +6,21 @@
 <meta name="robots" content="noindex, nofollow" />
 <title>登录 · UPilot-mini</title>
 <style>
-  /* 与仪表盘同一套设计语言：同样的色板变量、卡片、圆角、渐变主按钮、pill */
+  /* 与仪表盘同一套设计语言（令牌来源见面板 index.html 注释） */
   :root{
     color-scheme:dark;
-    --bg:#0d1017; --panel:#151922; --line:#242a37; --line-2:#2f3747; --line-3:#3b445a;
-    --fg:#e9edf5; --muted:#aab3c5; --dim:#8892a6; --field:#10141c; --field-focus:#121722;
-    --indigo:#6366f1; --emerald:#34d399; --amber:#fbbf24; --rose:#fb7185;
-    --err-fg:#fda4af; --radius:12px;
+    --bg:#0b0d12; --panel:#13151c; --line:#232633; --line-2:#2c3040; --line-3:#3a4052;
+    --fg:#eceef4; --muted:#9aa0b0; --dim:#7b8292; --field:#0e1016; --field-focus:#151821;
+    --indigo:#7B84E0; --primary:#5E6AD2; --emerald:#3dcf8e; --amber:#f5a524; --rose:#fb7185;
+    --err-fg:#fda4af; --accent-soft:rgba(123,132,224,.16); --radius:10px;
     font-synthesis:none;
   }
   @media (prefers-color-scheme:light){
     :root{color-scheme:light;
-      --bg:#f3f5f9; --panel:#fff; --line:#e3e7ef; --line-2:#d3d9e5; --line-3:#bcc5d6;
-      --fg:#1a2030; --muted:#5a6479; --dim:#7a8499; --field:#f6f8fb; --field-focus:#fff;
-      --indigo:#4f46e5; --emerald:#10b981; --amber:#f59e0b; --rose:#e11d48; --err-fg:#be123c}
+      --bg:#f3f4f7; --panel:#fff; --line:#e4e6eb; --line-2:#d7dae2; --line-3:#c4c8d2;
+      --fg:#111218; --muted:#5b6170; --dim:#7a8090; --field:#f6f7f9; --field-focus:#fff;
+      --indigo:#5E6AD2; --primary:#5E6AD2; --emerald:#0f9f6e; --amber:#dc6803; --rose:#e11d48; --err-fg:#be123c;
+      --accent-soft:rgba(94,106,210,.12)}
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
@@ -33,7 +34,7 @@
 
   .brand{display:flex;align-items:center;gap:13px;margin-bottom:20px}
   .logo{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;flex:none;
-    background:var(--indigo)}
+    background:var(--accent-soft);color:var(--indigo);border:1px solid var(--accent-soft)}
   .logo svg{width:24px;height:24px}
   h1{margin:0;font-size:20px;font-weight:650;letter-spacing:.2px;display:flex;align-items:center;gap:9px}
   .sub{color:var(--muted);font-size:12.5px;margin-top:3px}
@@ -45,17 +46,17 @@
   label{display:block;color:var(--muted);font-size:12.5px;margin:0 0 7px}
   .field{margin-bottom:15px}
   input[type=text],input[type=password]{width:100%;font:inherit;font-size:16px;color:var(--fg);
-    background:var(--field);border:1px solid var(--line-2);border-radius:9px;
+    background:var(--field);border:1px solid var(--line-2);border-radius:8px;
     min-height:44px;padding:11px 12px;transition:.16s ease;outline:none}
   input::placeholder{color:var(--dim)}
   input[type=text]:hover,input[type=password]:hover{border-color:var(--line-3)}
-  input[type=text]:focus,input[type=password]:focus{border-color:rgba(99,102,241,.85);
-    box-shadow:0 0 0 3px rgba(99,102,241,.2);background:var(--field-focus)}
+  input[type=text]:focus,input[type=password]:focus{border-color:var(--indigo);
+    box-shadow:0 0 0 3px var(--accent-soft);background:var(--field-focus)}
 
   button{width:100%;font:inherit;font-weight:600;color:var(--fg);cursor:pointer;
     display:inline-flex;align-items:center;justify-content:center;gap:8px;
-    min-height:44px;padding:11px 14px;border:1px solid transparent;border-radius:9px;
-    background:var(--indigo);color:#fff;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+    min-height:44px;padding:11px 14px;border:1px solid transparent;border-radius:8px;
+    background:var(--primary,#5E6AD2);color:#fff;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
   button:hover{filter:brightness(1.08)}
   button:active{filter:brightness(.96)}
   button svg{width:16px;height:16px}
@@ -67,13 +68,14 @@
   .site{margin-top:12px;text-align:center;color:var(--dim);font-size:11.5px;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
   @media (max-width:420px){form{padding:18px} body{padding-left:16px;padding-right:16px}}
+  @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important}}
 </style>
 </head>
 <body>
 <form method="post" action="/login" autocomplete="on">
   <div class="brand">
     <div class="logo">
-      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M12 19V6"/><path d="M6 12l6-6 6 6"/><path d="M4 21h16"/>
       </svg>
     </div>
