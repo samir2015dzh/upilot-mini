@@ -6,7 +6,12 @@
      （iOS 按钮高度 56px；本页常规按钮 44px，操作表行 52px）
    - 主按钮语义参考 Pico CSS（不引入）：
      https://github.com/picocss/pico/blob/main/scss/content/_button.scss
+   - 视觉令牌还参考：Pico CSS 变量 https://picocss.com/docs/css-variables
+     Open Props 圆角与阴影 https://github.com/argyleink/open-props
+     shadcn/ui zinc 中性色 https://ui.shadcn.com/docs/theming
+     Linear 强调色 #5E6AD2；底栏图标路径来自 Lucide https://lucide.dev
 */
+
 "use strict";
 
 
@@ -494,7 +499,7 @@ function renderTaskCards(rows) {
       <div class="path" title="${esc(f.target_dir || f.path)}">${esc(f.target_dir || "…")}</div>
       <div class="meta-row">
         <span>${esc(bits.join(" · "))}</span>
-        <button type="button" class="mini act" data-act="menu" data-path="${esc(f.path)}" aria-haspopup="dialog">操作</button>
+        <button type="button" class="ghost act" data-act="menu" data-path="${esc(f.path)}" aria-haspopup="dialog">操作</button>
       </div>
       ${prog}
     </article>`;
