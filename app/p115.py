@@ -240,6 +240,25 @@ OSS_MAX_PARTS = 10000
 _MIB = 1024 * 1024
 
 
+# 单个分块上传失败（断网 / 对端重置 / 超时）时原地重试的次数与基础等待（秒，指数退避）。
+# 原来任何一次失败都冒到任务级：整个上传中止 → 30 秒起退避 → 重新 list_parts → 再续传。
+# 一次网络抖动白等半分钟以上。参考 orzogc/fake115uploader 对单个分片原地重试 3 次：
+# https://github.com/orzogc/fake115uploader/blob/40b9b5a76675e52527bab3e10639198b64facad0/multipart.go
+# 重试之前已经传完的分块（done）保持不动，只从失败的那一块重新读起。
+PART_RETRIES = 3
+PART_RETRY_DELAY = 2.0
+
+
+def is_part_retryable(exc: BaseException) -> bool:
+    """分块上传中值得原地重试的错误：连接类 / 超时 / is_transient 认定的瞬态。
+    取消、认证失败、MultipartUploadAbort 之类一律不重试，直接上抛。"""
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    return isinstance(exc, Exception) and is_transient(exc)
+
+
 def part_size_for(file_size: int, base: int) -> int:
     """分块大小：至少 base；会超过 OSS_MAX_PARTS 片时放大到刚好够（按 1MiB 向上取整）。"""
     base = max(_MIB, int(base))
@@ -890,16 +909,34 @@ class P115:
             progress.update(sent / total * 100)
 
         with open(file_path, "rb") as fh:
-            # 【第 48 处】p115oss 的 part_iter 不会自己跳过已传数据（其文档原话：
-            # 「如果需要跳过一定的数据，请提前处理好」）。原来句柄停在偏移 0、分块编号却
-            # 从 len(parts)+1 开始 ⇒ 第 N+1 块传的是文件开头的数据，云端拼出来是坏文件。
-            fh.seek(skip)
-            async for part in oss_multipart_upload_part_iter(
-                up.url, up.upload_id, fh,
-                part_number_start=len(done) + 1, partsize=partsize,
-                endpoint=endpoint, reporthook=reporthook, async_=True, headers=headers,
-            ):
-                done.append(part)
+            failures = 0
+            while True:
+                # 【第 48 处】p115oss 的 part_iter 不会自己跳过已传数据（其文档原话：
+                # 「如果需要跳过一定的数据，请提前处理好」）。原来句柄停在偏移 0、分块编号却
+                # 从 len(parts)+1 开始 ⇒ 第 N+1 块传的是文件开头的数据，云端拼出来是坏文件。
+                # 原地重试时同理：偏移 = 已完成分块的字节数，编号 = 已完成个数 + 1。
+                offset = sum(_part_field(p, "Size", "size") for p in done)
+                fh.seek(offset)
+                sent = offset
+                try:
+                    async for part in oss_multipart_upload_part_iter(
+                        up.url, up.upload_id, fh,
+                        part_number_start=len(done) + 1, partsize=partsize,
+                        endpoint=endpoint, reporthook=reporthook, async_=True, headers=headers,
+                    ):
+                        done.append(part)
+                        failures = 0               # 只要还在往前走，就不累计失败次数
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if failures >= PART_RETRIES or not is_part_retryable(exc):
+                        raise
+                    failures += 1
+                    wait = PART_RETRY_DELAY * (2 ** (failures - 1))
+                    logger.warning("分块 %d 上传失败（第 %d/%d 次原地重试，%.1fs 后，已完成 %d 块）：%s",
+                                   len(done) + 1, failures, PART_RETRIES, wait, len(done), exc)
+                    progress.update(sum(_part_field(p, "Size", "size") for p in done) / total * 100,
+                                    force=True)       # 进度退回到已完成分块的位置
+                    await asyncio.sleep(wait)
         progress.update(sent / total * 100, force=True)
 
         result = await up.complete(done, async_=True, headers=headers)

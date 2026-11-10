@@ -44,6 +44,8 @@ upload:
   mode: rapid_only
   small_file_mb: 10             # 仅 rapid_then_upload：秒传未命中且小于它 → 直接普通上传
   partsize_mb: 10               # 分块上传分块大小（下限；超大文件会自动放大，保证不超过 OSS 的 10000 片）
+  # 普通上传的单文件上限（GiB）：超过就直接标「错误」，不白传。115 官方：VIP 最大 115GB（原石 5GB、尝鲜 15GB）；0 = 不限制。秒传不受影响
+  max_file_gb: 115
   # oss_endpoint: "https://oss-cn-shenzhen.aliyuncs.com"   # 分块上传的 OSS 地址（一般不用改）
   concurrency: 2                # 同时处理的文件数
   init_min_interval: 0.5        # 两次秒传/上传初始化之间的最小间隔（防 115 限流）

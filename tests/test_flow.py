@@ -3445,6 +3445,8 @@ class _FakeOSS:
         self.calls: list[dict] = []
         self.completed: list[dict] | None = None
         self.fail_after_parts: int | None = None
+        self.fail_times: int | None = None      # 只失败这么多次（None = 每次都失败）
+        self.fail_mid_part = False              # True：读完整块数据后才断（模拟传到一半断网）
         fake = self
 
         class MultipartUpload:
@@ -3466,7 +3468,12 @@ class _FakeOSS:
             n = part_number_start
             sent_parts = 0
             while True:
-                if fake.fail_after_parts is not None and sent_parts >= fake.fail_after_parts:
+                due = fake.fail_after_parts is not None and sent_parts >= fake.fail_after_parts
+                if due and fake.fail_times is not None:
+                    due = fake.fail_times > 0
+                if due and not fake.fail_mid_part:
+                    if fake.fail_times is not None:
+                        fake.fail_times -= 1
                     raise ConnectionResetError("模拟：上传中途断网")
                 buf = b""
                 while len(buf) < partsize:
@@ -3476,6 +3483,10 @@ class _FakeOSS:
                     buf += piece
                     if reporthook:
                         reporthook(len(piece))           # 与 p115oss 一样按 64KB 回调
+                if due and buf:
+                    if fake.fail_times is not None:
+                        fake.fail_times -= 1
+                    raise ConnectionResetError("模拟：这一块传到一半断网")
                 if not buf:
                     break
                 fake.cloud[n] = buf
@@ -3798,6 +3809,9 @@ async def case_multipart_failure_backoff_resume():
         m.rapid = miss
         m.ensure_pid = ensure_pid
         up.mgr = m
+        import p115 as _p115mod
+        real_retries = _p115mod.PART_RETRIES
+        _p115mod.PART_RETRIES = 0            # 本用例测的是任务级退避；分块原地重试见 [69]
         with _FakeOSS() as oss:
             oss.fail_after_parts = 2
             up.spawn(path)
@@ -3826,6 +3840,7 @@ async def case_multipart_failure_backoff_resume():
             assert rapid_calls["n"] == 0, "带断点的「待重试」应直接续传，不该再发秒传"
             assert oss.calls[-1]["offset"] == 2 * ps and oss.calls[-1]["start"] == 3, oss.calls
             assert oss.assembled() == content
+        _p115mod.PART_RETRIES = real_retries
         up._err_streak.clear()
         PASS.append("[51] 分块上传中途断网：转「待重试」退避（断点保留，不再一次就判「错误」），"
                     "到期后直接从第 3 块续传，云端内容与本地一致")
@@ -4518,6 +4533,8 @@ async def case_partsize_oss_limit():
     assert ps(110 * GiB, 64 * MiB) == 64 * MiB                    # 用户设得更大：以用户为准
 
     cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    real_retries = p115mod.PART_RETRIES
+    p115mod.PART_RETRIES = 0                  # 只想记下分块参数就断开，不要原地重试
     try:
         path = os.path.join(src, "huge.iso")
         size = 110 * GiB
@@ -4546,6 +4563,7 @@ async def case_partsize_oss_limit():
         PASS.append(f"[66] 110 GiB 文件分块自动放大到 {used // MiB} MB（{-(-size // used)} 片 ≤ 10000），"
                     f"断点记下实际分块大小、续传沿用")
     finally:
+        p115mod.PART_RETRIES = real_retries
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -4577,6 +4595,172 @@ def case_scan_log_capped():
         PASS.append("[67] 扫描日志：每轮逐条 INFO 最多 20 条，其余降 DEBUG，超出时打一行汇总；少量文件照旧")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_ino_backfill():
+    """[68] 升级前入库、没有 inode 的记录：扫描时补上（只补空值、不动其他列），
+    之后改名也能复用 SHA1。"""
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    real = upmod._sha1_file
+    reads: list[str] = []
+
+    def counting(path, total, on_progress, cancel):
+        reads.append(path)
+        return real(path, total, on_progress, cancel)
+
+    upmod._sha1_file = counting
+    try:
+        a = write_file(src, "旧库/S01E01.mkv", 2 * 1024 * 1024)
+        z = write_file(src, "旧库/S01E02.mkv", 0)
+        scanner.scan_once(store, cfg)
+        d1 = await sha1_of(a, store.get(a), store)
+        store.set(z, status="已上传")                          # 终态记录也要补
+        with store.lock:                                       # 模拟升级前入库：ino 为空
+            store.db.execute("UPDATE files SET ino=NULL")
+            store.db.commit()
+        before = {p: store.get(p)["updated_at"] for p in (a, z)}
+        time.sleep(0.02)
+        assert scanner.scan_once(store, cfg) == 0, "补 inode 不算「触及文件」"
+        for p in (a, z):
+            r = store.get(p)
+            assert r["ino"] and r["ino"] == scanner.file_ino(os.stat(p)), r
+            assert r["updated_at"] == before[p], "补 inode 不该顶动 updated_at（面板最近活动）"
+        assert store.get(a)["sha1"] == d1 and store.get(z)["status"] == "已上传"
+
+        # 文件在两次扫描之间被换了内容（size/mtime 变）：走重建，不拿旧 inode 乱补
+        with store.lock:
+            store.db.execute("UPDATE files SET ino=NULL WHERE path=?", (a,))
+            store.db.commit()
+        with open(a, "ab") as f:
+            f.write(b"x")
+        scanner.scan_once(store, cfg)
+        assert store.get(a)["ino"] and not store.get(a)["sha1"], store.get(a)
+
+        # 补完之后改名：直接复用，不读盘
+        b0 = write_file(src, "旧库2/S02E01.mkv", 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        d2 = await sha1_of(b0, store.get(b0), store)
+        with store.lock:
+            store.db.execute("UPDATE files SET ino=NULL WHERE path=?", (b0,))
+            store.db.commit()
+        scanner.scan_once(store, cfg)                          # 补回
+        n_reads = len(reads)
+        os.rename(os.path.join(src, "旧库2"), os.path.join(src, "新库2"))
+        b1 = os.path.normpath(os.path.join(src, "新库2", "S02E01.mkv"))
+        scanner.scan_once(store, cfg)
+        assert await sha1_of(b1, store.get(b1), store) == d2 and len(reads) == n_reads, reads
+        PASS.append("[68] 升级前没有 inode 的记录扫描时补上（含终态；不动 updated_at；内容变了的不补），"
+                    "补完后改名同样复用 SHA1")
+    finally:
+        upmod._sha1_file = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_part_inplace_retry():
+    """[69] 单个分块上传失败：原地重试（只重传失败那块），不再整个上传中止、退避 30 秒。"""
+    import p115 as p115mod
+
+    MiB = 1024 * 1024
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    real_delay = p115mod.PART_RETRY_DELAY
+    p115mod.PART_RETRY_DELAY = 0.0
+    try:
+        path = os.path.join(src, "big.mkv")
+        content = os.urandom(3 * MiB + 12345)
+        with open(path, "wb") as f:
+            f.write(content)
+        store.add(path, len(content), os.path.getmtime(path))
+        m = _bare_p115(store, MiB)
+        m.cfg = {"upload": {}}
+
+        # 1) 第 2 块传到一半断网两次：原地重试后整份内容正确拼回
+        with _FakeOSS() as oss:
+            oss.fail_after_parts, oss.fail_times, oss.fail_mid_part = 1, 2, True
+            await m.multipart(path, 700, "sha", store.get(path))
+            body = b"".join(oss.cloud[n] for n in sorted(oss.cloud))
+            assert body == content, "原地重试后内容不对（偏移/分块编号错了）"
+            assert len(oss.calls) == 3, oss.calls
+            assert [(c["offset"], c["start"]) for c in oss.calls] == [(0, 1), (MiB, 2), (2 * MiB, 3)], oss.calls
+            assert len(oss.completed) == 4
+
+        # 2) 连续失败超过上限：照旧上抛（交给任务级退避）
+        store.set(path, upload_id=None, upload_oss_url=None, upload_callback=None)
+        with _FakeOSS() as oss:
+            oss.fail_after_parts = 0                            # 每次都在第一块前断
+            try:
+                await m.multipart(path, 700, "sha", store.get(path))
+                raise AssertionError("应当上抛")
+            except ConnectionResetError:
+                pass
+            assert len(oss.calls) == p115mod.PART_RETRIES + 1, oss.calls
+
+        # 3) 非连接类错误（比如被拒、编程错误）不重试
+        store.set(path, upload_id=None, upload_oss_url=None, upload_callback=None)
+
+        class Rejected(Exception):
+            pass
+
+        with _FakeOSS() as oss:
+            real_iter = oss.mods["p115oss"].oss_multipart_upload_part_iter
+
+            async def bad_iter(*a, **k):
+                raise Rejected("403")
+                yield  # pragma: no cover
+
+            oss.mods["p115oss"].oss_multipart_upload_part_iter = bad_iter
+            try:
+                await m.multipart(path, 700, "sha", store.get(path))
+                raise AssertionError("应当上抛")
+            except Rejected:
+                pass
+            oss.mods["p115oss"].oss_multipart_upload_part_iter = real_iter
+        assert p115mod.is_part_retryable(ConnectionResetError()) and p115mod.is_part_retryable(TimeoutError())
+        assert not p115mod.is_part_retryable(Rejected()) and not p115mod.is_part_retryable(asyncio.CancelledError())
+        PASS.append("[69] 分块失败原地重试：第 2 块两次传到一半断网后仍拼出正确内容（只重传失败块）；"
+                    "连续失败超过上限照旧上抛；非连接类错误不重试")
+    finally:
+        p115mod.PART_RETRY_DELAY = real_delay
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_max_upload_size():
+    """[70] 超过 115 单文件上限（默认 115 GiB，upload.max_file_gb 可调、0=不限）的文件不走普通上传：
+    直接标「错误」并说明原因，不白传；秒传不受影响。"""
+    MiB = 1024 * 1024
+    assert cfgmod.DEFAULTS["upload"]["max_file_gb"] == 115
+
+    async def run(max_gb, fail_first):
+        cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=0, fail_first=fail_first,
+                                                 mode="rapid_then_upload", small_file_mb=1)
+        try:
+            cfg["upload"]["max_file_gb"] = max_gb
+            up = Uploader(cfg, store, mgr)
+            calls = []
+            real = mgr.multipart
+
+            async def spy(*a, **k):
+                calls.append(a[0])
+                return await real(*a, **k)
+
+            mgr.multipart = spy
+            p = write_file(src, "huge/E01.mkv", 3 * MiB)
+            scanner.scan_once(store, cfg)
+            rec = await drive(up, store, p, rounds=6)
+            return rec, calls
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    limit = 2 / 1024                                            # 2 MiB 的上限，文件 3 MiB
+    rec, calls = await run(limit, fail_first=99)
+    assert rec["status"] == "错误" and "上限" in (rec["message"] or "") and not calls, (rec, calls)
+    rec, calls = await run(0, fail_first=99)                    # 0 = 不限制
+    assert rec["status"] == "已上传" and rec["upload_mode"] == "normal" and calls, rec
+    rec, calls = await run(limit, fail_first=0)                 # 秒传命中：不受上限影响
+    assert rec["status"] == "已上传" and rec["upload_mode"] == "rapid" and not calls, rec
+    PASS.append("[70] 超过 115 单文件上限（upload.max_file_gb，默认 115）的文件不普通上传、直接标错误；"
+                "0=不限制；秒传命中不受影响")
 
 
 async def main():
@@ -4642,6 +4826,9 @@ async def main():
     await case_sha1_reuse_same_inode()
     await case_partsize_oss_limit()
     case_scan_log_capped()
+    await case_ino_backfill()
+    await case_part_inplace_retry()
+    await case_max_upload_size()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

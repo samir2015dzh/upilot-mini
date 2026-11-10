@@ -45,6 +45,7 @@ def scan_once(store, cfg: dict) -> int:
     # 原来每个文件一次 SELECT、每次推进一次 commit。判断逻辑逐条不变。
     new_files: list[tuple] = []
     bumps: list[tuple[str, int]] = []
+    ino_fill: list[tuple] = []       # (path, size, mtime, ino)：给升级前入库、还没有 inode 的记录补上
     n_new = n_stable = 0
 
     for root, dirs, names in os.walk(src):
@@ -90,6 +91,10 @@ def scan_once(store, cfg: dict) -> int:
                 continue
 
             status, stable_count = rec[2], rec[3]
+            if rec[4] is None:
+                ino = file_ino(st)
+                if ino:
+                    ino_fill.append((full, st.st_size, st.st_mtime, ino))
             if status in TERMINAL:
                 continue
             if stable_count < stable_rounds:
@@ -100,13 +105,13 @@ def scan_once(store, cfg: dict) -> int:
                     logger.log(logging.INFO if n_stable <= LOG_EACH_MAX else logging.DEBUG,
                                "文件已稳定：%s", os.path.basename(full))
                 touched += 1
-        if len(new_files) + len(bumps) >= FLUSH_EVERY:
+        if len(new_files) + len(bumps) + len(ino_fill) >= FLUSH_EVERY:
             # 分批提交：首轮扫一个大片库时别把几万条写入攒在内存里一次性写
             # （实测 2 万条一次写完，进程常驻内存会多留十几 MB 回不去）
-            store.apply_scan(new_files, bumps)
-            new_files, bumps = [], []
+            store.apply_scan(new_files, bumps, ino_fill)
+            new_files, bumps, ino_fill = [], [], []
 
-    store.apply_scan(new_files, bumps)
+    store.apply_scan(new_files, bumps, ino_fill)
     if n_new > LOG_EACH_MAX or n_stable > LOG_EACH_MAX:
         logger.info("本轮扫描：发现新文件 %d 个、文件已稳定 %d 个（逐条只列前 %d 个，其余见 DEBUG 日志）",
                     n_new, n_stable, LOG_EACH_MAX)

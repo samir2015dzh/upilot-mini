@@ -121,6 +121,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `upload.mode` | `rapid_only` | `rapid_only` = 只用秒传，未命中就排队等，**永不普通上传**；`rapid_then_upload` = 秒传优先，重试耗尽后转分块上传 |
 | `upload.small_file_mb` | 10 | 仅 `rapid_then_upload`：秒传未命中且小于该值直接上传 |
 | `upload.concurrency` | 2 | 同时在处理的文件数 |
+| `upload.max_file_gb` | 115 | 普通上传（分块）的单文件上限（GiB），超过的直接标「错误」不白传；115 官方 VIP 单文件最大 115GB（原石 5GB、尝鲜 15GB）。`0` = 不限制；秒传不受影响 |
 | `upload.init_min_interval` | 0.5 | 两次初始化请求的最小间隔（防 115 限流 401） |
 | `retry.interval_seconds` | 60 | 秒传重试间隔（每轮只发校验请求） |
 | `retry.max_count` | 5 | `rapid_only`：前 N 轮用短间隔；`rapid_then_upload`：超过即算重试耗尽 |
@@ -404,6 +405,7 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **`docker stop` / 重启时会丢进度吗**：不会。收到退出信号后不再派发新任务，正在做的（秒传请求、SHA1、分块）最多再等 8 秒自然结束（docker 默认 10 秒后强杀），没做完的状态都在库里，下次启动接着做。
 - **日志太多**：compose 示例已带日志轮转（最多 3×10 MB）；自己写 `docker run` 的加 `--log-opt max-size=10m --log-opt max-file=3`。逐个文件的「秒传未命中」只有第一次是 INFO，之后是 DEBUG，每轮另打一行「秒传校验汇总」；要看明细把 `log_level` 改成 `DEBUG`。
 - **容器显示 unhealthy**：`docker inspect --format '{{json .State.Health}}' upilot-mini` 看原因；`stalled: main loop heartbeat …` 表示主循环卡住了，`docker restart upilot-mini` 即可（状态都在库里）。
+- **分块上传断网抖一下就等半分钟**：现在单个分块失败（连接重置/超时）会原地重试最多 3 次（2/4/8 秒），只重传失败那一块；连续失败才走任务级退避（30 秒起）。
 - **115 换了 OSS 区域，分块上传连不上**：在 `config.yaml` 的 `upload` 下加 `oss_endpoint: "https://oss-cn-xxx.aliyuncs.com"`，默认是深圳。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。
 - **想临时停一下上传**：界面上点「暂停调度」，在途任务跑完就停；点「恢复调度」继续。

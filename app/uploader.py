@@ -249,6 +249,11 @@ class Uploader:
         # 洗板：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
         self.cleanup_prev = bool(up.get("cleanup_previous_versions"))
         self.cleanup_max = int(up.get("cleanup_max_delete") or 3)
+        # 普通上传的单文件上限（字节，0 = 不限）。见 config.DEFAULTS["upload"]["max_file_gb"]
+        try:
+            self.max_upload_bytes = int(float(up.get("max_file_gb", 115) or 0) * 1024 ** 3)
+        except (TypeError, ValueError):
+            self.max_upload_bytes = 115 * 1024 ** 3
         self.notifier = Notifier(cfg)
         # 同样跨实例共享：旧实例被覆盖后，它派发的后台任务若只被实例持有的 set 引用，
         # 会被 GC 回收（跑到一半消失）；异常计数清空则让退避重试永远到不了阈值。
@@ -979,6 +984,15 @@ class Uploader:
             return                                       # 到期由调度器重新拾起
 
         # 4) 分块上传（带断点续传）
+        # 超过 115 单文件上限的，传多少都会在最后被拒：先拦住，别白占几十上百 GB 上行。
+        if self.max_upload_bytes and rec["size"] > self.max_upload_bytes:
+            gb = rec["size"] / 1024 ** 3
+            store.set(path, status="错误",
+                      message=f"文件 {gb:.1f} GiB，超过普通上传上限 {self.max_upload_bytes / 1024 ** 3:.0f} GiB"
+                              "（115 单文件限制），已跳过；秒传不受此限")
+            logger.warning("不普通上传（超过 115 单文件上限 %.0f GiB）：%s（%.1f GiB）",
+                           self.max_upload_bytes / 1024 ** 3, os.path.basename(path), gb)
+            return
         store.set(path, status="上传中", message="分块上传中")
         try:
             result = await self.mgr.multipart(path, pid, rec["sha1"] or "", store.get(path))
