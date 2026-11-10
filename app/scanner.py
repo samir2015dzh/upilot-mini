@@ -16,6 +16,19 @@ _SIDECAR_SUFFIXES = (
 )
 
 
+def has_sidecar(filename: str, names) -> bool:
+    """同一目录的文件名列表里，有没有这个成品旁边的控制文件。
+
+    扫描时用 os.walk 已经拿到的 names，避免每个视频再 stat/lexists 七八次。
+    两万集的片库里大部分早已「已上传」，每轮扫描若逐个探控制文件，在 NAS 上会多出
+    十几万次系统调用，一轮轻松超过扫描间隔。
+    """
+    for sfx in _SIDECAR_SUFFIXES:
+        if (filename + sfx) in names:
+            return True
+    return False
+
+
 def still_writing(path: str) -> bool:
     """成品旁边还有下载器的控制文件时，文件还没写完，不能当稳定、不能算 SHA1。"""
     for sfx in _SIDECAR_SUFFIXES:
@@ -89,7 +102,9 @@ def scan_once(store, cfg: dict) -> int:
                 continue
             keep.append(d)
         dirs[:] = keep
-        cands: list[tuple[str, os.stat_result]] = []
+        # 整目录的文件名只建一次集合：后面判断控制文件不再逐个 lexists
+        name_set = set(names)
+        cands: list[tuple[str, str, os.stat_result]] = []
         for name in names:
             if name.startswith("."):
                 continue
@@ -103,11 +118,11 @@ def scan_once(store, cfg: dict) -> int:
                 continue
             if st.st_size < min_bytes:
                 continue
-            cands.append((full, st))
+            cands.append((full, name, st))
         if not cands:
             continue
         known = store.scan_lookup([c[0] for c in cands])
-        for full, st in cands:
+        for full, name, st in cands:
             rec = known.get(full)
             if rec is None or rec[0] != st.st_size or rec[1] != st.st_mtime:
                 # 新文件，或同路径内容被改写（size/mtime 变了）→ 重建记录
@@ -118,19 +133,18 @@ def scan_once(store, cfg: dict) -> int:
                 touched += 1
                 continue
 
-            # 成品旁边还有 .aria2 / .!qB 等控制文件：先记下，但不要推进稳定计数。
-            # 预分配的完整大小看起来「已经稳定」，sidecar 才是还在写的信号。
-            if still_writing(full):
-                logger.debug("还在下载（旁边有控制文件），暂不推进稳定计数：%s",
-                             os.path.basename(full))
-                continue
-
             status, stable_count = rec[2], rec[3]
             if rec[4] is None:
                 ino = file_ino(st)
                 if ino:
                     ino_fill.append((full, st.st_size, st.st_mtime, ino))
             if status in TERMINAL:
+                # 已经结束的记录不必再探控制文件：大片库每轮能少十几万次系统调用
+                continue
+            # 成品旁边还有 .aria2 / .!qB 等控制文件：先记下，但不要推进稳定计数。
+            # 预分配的完整大小看起来「已经稳定」，sidecar 才是还在写的信号。
+            if has_sidecar(name, name_set):
+                logger.debug("还在下载（旁边有控制文件），暂不推进稳定计数：%s", name)
                 continue
             if stable_count < stable_rounds:
                 new_count = stable_count + 1

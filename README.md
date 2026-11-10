@@ -101,7 +101,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 分块上传（默认 10MB 分块，超过 97.6 GiB 的文件自动放大分块、保证不超过 OSS 的 10000 片；OSS 多段上传；upload_id / callback / oss_url 落库 → 暂停或重启后从已传分块继续）
 ```
 
-不重复读盘的四道防线：秒传命中根本不读文件 → SHA1 落库后不再重算 → 同 path+size+mtime 的扫描去重 → 稳定判定（避免文件还在写就上传）。下载器预分配了完整大小时，只看 size/mtime 不够，旁边还有 `.aria2` / `.!qB` / `.part` 等控制文件就先不算 SHA1。不用 inotify（NAS 上的 CIFS/NFS 挂载通知不可靠）。
+不重复读盘的四道防线：秒传命中根本不读文件 → SHA1 落库后不再重算 → 同 path+size+mtime 的扫描去重 → 稳定判定（避免文件还在写就上传）。下载器预分配了完整大小时，只看 size/mtime 不够，旁边还有 `.aria2` / `.!qB` / `.part` 等控制文件就先不算 SHA1。扫描时用目录里已经列出的文件名判断控制文件，已经传完的记录不再探。不用 inotify（NAS 上的 CIFS/NFS 挂载通知不可靠）。
 
 文件被覆盖（size/mtime 变化）会被识别为新文件，旧 SHA1 与断点作废重来。
 

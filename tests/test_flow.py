@@ -5854,6 +5854,57 @@ def case_config_startup_validation():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def case_scan_large_library_sidecars():
+    """[84] 大片库扫描：用目录文件名判断控制文件，已上传的不再逐个 lexists；语义不变。"""
+    assert scanner.has_sidecar("Show.mkv", {"Show.mkv", "Show.mkv.aria2"})
+    assert scanner.has_sidecar("Show.mkv", {"Show.mkv.!qB"})
+    assert not scanner.has_sidecar("Show.mkv", {"Show.mkv", "other.aria2"})
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    try:
+        n = 400
+        uploaded = [write_file(src, f"库/已传/{i:04d}.mkv", 64) for i in range(n)]
+        pending = write_file(src, "库/新/a.mkv", 64)
+        blocked = write_file(src, "库/新/b.mkv", 64)
+        Path = __import__("pathlib").Path
+        Path(blocked + ".aria2").write_text("lock")
+        # 先扫一轮入队，再把大部分标成已上传（模拟已经跑过一轮的大片库）
+        scanner.scan_once(store, cfg)
+        for pth in uploaded:
+            store.set(pth, status="已上传", sha1="done", stable_count=1)
+        rec_u = {pth: dict(store.get(pth)) for pth in (uploaded[0], uploaded[-1])}
+
+        calls = []
+        real_lexists = os.path.lexists
+
+        def counting_lexists(path):
+            calls.append(path)
+            return real_lexists(path)
+
+        os.path.lexists = counting_lexists
+        try:
+            t0 = time.perf_counter()
+            scanner.scan_once(store, cfg)
+            elapsed = time.perf_counter() - t0
+        finally:
+            os.path.lexists = real_lexists
+
+        assert elapsed < 3.0, f"扫描 {n}+2 个文件耗时 {elapsed:.2f}s，太慢"
+        assert calls == [], f"扫描不该再逐个 lexists，实际 {len(calls)} 次：{calls[:5]}"
+        for pth, before in rec_u.items():
+            after = store.get(pth)
+            assert after["status"] == "已上传" and after["sha1"] == "done"
+            assert after["stable_count"] == before["stable_count"]
+        assert store.get(pending)["stable_count"] >= 1
+        assert store.get(blocked)["stable_count"] == 0 and not store.get(blocked).get("sha1")
+
+        PASS.append("[84] 大片库扫描用目录文件名判断控制文件、已上传的不再逐个 lexists；"
+                    "未完成下载仍不推进稳定计数，语义与原来一致")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5933,6 +5984,7 @@ async def main():
     case_version_tiebreak()
     await case_sidecar_still_writing()
     case_config_startup_validation()
+    case_scan_large_library_sidecars()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
