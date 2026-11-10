@@ -315,8 +315,14 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="离线自检：不联网，模拟 115")
     args = parser.parse_args()
 
-    cfg = cfgmod.load()
+    try:
+        cfg = cfgmod.load()
+    except cfgmod.ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     setup_logging(cfg.get("log_level", "INFO"))
+    for msg in cfgmod.startup_warnings(cfg):
+        logging.getLogger("upilot").warning("%s", msg)
 
     if args.command == "login":
         return do_login(cfg)

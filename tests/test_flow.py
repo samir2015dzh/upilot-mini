@@ -5775,6 +5775,85 @@ async def case_sidecar_still_writing():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def case_config_startup_validation():
+    """[83] 启动时检查配置：YAML 写坏、类型不对会中文报错退出；目录不存在 / 没填 cookie 只警告。"""
+    from pathlib import Path
+    tmp = tempfile.mkdtemp(prefix="upilot-cfgval-")
+    old_path, old_pf = cfgmod.CONFIG_PATH, cfgmod.PORT_FILE
+    cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
+    cfgmod.PORT_FILE = cfgmod.CONFIG_PATH.parent / ".http_port"
+    # 避免环境变量把测试配置盖掉
+    env_backup = {k: os.environ.pop(k) for k in ("P115_COOKIE", "UPILOT_SOURCE", "UPILOT_TARGET_ROOT")
+                  if k in os.environ}
+    src_ok = os.path.join(tmp, "media")
+    os.makedirs(src_ok)
+
+    def dump(body: str) -> None:
+        cfgmod.CONFIG_PATH.write_text(body, encoding="utf-8")
+
+    def load_err(body: str) -> str:
+        dump(body)
+        try:
+            cfgmod.load()
+        except cfgmod.ConfigError as exc:
+            return str(exc)
+        raise AssertionError("应当抛出 ConfigError")
+
+    try:
+        # 1) YAML 语法错误
+        msg = load_err("scan:\n  interval_seconds: [未闭合")
+        assert "YAML" in msg and "缩进" in msg, msg
+
+        # 2) 顶层不是 mapping
+        msg = load_err("- just a list\n")
+        assert "顶层应该是一组键值" in msg, msg
+
+        # 3) 整段写成一行文字
+        msg = load_err("paths: 不是一组设置\n")
+        assert "目录设置" in msg and "一组设置" in msg, msg
+
+        # 4) 该是数字的写成文字 / 小于最小值
+        base = (f"paths:\n  source: {src_ok}\n"
+                f"p115:\n  cookie: UID=1; CID=2\n")
+        msg = load_err(base + "scan:\n  interval_seconds: 不是数字\n")
+        assert "多久看一眼文件夹" in msg and "应该是数字" in msg, msg
+        msg = load_err(base + "scan:\n  interval_seconds: 0\n")
+        assert "至少是 1 秒" in msg, msg
+        # 设置页下限是 2，但写 1 仍能启动（只警告）
+        dump(base + "scan:\n  interval_seconds: 1\n")
+        cfg = cfgmod.load()
+        assert cfg["scan"]["interval_seconds"] == 1
+        assert any("建议至少是 2" in w for w in cfgmod.startup_warnings(cfg))
+
+        # 5) 监控目录没填
+        msg = load_err("paths:\n  source: ''\n")
+        assert "没有指定监控目录" in msg, msg
+
+        # 6) 合法配置能加载
+        dump(base)
+        cfg = cfgmod.load()
+        assert cfg["paths"]["source"] == src_ok
+
+        # 7) 目录还不存在、没填 cookie → 只警告，不阻止启动
+        missing = os.path.join(tmp, "not-mounted")
+        dump(f"paths:\n  source: {missing}\n")
+        cfg = cfgmod.load()
+        warns = cfgmod.startup_warnings(cfg)
+        assert any("还不存在" in w and missing in w for w in warns), warns
+        assert any("登录凭证" in w for w in warns), warns
+        _err, _w = cfgmod.inspect_config(cfg)
+        assert not _err, _err
+
+        PASS.append("[83] 启动配置检查：YAML 写坏 / 顶层不是键值 / 类型不对 / 数字过小会中文报错退出；"
+                    "监控目录还不存在、还没填 cookie 只警告")
+    finally:
+        cfgmod.CONFIG_PATH, cfgmod.PORT_FILE = old_path, old_pf
+        for k, v in env_backup.items():
+            os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5853,6 +5932,7 @@ async def main():
     await case_season_panel_history()
     case_version_tiebreak()
     await case_sidecar_still_writing()
+    case_config_startup_validation()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
