@@ -190,6 +190,144 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
+class ConfigError(Exception):
+    """启动时配置没法用。str(self) 已经是给用户看的中文说明（可能有多行）。"""
+
+
+_SECTION_LABELS = {
+    "paths": "目录设置（paths）",
+    "p115": "115 账号（p115）",
+    "scan": "扫描（scan）",
+    "upload": "上传（upload）",
+    "retry": "重试（retry）",
+    "http": "网页面板（http）",
+    "notify": "通知（notify）",
+    "state": "状态库（state）",
+}
+
+
+def _field_by_key(key: str) -> dict | None:
+    for group in FIELD_GROUPS:
+        for field in group["fields"]:
+            if field["key"] == key:
+                return field
+    return None
+
+
+def _field_name(key: str) -> str:
+    field = _field_by_key(key)
+    return f"{field['label']}（{key}）" if field else key
+
+
+def inspect_config(cfg: dict) -> tuple[list[str], list[str]]:
+    """启动前检查配置。返回 (错误, 警告)；有错误就不该启动。"""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(cfg, dict):
+        return ["配置的顶层应该是一组键值，现在不是。"], warnings
+
+    for key, label in _SECTION_LABELS.items():
+        val = cfg.get(key)
+        if val is not None and not isinstance(val, dict):
+            errors.append(f"{label} 应该是一组设置，不能写成 {type(val).__name__}。")
+
+    # 面板字段的类型和范围（与设置页同一套规则）
+    for group in FIELD_GROUPS:
+        for field in group["fields"]:
+            key = field["key"]
+            raw = _dig(cfg, key, default=None)
+            if raw is None:
+                continue
+            typ = field["type"]
+            name = _field_name(key)
+            if typ in ("int", "float"):
+                try:
+                    num = float(raw)
+                except (TypeError, ValueError):
+                    errors.append(f"{name} 应该是数字，现在是 {raw!r}。")
+                    continue
+                if not math.isfinite(num):
+                    errors.append(f"{name} 不能是无穷大或非数字。")
+                    continue
+                if typ == "int" and abs(num - int(num)) > 1e-9:
+                    errors.append(f"{name} 应该是整数，现在是 {raw!r}。")
+                    continue
+                lo, hi = field.get("min"), field.get("max")
+                # 超出设置页范围先警告；只有真会跑不起来的值才阻止启动
+                # （比如扫描间隔 0 会空转，同时处理 0 个文件会卡住）。
+                hard = None
+                if key == "scan.interval_seconds" and num < 1:
+                    hard = f"{name} 至少是 1 秒，现在是 {raw}。"
+                elif key == "scan.stable_rounds" and num < 1:
+                    hard = f"{name} 至少是 1，现在是 {raw}。"
+                elif key == "upload.concurrency" and num < 1:
+                    hard = f"{name} 至少是 1，现在是 {raw}。"
+                elif key == "http.port" and not (1 <= num <= 65535):
+                    hard = f"{name} 应在 1 到 65535 之间，现在是 {raw}。"
+                elif key == "scan.min_size_mb" and num < 0:
+                    hard = f"{name} 不能是负数，现在是 {raw}。"
+                if hard:
+                    errors.append(hard)
+                else:
+                    if lo is not None and num < lo:
+                        warnings.append(f"{name} 建议至少是 {lo}，现在是 {raw}，仍会启动。")
+                    if hi is not None and num > hi:
+                        warnings.append(f"{name} 建议不超过 {hi}，现在是 {raw}，仍会启动。")
+            elif typ == "bool":
+                if isinstance(raw, bool):
+                    continue
+                if isinstance(raw, (int, float)) and raw in (0, 1):
+                    continue
+                if isinstance(raw, str) and raw.strip().lower() in (
+                    "true", "false", "yes", "no", "on", "off", "1", "0",
+                ):
+                    continue
+                errors.append(f"{name} 应该是 true 或 false，现在是 {raw!r}。")
+            elif typ == "list":
+                if isinstance(raw, str):
+                    # 面板允许逗号分隔；手写配置写成一行也可以
+                    continue
+                if not isinstance(raw, list) or any(isinstance(x, (dict, list)) for x in raw):
+                    errors.append(f"{name} 应该是一串文字（列表或逗号分隔），现在格式不对。")
+            elif typ == "select":
+                allowed = [str(o["value"]) for o in (field.get("options") or [])]
+                if allowed and str(raw).strip() not in allowed:
+                    # 上传方式写错会按「只秒传」处理，不算致命；其它选项也先警告
+                    warnings.append(
+                        f"{name} 的值 {raw!r} 不在可选范围（{' / '.join(allowed)}），"
+                        f"程序会按默认值处理。"
+                    )
+            elif typ == "map":
+                if not isinstance(raw, list):
+                    errors.append(f"{name} 应该是列表，每一项包含 from 和 to。")
+                    continue
+                for i, item in enumerate(raw, 1):
+                    if not isinstance(item, dict) or "from" not in item or "to" not in item:
+                        errors.append(f"{name} 第 {i} 条格式不对，需要同时有 from 和 to。")
+
+    src = str(_dig(cfg, "paths.source", "") or "").strip()
+    if not src:
+        errors.append("没有指定监控目录（paths.source）。请在配置里填，或设环境变量 UPILOT_SOURCE。")
+    elif not os.path.isdir(src):
+        warnings.append(f"监控目录还不存在：{src}。目录挂上来之前不会处理文件。")
+
+    db = _dig(cfg, "state.db", None)
+    if db is not None and not isinstance(db, str):
+        errors.append(f"状态库路径（state.db）应该是文字路径，现在是 {type(db).__name__}。")
+
+    cookie = str(_dig(cfg, "p115.cookie", "") or "").strip()
+    cookie_from = str(_dig(cfg, "p115.cookie_from", "") or "").strip()
+    if not cookie and not cookie_from:
+        warnings.append("还没有 115 登录凭证（p115.cookie 为空）。可以在面板里粘贴，或设置环境变量 P115_COOKIE。")
+    return errors, warnings
+
+
+def startup_warnings(cfg: dict) -> list[str]:
+    """load() 通过后，启动时需要打出来的警告（监控目录还不在、还没填 cookie 等）。"""
+    _errors, warnings = inspect_config(cfg)
+    return warnings
+
+
 def ensure_config() -> Path:
     """首次启动：把示例配置复制到 /config/config.yaml。"""
     if not CONFIG_PATH.exists():
@@ -203,7 +341,7 @@ def ensure_config() -> Path:
 
 
 def load() -> dict:
-    """读配置。
+    """读配置。格式不对或关键项无法使用时抛 ConfigError（中文说明，不带 traceback）。
 
     与 save() 共用同一把锁：Linux 上 POSIX rename 是原子的（读者拿旧 inode，
     不受写者影响），所以生产环境其实不需要；但 Windows 上「目标文件正被打开」
@@ -212,9 +350,25 @@ def load() -> dict:
     """
     with _SAVE_LOCK:
         ensure_config()
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            user = yaml.safe_load(f) or {}
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                user = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ConfigError(
+                f"配置文件 {CONFIG_PATH} 不是合法的 YAML，请检查缩进和标点。\n细节：{exc}"
+            ) from exc
+        except OSError as exc:
+            raise ConfigError(f"读不了配置文件 {CONFIG_PATH}：{exc}") from exc
+    if user is None:
+        user = {}
+    if not isinstance(user, dict):
+        raise ConfigError(
+            f"配置文件 {CONFIG_PATH} 的顶层应该是一组键值，现在是 {type(user).__name__}。"
+        )
     cfg = _merge(DEFAULTS, user)
+    for key, label in _SECTION_LABELS.items():
+        if not isinstance(cfg.get(key), dict):
+            raise ConfigError(f"{label} 应该是一组设置，请检查 {CONFIG_PATH}。")
 
     env_cookie = os.environ.get("P115_COOKIE", "").strip()
     if env_cookie:
@@ -225,6 +379,14 @@ def load() -> dict:
     env_target = os.environ.get("UPILOT_TARGET_ROOT", "").strip()
     if env_target:
         cfg["paths"]["target_root"] = env_target
+
+    errors, _warnings = inspect_config(cfg)
+    if errors:
+        raise ConfigError(
+            "配置有问题，没法启动：\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + f"\n请检查 {CONFIG_PATH}。"
+        )
     return cfg
 
 

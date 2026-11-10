@@ -107,6 +107,8 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 
 ## 4. 配置要点（`/config/config.yaml`）
 
+启动时会先检查配置。YAML 写坏了、该是数字的写成了文字、监控目录没填，会直接退出并打出中文原因；监控目录还不存在、还没填 115 凭证，只警告，不阻止启动。
+
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `p115.cookie` / `p115.app` | — / `115ipad` | 115 登录凭证与客户端身份（可选值见 §2） |
