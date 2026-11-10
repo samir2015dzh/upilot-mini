@@ -2773,6 +2773,9 @@ async def case_delete_after_upload_no_mutual_delete():
         # 两个版本大小刻意不同（相同会被 keep_size 那道挡住，测不出这个洞）
         p1 = write_file(src, f"TVs/Drama/{dv}", 3 * 1024 * 1024)
         p2 = write_file(src, f"TVs/Drama/{nov}", 5 * 1024 * 1024)
+        _t = time.time()
+        os.utime(p1, (_t - 600, _t - 600))                    # DV 版先下载（旧），无 DV 版后下载（新）
+        os.utime(p2, (_t, _t))
         scanner.scan_once(store, cfg)
         scanner.scan_once(store, cfg)
 
@@ -2789,7 +2792,9 @@ async def case_delete_after_upload_no_mutual_delete():
         gone.clear()
         rec2 = await drive(up, store, p2)
         assert rec2["status"] == "已上传", rec2["status"]
-        assert gone == [], f"同集两版本都正当，谁都不该被删：{gone}"
+        # 洗板只留最新：库里记录在本地文件被收尾删除后仍在，按本地下载时间判新旧 ——
+        # 先下载的 DV 版被替换、后下载的留下；裁决确定，不会互删到云端一个不剩
+        assert gone == [f"stub-{p1}"], f"应只清掉先下载的旧版：{gone}"
 
         # ---- C) 洗板场景：本地文件不在、且不是本程序删的 → 仍要清 ----
         # 把 p1（dv 那条）降回「非程序删」—— 此时它本地文件已不在、source_deleted=0，
