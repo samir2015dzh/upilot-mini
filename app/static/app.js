@@ -1,5 +1,14 @@
-/* UPilot-mini 前端：概览 / 任务明细 / 设置（零依赖，纯原生 JS） */
+/* UPilot-mini 前端：概览 / 任务明细 / 设置（零依赖，纯原生 JS）
+   手机按钮与操作表（只借布局，不引入框架）：
+   - 点击区 ≥ 44px：Apple HIG / WCAG 2.5.5 Target Size
+   - 底部操作表、安全区、取消键单独一组：
+     https://github.com/ionic-team/ionic-framework/blob/main/core/src/components/action-sheet/action-sheet.ios.vars.scss
+     （iOS 按钮高度 56px；本页常规按钮 44px，操作表行 52px）
+   - 主按钮语义参考 Pico CSS（不引入）：
+     https://github.com/picocss/pico/blob/main/scss/content/_button.scss
+*/
 "use strict";
+
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -39,6 +48,102 @@ const S = {
   STATUSES: ["全部", "进行中", "待上传", "待重试", "已完成", "错误"],
 };
 const INTERVALS = [3000, 5000, 10000, 30000];
+const THEMES = ["auto", "dark", "light"];
+const THEME_LABEL = { auto: "自动", dark: "深色", light: "浅色" };
+const curTheme = () => document.documentElement.dataset.theme || "auto";
+
+function setBusy(el, on) {
+  if (!el) return;
+  el.disabled = !!on;
+  if (on) el.setAttribute("aria-busy", "true");
+  else el.removeAttribute("aria-busy");
+}
+
+let _confirmWait = null;
+function closeConfirm(result) {
+  const el = $("#confirm");
+  if (!el) return;
+  el.classList.remove("on");
+  el.hidden = true;
+  const fn = _confirmWait;
+  _confirmWait = null;
+  if (fn) fn(!!result);
+}
+function askConfirm({ title, body, ok = "确定" }) {
+  return new Promise((resolve) => {
+    closeConfirm(false);
+    $("#confirm-title").textContent = title || "确认";
+    $("#confirm-body").textContent = body || "";
+    $("#confirm-ok").textContent = ok;
+    _confirmWait = resolve;
+    const el = $("#confirm");
+    el.hidden = false;
+    el.classList.add("on");
+    $("#confirm-cancel").focus();
+  });
+}
+
+let _sheetPick = null;
+function closeSheet() {
+  const el = $("#sheet");
+  if (!el) return;
+  el.classList.remove("on");
+  el.hidden = true;
+  _sheetPick = null;
+}
+function openSheet(items, onPick, title) {
+  const el = $("#sheet");
+  const main = $("#sheet-actions");
+  const danger = $("#sheet-danger");
+  $("#sheet-title").textContent = title || "操作";
+  const mk = (i) => `<button type="button" data-id="${esc(i.id)}" class="${i.kind === "primary" ? "primary" : (i.kind === "danger" ? "danger" : "")}">${esc(i.label)}</button>`;
+  const normal = (items || []).filter(i => i.kind !== "danger");
+  const bad = (items || []).filter(i => i.kind === "danger");
+  main.innerHTML = normal.map(mk).join("");
+  danger.innerHTML = bad.map(mk).join("");
+  danger.hidden = !bad.length;
+  _sheetPick = onPick;
+  el.hidden = false;
+  el.classList.add("on");
+}
+function onSheetClick(id) {
+  const fn = _sheetPick;
+  closeSheet();
+  if (fn && id) fn(id);
+}
+
+function cycleTheme() {
+  const next = THEMES[(THEMES.indexOf(curTheme()) + 1) % THEMES.length];
+  if (next === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("upilot-theme", next); } catch (e) { /* 隐私模式写不了就算了 */ }
+  const lab = $("#theme-label");
+  if (lab) lab.textContent = THEME_LABEL[next];
+  return next;
+}
+function cycleAuto() {
+  const i = INTERVALS.indexOf(S.refreshMs);
+  if (!S.auto) { S.auto = true; S.refreshMs = INTERVALS[0]; }
+  else if (i === INTERVALS.length - 1) { S.auto = false; }
+  else { S.refreshMs = INTERVALS[i + 1]; }
+  const sw = $("#auto");
+  if (sw) sw.classList.toggle("on", S.auto);
+  const lab = $("#auto-label");
+  if (lab) lab.textContent = S.auto ? (S.refreshMs / 1000) + "s" : "关";
+  refreshOverview();
+}
+function setTaskCount(n) {
+  const text = n ? `(${n})` : "";
+  const a = $("#tab-tasks-cnt"), b = $("#dock-tasks-cnt");
+  if (a) a.textContent = text;
+  if (b) b.textContent = text;
+}
+function syncDock(name) {
+  document.querySelectorAll(".dock-item").forEach(btn => {
+    btn.classList.toggle("on", btn.dataset.tab === name);
+  });
+}
+
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("on");
@@ -63,6 +168,7 @@ function switchTab(name) {
     $("#view-" + t).hidden = (t !== name);
     $("#tab-" + t).classList.toggle("on", t === name);
   }
+  syncDock(name);
   if (name === "tasks") loadTasks();
   if (name === "settings") loadConfig();
 }
@@ -274,7 +380,7 @@ function renderOverview(d) {
   $("#f-db").textContent = c.db || "/config/state.db";
 
   // 标签上的计数
-  $("#tab-tasks-cnt").textContent = (st.total?.count ?? 0) ? `(${st.total.count})` : "";
+  setTaskCount(st.total?.count ?? 0);
 }
 
 async function refreshOverview() {
@@ -289,12 +395,14 @@ async function refreshOverview() {
   }
 }
 
-async function act(path, label) {
+async function act(path, label, btn) {
+  setBusy(btn, true);
   try {
     const j = await post(path);
     toast(j.message || label);
     refreshOverview();
   } catch (e) { toast("操作失败：" + e.message); }
+  finally { setBusy(btn, false); }
 }
 
 /* ---------------- 任务明细 ---------------- */
@@ -351,9 +459,10 @@ function renderTasks() {
   $("#tasks-body").querySelectorAll("button").forEach(b => {
     b.onclick = () => {
       const p = b.dataset.path, a = b.dataset.act;
-      if (a === "detail") openTask(p); else taskAction(a, p);
+      if (a === "detail") openTask(p); else taskAction(a, p, b);
     };
   });
+  renderTaskCards(t.rows);
 
   const from = t.total ? (t.page - 1) * t.limit + 1 : 0;
   const to = Math.min(t.page * t.limit, t.total);
@@ -363,12 +472,61 @@ function renderTasks() {
   $("#t-next").disabled = t.page >= Math.ceil(t.total / t.limit);
 }
 
-async function taskAction(action, path) {
+function renderTaskCards(rows) {
+  const box = $("#tasks-cards");
+  if (!box) return;
+  if (!rows || !rows.length) {
+    box.innerHTML = '<div class="empty">这个筛选下没有文件</div>';
+    return;
+  }
+  box.innerHTML = rows.map(f => {
+    const pct = Number(f.progress || 0);
+    const prog = ["上传中", "处理中", "秒传中"].includes(f.status)
+      ? `<div class="prog-wrap"><div class="prog"><i style="width:${Math.max(2, Math.min(100, pct)).toFixed(0)}%"></i></div><span>${pct.toFixed(0)}%</span></div>`
+      : "";
+    const mode = f.upload_mode === "rapid" ? "秒传" : (f.upload_mode === "normal" ? "分块" : "");
+    const bits = [fmtBytes(f.size), mode, (f.retry_count ? "重试 " + f.retry_count : ""), fmtAgo(f.updated_at)].filter(Boolean);
+    return `<article class="task-card" data-path="${esc(f.path)}" tabindex="0">
+      <div class="top">
+        <div class="name" title="${esc(f.path)}">${esc(base(f.path))}</div>
+        <span class="badge ${cls(f.status)}">${esc(f.status)}</span>
+      </div>
+      <div class="path" title="${esc(f.target_dir || f.path)}">${esc(f.target_dir || "…")}</div>
+      <div class="meta-row">
+        <span>${esc(bits.join(" · "))}</span>
+        <button type="button" class="mini act" data-act="menu" data-path="${esc(f.path)}" aria-haspopup="dialog">操作</button>
+      </div>
+      ${prog}
+    </article>`;
+  }).join("");
+  box.querySelectorAll(".task-card").forEach(card => {
+    const open = () => openTask(card.dataset.path);
+    card.addEventListener("click", (e) => { if (!e.target.closest("[data-act]")) open(); });
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+  });
+  box.querySelectorAll("[data-act=menu]").forEach(b => {
+    b.onclick = (e) => { e.stopPropagation(); openTaskMenu(b.dataset.path, b); };
+  });
+}
+function openTaskMenu(path) {
+  openSheet([
+    { id: "detail", label: "查看详情" },
+    { id: "upload-now", label: "立即处理", kind: "primary" },
+    { id: "retry", label: "重新排队" },
+  ], (id) => {
+    if (id === "detail") openTask(path);
+    else taskAction(id, path);
+  }, "文件操作");
+}
+
+async function taskAction(action, path, btn) {
+  setBusy(btn, true);
   try {
     const j = await post("/api/task", { path, action });
     toast(j.message || "已完成");
     if ($("#drawer").classList.contains("on")) openTask(path); else loadTasks();
   } catch (e) { toast("操作失败：" + e.message); }
+  finally { setBusy(btn, false); }
 }
 
 async function openTask(path) {
@@ -527,6 +685,8 @@ async function saveSettings() {
   $("#settings-groups").querySelectorAll("[data-clear]").forEach(el => {
     if (el.checked) clear.push(el.dataset.clear);
   });
+  const btns = [$("#btn-save-settings"), $("#btn-save-settings-bottom")];
+  btns.forEach(b => setBusy(b, true));
   try {
     const j = await post("/api/config", { values, clear });
     const msg = j.message || "已保存";
@@ -537,6 +697,8 @@ async function saveSettings() {
   } catch (e) {
     $("#settings-msg").innerHTML = `<div class="hint err">保存失败：${esc(e.message)}</div>`;
     toast("保存失败：" + e.message);
+  } finally {
+    btns.forEach(b => setBusy(b, false));
   }
 }
 
@@ -557,34 +719,37 @@ function bind() {
   $("#tab-tasks").onclick = () => switchTab("tasks");
   $("#tab-settings").onclick = () => switchTab("settings");
 
-  $("#btn-scan").onclick = () => act("/api/scan", "已触发扫描");
-  $("#btn-retry").onclick = () => act("/api/retry-now", "已提前重试");
-  $("#btn-requeue").onclick = () => act("/api/requeue", "已重新入队");
-  $("#btn-sweep").onclick = () => act("/api/sweep", "已触发同集核对");
-  // 主题：自动（跟随系统）→ 深色 → 浅色，选择记在浏览器里；没有任何动画/监听器，零开销
-  const THEMES = ["auto", "dark", "light"], THEME_LABEL = { auto: "自动", dark: "深色", light: "浅色" };
-  const curTheme = () => document.documentElement.dataset.theme || "auto";
-  const showTheme = () => { $("#theme-label").textContent = THEME_LABEL[curTheme()]; };
+  const showTheme = () => { const lab = $("#theme-label"); if (lab) lab.textContent = THEME_LABEL[curTheme()]; };
   showTheme();
-  $("#btn-theme").onclick = () => {
-    const next = THEMES[(THEMES.indexOf(curTheme()) + 1) % THEMES.length];
-    if (next === "auto") delete document.documentElement.dataset.theme;
-    else document.documentElement.dataset.theme = next;
-    try { localStorage.setItem("upilot-theme", next); } catch (e) { /* 隐私模式写不了就算了 */ }
-    showTheme();
+  $("#btn-scan").onclick = (e) => act("/api/scan", "已触发扫描", e.currentTarget);
+  $("#btn-retry").onclick = (e) => act("/api/retry-now", "已提前重试", e.currentTarget);
+  $("#btn-requeue").onclick = (e) => act("/api/requeue", "已重新入队", e.currentTarget);
+  $("#btn-sweep").onclick = async (e) => {
+    const ok = await askConfirm({
+      title: "核对同集？",
+      body: "会在 115 里查找同一集的重复文件，只留最新的，旧的进回收站。",
+      ok: "开始核对",
+    });
+    if (ok) act("/api/sweep", "已触发同集核对", e.currentTarget);
   };
+  $("#btn-theme").onclick = () => cycleTheme();
   $("#btn-refresh").onclick = () => { S.lastFetch = Date.now(); refreshOverview(); if (S.tab === "tasks") loadTasks(); toast("已刷新"); };
-  $("#btn-pause").onclick = () => act(S.paused ? "/api/resume" : "/api/pause", S.paused ? "已恢复调度" : "已暂停调度");
+  $("#btn-pause").onclick = (e) => act(S.paused ? "/api/resume" : "/api/pause", S.paused ? "已恢复调度" : "已暂停调度", e.currentTarget);
   $("#btn-logout").onclick = () => { location.href = "/logout"; };
-  $("#btn-auto").onclick = () => {
-    const i = INTERVALS.indexOf(S.refreshMs);
-    if (!S.auto) { S.auto = true; S.refreshMs = INTERVALS[0]; }
-    else if (i === INTERVALS.length - 1) { S.auto = false; }
-    else { S.refreshMs = INTERVALS[i + 1]; }
-    $("#auto").classList.toggle("on", S.auto);
-    $("#auto-label").textContent = S.auto ? (S.refreshMs / 1000) + "s" : "关";
-    refreshOverview();
-  };
+  $("#btn-auto").onclick = () => cycleAuto();
+  $("#btn-more").onclick = () => openMore();
+  document.querySelectorAll(".dock-item").forEach(btn => {
+    btn.onclick = () => switchTab(btn.dataset.tab);
+  });
+  $("#sheet-cancel").onclick = closeSheet;
+  $("#sheet-backdrop").onclick = closeSheet;
+  $("#sheet").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-id]");
+    if (b && $("#sheet").contains(b)) onSheetClick(b.dataset.id);
+  });
+  $("#confirm-cancel").onclick = () => closeConfirm(false);
+  $("#confirm-backdrop").onclick = () => closeConfirm(false);
+  $("#confirm-ok").onclick = () => closeConfirm(true);
 
   // 任务页
   $("#t-refresh").onclick = () => { loadTasks(); refreshOverview(); toast("已刷新任务"); };
@@ -594,18 +759,25 @@ function bind() {
   $("#t-next").onclick = () => { S.tasks.page++; loadTasks(); };
   $("#d-close").onclick = closeDrawer;
   $("#drawer").onclick = (e) => { if (e.target.id === "drawer") closeDrawer(); };
-  $("#d-upload").onclick = () => S.tasks.current && taskAction("upload-now", S.tasks.current);
-  $("#d-requeue").onclick = () => S.tasks.current && taskAction("retry", S.tasks.current);
-  $("#d-retrynow").onclick = () => S.tasks.current && taskAction("retry-now", S.tasks.current);
-  $("#d-delete").onclick = () => {
+  $("#d-upload").onclick = (e) => S.tasks.current && taskAction("upload-now", S.tasks.current, e.currentTarget);
+  $("#d-requeue").onclick = (e) => S.tasks.current && taskAction("retry", S.tasks.current, e.currentTarget);
+  $("#d-retrynow").onclick = (e) => S.tasks.current && taskAction("retry-now", S.tasks.current, e.currentTarget);
+  $("#d-delete").onclick = async (e) => {
     if (!S.tasks.current) return;
-    if (confirm("删掉这条记录？（文件本体不动，下次扫描会重新入队）")) taskAction("delete", S.tasks.current);
+    const ok = await askConfirm({
+      title: "删除这条记录？",
+      body: "只删记录，文件还在。下次扫描会重新入队。",
+      ok: "删除记录",
+    });
+    if (ok) taskAction("delete", S.tasks.current, e.currentTarget);
   };
 
   // 设置页
   $("#btn-save-settings").onclick = saveSettings;
   $("#btn-save-settings-bottom").onclick = saveSettings;
-  $("#btn-reload-config").onclick = () => { loadConfig(); toast("已重新读取配置"); };
+  const reloadCfg = () => { loadConfig(); toast("已重新读取配置"); };
+  $("#btn-reload-config").onclick = reloadCfg;
+  $("#btn-reload-config-bottom").onclick = reloadCfg;
   $("#btn-refresh-logs").onclick = refreshLogs;
   document.addEventListener("click", (e) => {
     const opt = e.target.closest(".dd-opt");            // 选一项
@@ -647,8 +819,47 @@ function bind() {
 
 /* ---------------- 启动 ---------------- */
 bind();
+function openMore() {
+  const items = [
+    { id: "scan", label: "立即扫描", kind: "primary" },
+    { id: "pause", label: S.paused ? "恢复调度" : "暂停调度" },
+    { id: "refresh", label: "刷新数据" },
+    { id: "retry", label: "立即重试秒传" },
+    { id: "requeue", label: "重试失败项" },
+    { id: "auto", label: S.auto ? ("自动刷新：" + (S.refreshMs / 1000) + " 秒") : "自动刷新：关" },
+    { id: "theme", label: "主题：" + THEME_LABEL[curTheme()] },
+  ];
+  if ($("#btn-logout") && $("#btn-logout").style.display !== "none") {
+    items.push({ id: "logout", label: ($("#logout-label") && $("#logout-label").textContent) || "退出登录" });
+  }
+  items.push({ id: "sweep", label: "核对同集（旧版进回收站）", kind: "danger" });
+  openSheet(items, (id) => {
+    const mapBtn = { scan: "#btn-scan", pause: "#btn-pause", retry: "#btn-retry", requeue: "#btn-requeue", sweep: "#btn-sweep" };
+    if (id === "refresh") { $("#btn-refresh").click(); return; }
+    if (id === "auto") { cycleAuto(); return; }
+    if (id === "theme") { cycleTheme(); return; }
+    if (id === "logout") { location.href = "/logout"; return; }
+    if (mapBtn[id]) $(mapBtn[id]).click();
+  }, "更多操作");
+}
+
+function syncKeyboardInset() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+  document.documentElement.style.setProperty("--kb", kb + "px");
+  const ae = document.activeElement;
+  if (kb > 40 && ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) {
+    ae.scrollIntoView({ block: "center", behavior: "auto" });
+  }
+}
+
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
+  if (e.key !== "Escape") return;
+  if ($("#confirm") && !$("#confirm").hidden) { closeConfirm(false); return; }
+  if ($("#sheet") && !$("#sheet").hidden) { closeSheet(); return; }
+  if ($("#drawer") && $("#drawer").classList.contains("on")) { closeDrawer(); return; }
+  document.querySelectorAll(".dd.on").forEach(x => x.classList.remove("on"));
 });
 
 renderLimitDd(S.tasks.limit);
@@ -666,6 +877,10 @@ refreshLogs();
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && S.auto) S.lastFetch = 0;     // 下一个 1 秒节拍就会刷新
 });
+if (window.visualViewport) {
+  visualViewport.addEventListener("resize", syncKeyboardInset);
+  visualViewport.addEventListener("scroll", syncKeyboardInset);
+}
 setInterval(() => {
   if (!S.auto || document.hidden) return;
   if (Date.now() - S.lastFetch >= S.refreshMs) {
