@@ -167,6 +167,21 @@ def long_retry_interval(base: int, steps, age_seconds: float) -> int:
     return interval
 
 
+def wait_text(seconds: float) -> str:
+    """把等待秒数说成人话，给面板和任务消息用：90 秒内用秒，再大用分钟/小时/天。"""
+    try:
+        s = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        s = 0
+    if s < 90:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{max(1, int(round(s / 60)))} 分钟"
+    if s < 48 * 3600:
+        return f"{max(1, int(round(s / 3600)))} 小时"
+    return f"{max(1, int(round(s / 86400)))} 天"
+
+
 def _sha1_file(path: str, total: int, on_progress, cancel: threading.Event) -> str | None:
     """同步读盘 + 算 SHA1（在线程池里跑，不占事件循环）。
 
@@ -1290,13 +1305,13 @@ class Uploader:
                                                    time.time() - first)
                 store.set(path, status="待重试", retry_count=rc, first_failed_at=first,
                           next_retry_at=time.time() + interval,
-                          message=f"纯秒传：未命中（{info.get('reason', '')}），"
-                                  f"{interval}s 后第 {rc} 次校验（只发校验请求）")
+                          message=(f"云端还没有相同文件，约 {wait_text(interval)}后再问"
+                                   f"（不会真上传，已问 {rc} 次）"))
                 # 只有第一次未命中打 INFO；之后每次都一样的「还没有」降成 DEBUG，
                 # 由主循环每轮一行汇总代替（否则 1000 个待命中文件每天约 10 万行）。
                 logger.log(logging.INFO if rc == 1 else logging.DEBUG,
-                           "纯秒传：未命中，%ds 后第 %d 次校验：%s",
-                           interval, rc, os.path.basename(path))
+                           "纯秒传：未命中，约 %s 后第 %d 次校验：%s",
+                           wait_text(interval), rc, os.path.basename(path))
                 return
 
             if rc > self.retry_max_count or aged >= self.retry_max_hours:

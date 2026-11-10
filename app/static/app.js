@@ -19,6 +19,13 @@ const fmtAgo = (ts) => {
   return Math.floor(d / 86400) + " 天前";
 };
 const secsLeft = (ts) => Math.max(0, Math.round((ts || 0) - Date.now() / 1000));
+const fmtWait = (secs) => {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  if (s < 90) return s + " 秒";
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + " 分钟";
+  if (s < 48 * 3600) return Math.max(1, Math.round(s / 3600)) + " 小时";
+  return Math.max(1, Math.round(s / 86400)) + " 天";
+};
 const fmtAbs = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "–";
 const base = (p) => String(p || "").split(/[\\/]/).pop();
 const cls = (s) => "b-" + String(s || "").replace(/\s/g, "");
@@ -159,8 +166,11 @@ function renderOverview(d) {
     if (f.status === "待重试") {
       const left = secsLeft(f.next_retry_at);
       barCls = "retry";
-      width = Math.max(4, Math.min(1, left / interval) * 100);
-      note = `倒计时 ${left}s · 第 ${f.retry_count} 次秒传重试`;
+      width = Math.max(4, Math.min(1, left / Math.max(interval, left, 1)) * 100);
+      const asked = Number(f.retry_count || 0);
+      note = asked
+        ? `约 ${fmtWait(left)} 后再问 · 已问 ${asked} 次（不会真上传）`
+        : `约 ${fmtWait(left)} 后再问`;
     } else if (f.status === "秒传中") {
       barCls = "rapid"; width = 100; note = "只发校验请求，不重传数据";
     } else if (f.status === "上传中") {
@@ -193,7 +203,16 @@ function renderOverview(d) {
   if (S.paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务（在途任务会跑完），点「恢复调度」继续</div>');
   if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
   if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「任务明细」，可点「失败项重新入队」重试</div>`);
-  if (!hints.length) hints.push('<div class="hint">一切正常：队列为空，没有报错</div>');
+  const nRetry = q["待重试"] || 0;
+  const nPrep = (q["待处理"] || 0) + (q["待秒传"] || 0) + (q["处理中"] || 0);
+  if (nRetry > 0) {
+    const rapidOnly = (d.config || {}).upload_mode === "rapid_only";
+    hints.push(rapidOnly
+      ? `<div class="hint">有 ${nRetry} 个文件在等秒传：云端还没有相同文件，会自动再问，不会真上传</div>`
+      : `<div class="hint">有 ${nRetry} 个文件在等下一次秒传</div>`);
+  }
+  if (nPrep > 0) hints.push(`<div class="hint">有 ${nPrep} 个文件正在准备或计算校验</div>`);
+  if (!hints.length) hints.push('<div class="hint">一切正常：没有待处理文件，也没有报错</div>');
   // 最近的洗板替换（同一集只留最新那份）：保留了谁、把谁移进了回收站、凭什么判新旧
   (d.replacements || []).slice(0, 5).forEach(r => {
     const gone = (r.removed || []).map(esc).join("、");
