@@ -66,6 +66,16 @@ UPLOAD_MODES: list[dict] = [
 UPLOAD_MODE_LABELS = {x["value"]: x["label"] for x in UPLOAD_MODES}
 
 
+def normalize_upload_mode(raw) -> str:
+    """upload.mode 归一：只有**明确**写了 rapid_then_upload 才会真传（费上行流量）。
+
+    空值 / null / 拼写错误一律按 rapid_only（只秒传、永不普通上传）——
+    原来回落到 rapid_then_upload，一个想「只秒传」的人写错一个字就开始消耗上行。
+    """
+    v = str(raw or "").strip().lower()
+    return "rapid_then_upload" if v == "rapid_then_upload" else "rapid_only"
+
+
 def app_label(value: str) -> str:
     for item in APP_OPTIONS:
         if item["value"] == value:
