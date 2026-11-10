@@ -9,8 +9,9 @@
   - MoviePilot 的 MetaVideo（中文 `第N集/话`、`第N季`、动漫 ` - 05 `、`EP05`）：
     https://github.com/jxxghp/MoviePilot/blob/af963b47b350f07b7ee407ab54a5eb9b4091ab35/app/domain/meta/metavideo.py
 
-识别结果只有三样：剧名（归一化）、季（可能没有）、集（可能是多集区间）。
+识别结果只有三样：剧名（归一化）、季（可能没有，S00 是特别篇）、集（可能是多集区间）。
 **扩展名不参与**：同一集的 mkv / mp4 / ts 就是同一集。
+PROPER / REPACK / RERIP / v2 这类修订标记不进「同一集」键，只在时间并列时用来判断谁更新。
 """
 from __future__ import annotations
 
@@ -46,15 +47,18 @@ _CN_NUM = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
 
 
 def cn_to_int(s: str) -> int | None:
-    """中文数字转整数：十二→12、二十→20、一百零五→105、纯阿拉伯数字原样返回。"""
+    """中文数字转整数：十二→12、二十→20、一百零五→105、一千零一→1001。纯阿拉伯数字原样返回。"""
     s = (s or "").strip()
     if s.isdigit():
         return int(s)
-    if not s or any(c not in _CN_NUM and c not in "十百" for c in s):
+    if not s or any(c not in _CN_NUM and c not in "十百千" for c in s):
         return None
     total, cur = 0, 0
     for c in s:
-        if c == "百":
+        if c == "千":
+            total += (cur or 1) * 1000
+            cur = 0
+        elif c == "百":
             total += (cur or 1) * 100
             cur = 0
         elif c == "十":
@@ -65,7 +69,7 @@ def cn_to_int(s: str) -> int | None:
     return total + cur
 
 
-_NUM = r"(\d{1,4}|[零〇一二两三四五六七八九十百]{1,5})"
+_NUM = r"(\d{1,4}|[零〇一二两三四五六七八九十百千]{1,7})"
 # 1) S01E02 / S01E02-E03 / S01E02E03 / S01E02-03（PTN 的 season+episode；多集区间）
 _SXXEYY = re.compile(
     r"(?<![a-z0-9])s(\d{1,2})[\s.\-_]*e(\d{1,4})"
@@ -77,8 +81,12 @@ _NXNN = re.compile(r"(?<![a-z0-9])(\d{1,2})x(\d{2,3})(?![a-z0-9])")
 # 4) 第12集 / 第十二话 / 第3期（可前置 第2季）
 _CN_SEASON = re.compile(r"第\s*" + _NUM + r"\s*季")
 _CN_EP = re.compile(r"第\s*" + _NUM + r"\s*[集话話期]")
-# 5) EP05 / E05（单独出现；季号从别处找）
-_EP_ONLY = re.compile(r"(?<![a-z0-9])e(?:p|pisode)?\s*(\d{1,4})(?![a-z0-9])")
+# 5) EP05 / E05 / E01-E02 / EP01-EP02（单独出现；季号从别处找）
+_EP_ONLY = re.compile(
+    r"(?<![a-z0-9])e(?:p|pisode)?\s*(\d{1,4})"
+    r"(?:\s*(?:-|~|–)\s*e(?:p|pisode)?\s*(\d{1,4})(?![\dpik]))?")
+# 5b) Show SP01 / Show.Special.01 → 特别篇，记成第 0 季
+_SPECIAL = re.compile(r"(?<![a-z0-9])(?:sp|special)\s*(\d{1,3})(?![a-z0-9])")
 _SEASON_ONLY = re.compile(r"(?<![a-z0-9])(?:s|season\s*)(\d{1,2})(?![a-z0-9])")
 # 6) 动漫字幕组命名：「Show - 05」「Show - 05v2」（只认 2~3 位，避开 4 位年份）
 _ANIME = re.compile(r"\s-\s(\d{2,3})(?:v\d)?(?=\s|$)")
@@ -87,6 +95,30 @@ _YEAR = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 _STOP = {"the", "a", "an", "of", "and", "season", "complete"}
 _CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
 _LATIN = re.compile(r"[a-z0-9]+")
+# 修订标记（不进同一集键）。借鉴 PTN 的 proper/repack 规则：
+# https://github.com/platelminto/parse-torrent-name/blob/4e793868512074e49c78e5b714d072f748ab9dc1/PTN/patterns.py
+# v2 / 05v2 也算修订；PROPER/REPACK/RERIP/REAL 至少当作 v2。
+_VER_TAG = re.compile(r"(?<![a-z0-9])(proper|repack|rerip|real)(?![a-z0-9])")
+_VER_NUM = re.compile(r"(?<![a-z])v(\d{1,2})(?![a-z0-9])")
+
+
+def version_score(name: str) -> int:
+    """文件名里的修订标记：没有=0，v2=2，v3=3；PROPER/REPACK/RERIP/REAL 至少为 2。
+
+    洗板判新旧时，本地下载时间仍然优先；只有时间并列（或退回云端时间也并列）才用它。
+    """
+    stem, _ext = os.path.splitext(name or "")
+    text = _normalize(stem)
+    n = 0
+    m = _VER_NUM.search(text)
+    if m:
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            n = 0
+    if _VER_TAG.search(text):
+        n = max(n, 2)
+    return n
 
 
 @dataclass(frozen=True)
@@ -119,6 +151,8 @@ def _clean_title(text: str) -> str:
     t = re.sub(r"\([^)]*\)|（[^）]*）", " ", text)             # (2026) 之类
     t = _CN_SEASON.sub(" ", t)
     t = re.sub(r"(?<![a-z0-9])(?:s\d{1,2}|season\s*\d{1,2})(?![a-z0-9])", " ", t)
+    t = _VER_TAG.sub(" ", t)
+    t = _VER_NUM.sub(" ", t)
     t = re.sub(r"[\s\-–:：,，]+$", "", t)
     return re.sub(r"\s+", " ", t).strip(" -–:：")
 
@@ -170,7 +204,10 @@ def parse_episode(name: str) -> Episode | None:
     if not eps:
         m = _EP_ONLY.search(text)
         if m:
-            eps, start = (int(m.group(1)),), m.start()
+            a = int(m.group(1))
+            b = m.group(2)
+            eps = (a,) if not b or not (a < int(b) < a + 100) else (a, int(b))
+            start = m.start()
             ms = _SEASON_ONLY.search(text)
             if ms:
                 season = int(ms.group(1))
@@ -179,6 +216,10 @@ def parse_episode(name: str) -> Episode | None:
         m = _ANIME.search(text)
         if m:
             eps, start = (int(m.group(1)),), m.start()
+    if not eps:
+        m = _SPECIAL.search(text)
+        if m and int(m.group(1)) > 0:
+            season, eps, start = 0, (int(m.group(1)),), m.start()
     if not eps or any(e <= 0 for e in eps):
         return None
     return Episode(_clean_title(text[:start]), season, eps)
