@@ -84,7 +84,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 ## 3. 工作流程（与官方行为一致）
 
 ```
-发现新文件 → 等稳定（连续 N 轮 size/mtime 不变）→ 算 SHA1（1MB 分块，算完落库；同一文件改名/移动/硬链接时直接复用，不再读盘）
+发现新文件 → 等稳定（连续 N 轮 size/mtime 不变，旁边还有 .aria2 / .!qB 等控制文件时先等）→ 算 SHA1（1MB 分块，算完落库；同一文件改名/移动/硬链接时直接复用，不再读盘）
    ↓
 建目标目录（fs_makedirs 整条链，保留相对结构，cid 带缓存）
    ↓
@@ -101,7 +101,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 分块上传（默认 10MB 分块，超过 97.6 GiB 的文件自动放大分块、保证不超过 OSS 的 10000 片；OSS 多段上传；upload_id / callback / oss_url 落库 → 暂停或重启后从已传分块继续）
 ```
 
-不重复读盘的四道防线：秒传命中根本不读文件 → SHA1 落库后不再重算 → 同 path+size+mtime 的扫描去重 → 稳定判定（避免文件还在写就上传）。
+不重复读盘的四道防线：秒传命中根本不读文件 → SHA1 落库后不再重算 → 同 path+size+mtime 的扫描去重 → 稳定判定（避免文件还在写就上传）。下载器预分配了完整大小时，只看 size/mtime 不够，旁边还有 `.aria2` / `.!qB` / `.part` 等控制文件就先不算 SHA1。不用 inotify（NAS 上的 CIFS/NFS 挂载通知不可靠）。
 
 文件被覆盖（size/mtime 变化）会被识别为新文件，旧 SHA1 与断点作废重来。
 
@@ -115,7 +115,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `paths.map` | `[]` | 本地文件夹 → 115 文件夹的对应表，见 §5「目录映射」 |
 | `scan.interval_seconds` | 30 | 扫描间隔 |
 | `scan.stable_rounds` | 2 | 文件连续 N 轮没变化才处理 |
-| `scan.ignore_suffixes` | 见示例 | 没下完的临时文件后缀 |
+| `scan.ignore_suffixes` | 见示例 | 没下完的临时文件后缀（这些文件本身不入队；成品旁边的同名控制文件也会拦住哈希） |
 | `scan.include_suffixes` | 见示例（视频扩展名） | 只处理这些扩展名，留空 = 全部。默认只传视频，不会带上 `.strm` / `.nfo` / 图片 |
 | `scan.exclude_dirs` | `[]` | 要跳过的文件夹名（如 `["Sample","extras"]`），整个文件夹都不处理 |
 | `upload.delete_after_upload` | `false` | 传完就删掉本地源文件（默认关）。只删文件、不删文件夹，不影响播放 |

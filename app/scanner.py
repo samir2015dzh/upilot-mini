@@ -3,8 +3,36 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger("upilot.scan")
+
+# 下载器常用的「成品文件旁边的控制文件」后缀。成品往往已经是最终文件名，
+# 有的还会预分配完整大小，只看 size/mtime 会误判为稳定。
+# 不用 inotify：群晖等 NAS 上的 CIFS/NFS 挂载通知不可靠，漏事件就会提前算 SHA1。
+_SIDECAR_SUFFIXES = (
+    ".aria2", ".!qb", ".!qB", ".qbnewb", ".part", ".tmp",
+    ".crdownload", ".downloading",
+)
+
+
+def still_writing(path: str) -> bool:
+    """成品旁边还有下载器的控制文件时，文件还没写完，不能当稳定、不能算 SHA1。"""
+    for sfx in _SIDECAR_SUFFIXES:
+        if os.path.lexists(path + sfx):
+            return True
+    return False
+
+
+def size_mtime_changed(path: str, wait: float = 0.15) -> bool:
+    """短间隔再看一次 size/mtime：还在涨就先别算 SHA1（预分配写完之前也会变）。"""
+    try:
+        a = os.stat(path)
+        time.sleep(wait)
+        b = os.stat(path)
+    except OSError:
+        return True
+    return a.st_size != b.st_size or a.st_mtime != b.st_mtime
 
 TERMINAL = {"已上传", "错误"}
 # 扫描写库每攒够这么多条提交一次（见 scan_once 末尾）
@@ -88,6 +116,13 @@ def scan_once(store, cfg: dict) -> int:
                 logger.log(logging.INFO if n_new <= LOG_EACH_MAX else logging.DEBUG,
                            "发现新文件：%s (%.1f MB)", full, st.st_size / 1024 / 1024)
                 touched += 1
+                continue
+
+            # 成品旁边还有 .aria2 / .!qB 等控制文件：先记下，但不要推进稳定计数。
+            # 预分配的完整大小看起来「已经稳定」，sidecar 才是还在写的信号。
+            if still_writing(full):
+                logger.debug("还在下载（旁边有控制文件），暂不推进稳定计数：%s",
+                             os.path.basename(full))
                 continue
 
             status, stable_count = rec[2], rec[3]

@@ -20,6 +20,7 @@ import time
 import config as cfgmod
 from notify import Notifier
 import episode
+import scanner
 from p115 import (P115 as _P115, episode_key, is_auth_error,
                   is_rate_limited, is_soft_busy, resolve_upload_target)
 
@@ -250,6 +251,10 @@ async def sha1_of(path: str, record: dict, store) -> str | None:
     """
     if record.get("sha1"):
         return record["sha1"]
+    # 下载还没写完：绝不能开始哈希，否则会把半成品的 SHA1 落库并拿去秒传。
+    if scanner.still_writing(path) or scanner.size_mtime_changed(path):
+        logger.info("文件还在写，暂不算 SHA1：%s", os.path.basename(path))
+        return None
     reused = _reuse_sha1(path, record, store)
     if reused:
         return reused
@@ -269,8 +274,9 @@ async def sha1_of(path: str, record: dict, store) -> str | None:
     # 线程里算的这段时间，主循环可能已经扫描过、发现文件变了并重建了记录：
     # 磁盘或库里的 size/mtime 任何一个对不上，都说明这个摘要不属于当前记录。
     cur = store.get(path) or {}
-    if not _same_file(path, record) or not _same_file(path, cur or record):
-        logger.warning("算 SHA1 期间文件被改动，丢弃结果：%s", os.path.basename(path))
+    if (scanner.still_writing(path)
+            or not _same_file(path, record) or not _same_file(path, cur or record)):
+        logger.warning("算 SHA1 期间文件被改动或仍在写，丢弃结果：%s", os.path.basename(path))
         return None
     store.set(path, sha1=digest, progress=0.0)
     logger.info("SHA1 计算完成：%s → %s", os.path.basename(path), digest)
@@ -1159,6 +1165,14 @@ class Uploader:
             return                                       # 还没稳定，等下一轮扫描
 
         if not rec.get("sha1"):
+            # 旁边还有下载器控制文件：连「处理中」都别进，等 sidecar 消失再算。
+            if scanner.still_writing(path):
+                logger.info("还在下载（旁边有控制文件），暂不算 SHA1：%s",
+                            os.path.basename(path))
+                if rec["status"] == "处理中":
+                    self.store.set(path, status="待处理",
+                                   message="还在下载，暂不算 SHA1")
+                return
             # sha1 是下面秒传的必需入参，任何状态下都不能为空。正常路径是
             # 「待处理 →（算）→ 待秒传」；但异常退避可能把它停在「待重试」而
             # SHA1 还没算出来 —— 这时若不补算，秒传会拿到空 sha1，永远不可能
@@ -1171,6 +1185,10 @@ class Uploader:
             rec = self.store.get(path)
             sha1 = await sha1_of(path, rec, self.store)
             if not sha1:
+                if scanner.still_writing(path):
+                    self.store.set(path, status="待处理",
+                                   message="还在下载，暂不算 SHA1")
+                    return
                 # 算的过程中文件被换掉 / 还在写：按新内容重新入队、重新等稳定
                 self._requeue_changed_file(path)
                 return
