@@ -5733,6 +5733,48 @@ def case_version_tiebreak():
                 "两个都没修订标记且时间并列则不动手")
 
 
+
+async def case_sidecar_still_writing():
+    """[82] 下载还没写完时（旁边有 .aria2 / .!qB）不推进稳定计数、不算 SHA1。"""
+    assert scanner.still_writing("/no/such.mkv") is False
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=1)
+    try:
+        path = write_file(src, "剧集/Show.S01E01.mkv", 4096)
+        sidecar = path + ".aria2"
+        Path = __import__("pathlib").Path
+        Path(sidecar).write_text("aria2 lock")
+        assert scanner.still_writing(path)
+        scanner.scan_once(store, cfg)          # 入队
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        rec = store.get(path)
+        assert rec and rec["stable_count"] == 0 and rec.get("sha1") in (None, ""), rec
+        await up._process(path)
+        rec = store.get(path)
+        assert rec["status"] == "待处理" and not rec.get("sha1"), rec
+
+        # qBittorrent 的 .!qB 同样拦住
+        os.remove(sidecar)
+        qb = path + ".!qB"
+        Path(qb).write_bytes(b"qb")
+        scanner.scan_once(store, cfg)
+        await up._process(path)
+        rec = store.get(path)
+        assert rec["stable_count"] == 0 and not rec.get("sha1"), rec
+
+        os.remove(qb)
+        scanner.scan_once(store, cfg)          # 控制文件没了，推进到 1，达到稳定
+        rec = store.get(path)
+        assert rec["stable_count"] >= 1, rec
+        await up._process(path)
+        rec = store.get(path)
+        assert rec.get("sha1"), rec
+        PASS.append("[82] 旁边有 .aria2 / .!qB 时不推进稳定计数、不算 SHA1；"
+                    "控制文件消失后再稳定、再哈希")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5810,6 +5852,7 @@ async def main():
     await case_rate_limit_breaker()
     await case_season_panel_history()
     case_version_tiebreak()
+    await case_sidecar_still_writing()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
