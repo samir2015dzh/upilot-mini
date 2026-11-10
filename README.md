@@ -406,6 +406,8 @@ docker compose run --rm upilot-mini python /app/app/main.py scan-once
 - **日志太多**：compose 示例已带日志轮转（最多 3×10 MB）；自己写 `docker run` 的加 `--log-opt max-size=10m --log-opt max-file=3`。逐个文件的「秒传未命中」只有第一次是 INFO，之后是 DEBUG，每轮另打一行「秒传校验汇总」；要看明细把 `log_level` 改成 `DEBUG`。
 - **容器显示 unhealthy**：`docker inspect --format '{{json .State.Health}}' upilot-mini` 看原因；`stalled: main loop heartbeat …` 表示主循环卡住了，`docker restart upilot-mini` 即可（状态都在库里）。
 - **分块上传断网抖一下就等半分钟**：现在单个分块失败（连接重置/超时）会原地重试最多 3 次（2/4/8 秒），只重传失败那一块；连续失败才走任务级退避（30 秒起）。
+- **cookie 过期了会怎样**：登录失效（p115client 的认证错误）不再算「秒传未命中」，也不会把文件标成「错误」；容器暂停向 115 发请求，每 5 分钟只放 1 个文件去试探，面板概览会出现红色提示。在面板「115 账号」更新 cookie 后下一轮自动恢复，重试次数不受影响。
+- **状态库备份**：每 24 小时（和每次重启后发现备份过期时）把 `state.db` 在线备份为同目录的 `state.db.bak`，只留一份；丢库时把它改名回 `state.db` 即可，省得全部文件重算 SHA1。
 - **115 换了 OSS 区域，分块上传连不上**：在 `config.yaml` 的 `upload` 下加 `oss_endpoint: "https://oss-cn-xxx.aliyuncs.com"`，默认是深圳。
 - **状态怎么看**：浏览器打开 `http://<host>:9844/`，或 `curl -s localhost:9844/api/status`，或直接查 `/config/state.db` 的 `files` 表。
 - **想临时停一下上传**：界面上点「暂停调度」，在途任务跑完就停；点「恢复调度」继续。

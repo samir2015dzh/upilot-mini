@@ -16,7 +16,7 @@ import threading
 import time
 
 from notify import Notifier
-from p115 import P115 as _P115, episode_key, resolve_upload_target
+from p115 import P115 as _P115, episode_key, is_auth_error, resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
 # SHA1 每次读多少。实测（2GB 热缓存，带 SHA-NI）1MB 与 8MB 吞吐一样（都 1.60 GB/s，
@@ -58,7 +58,21 @@ MAX_SWEEP_PAGES = 200
 _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  "sem_n": -1, "sweep_running": False,
                  # 本轮秒传校验计数（主循环每轮取走一次、打一条汇总；见 take_rapid_summary）
-                 "rapid_round": {"checked": 0, "hit": 0, "miss": 0}}
+                 "rapid_round": {"checked": 0, "hit": 0, "miss": 0},
+                 # 115 登录失效断路器：None = 正常；否则 {"since","message","next_probe"}。
+                 # 失效期间 dispatch 只放行「不联网」的状态，每 AUTH_PROBE_SECONDS 才试探一次。
+                 "auth_fail": None}
+
+# 登录失效后多久再试探一次 115（同时也是该文件下次重试的间隔）
+AUTH_PROBE_SECONDS = 300.0
+# 失效期间仍然照常派发的状态：只算 SHA1、不碰 115
+_OFFLINE_STATES = ("待处理", "处理中")
+
+
+def auth_status() -> dict | None:
+    """给面板用：115 登录当前是否失效（None = 正常）。"""
+    cur = _SHARED["auth_fail"]
+    return None if not cur else {"since": cur["since"], "message": cur["message"]}
 
 
 def take_rapid_summary() -> dict:
@@ -255,6 +269,8 @@ class Uploader:
         except (TypeError, ValueError):
             self.max_upload_bytes = 115 * 1024 ** 3
         self.notifier = Notifier(cfg)
+        # 改配置 / 换 cookie 会重建 Uploader：把断路器放开，让下一轮立刻重新试探一次
+        _SHARED["auth_fail"] = None
         # 同样跨实例共享：旧实例被覆盖后，它派发的后台任务若只被实例持有的 set 引用，
         # 会被 GC 回收（跑到一半消失）；异常计数清空则让退避重试永远到不了阈值。
         self._bg: set = _SHARED["bg"]          # 后台任务强引用，防止跑到一半被回收
@@ -275,9 +291,17 @@ class Uploader:
         async def run():
             try:
                 async with self.sem:
+                    if self._hold_for_auth(path):
+                        return
                     await self._process(path)
                 self._err_streak.pop(path, None)       # 跑通一轮 → 清掉异常计数
             except Exception as exc:  # noqa: BLE001
+                if is_auth_error(exc):
+                    # 登录失效不是文件的错：不累计异常次数（否则 3 次就把一整库文件标成「错误」），
+                    # 也不当「秒传未命中」（会推高 retry_count、把长间隔越拖越长）。
+                    # 记下断路器，文件 5 分钟后再来；cookie 更新后 dispatch 立刻放开。
+                    self._on_auth_failure(path, exc)
+                    return
                 # 只记 message、不改状态是不行的：文件会停在「处理中」「待处理」这类
                 # 中间态，而 dispatch 每轮又把它捞回来 → 每轮重试一次、日志一直刷、
                 # 并发名额一直被占，界面上却看不到「错误」，用户无从下手。
@@ -306,6 +330,39 @@ class Uploader:
         t = asyncio.create_task(run())
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
+
+    def _hold_for_auth(self, path: str) -> bool:
+        """断路器合上时，排队等着的联网任务（dispatch 一次派了一大批）别再逐个去撞 115：
+        除了指定的试探文件，其余推迟到下次试探时间。返回 True 表示已推迟、不要处理。"""
+        af = _SHARED["auth_fail"]
+        if not af or path == af.get("probe_path"):
+            return False
+        rec = self.store.get(path)
+        if not rec or rec["status"] in _OFFLINE_STATES or rec["status"] in ("已上传", "错误"):
+            return False
+        self.store.set(path, status="待重试", next_retry_at=max(af["next_probe"], time.time()),
+                       message="115 登录失效（cookie 过期？）：已暂停向 115 发请求，更新 cookie 后自动继续")
+        return True
+
+    def _on_auth_failure(self, path: str, exc: BaseException) -> None:
+        now = time.time()
+        first = _SHARED["auth_fail"] is None
+        msg = str(exc)[:200]
+        _SHARED["auth_fail"] = {"since": (_SHARED["auth_fail"] or {}).get("since", now),
+                                "message": msg, "next_probe": now + AUTH_PROBE_SECONDS}
+        if first:
+            logger.error("115 登录失效（cookie 过期或被踢下线）：%s。已暂停向 115 发请求，"
+                         "请在面板「115 账号」更新 cookie；每 %d 秒试探一次",
+                         msg, int(AUTH_PROBE_SECONDS))
+        self.store.set(path, status="待重试", next_retry_at=now + AUTH_PROBE_SECONDS,
+                       message="115 登录失效（cookie 过期？）：请在面板「115 账号」更新 cookie；"
+                               "更新后会自动继续，不计入重试次数")
+
+    def _auth_ok(self) -> None:
+        """联网请求成功过一次 = 登录有效，放开断路器。"""
+        if _SHARED["auth_fail"] is not None:
+            _SHARED["auth_fail"] = None
+            logger.info("115 登录已恢复")
 
     def _file_changed_on_disk(self, path: str, rec: dict) -> bool:
         """上传结束前确认磁盘上还是当初那个文件。
@@ -837,8 +894,21 @@ class Uploader:
         todo = [("待处理", False), ("处理中", False), ("待秒传", False),
                 ("秒传中", False), ("待上传", False), ("上传中", False),
                 ("待重试", True)]
+        af = _SHARED["auth_fail"]
+        limit_net = 100
+        if af:
+            # 登录失效断路器：平时只放行不联网的状态（算 SHA1）；到了试探时间只放 1 个文件去试，
+            # 它成功（_auth_ok）就整体放开，失败则继续等下一个 AUTH_PROBE_SECONDS。
+            todo = [(st, d) for st, d in todo if st in _OFFLINE_STATES]
+            if time.time() >= af["next_probe"]:
+                af["next_probe"] = time.time() + AUTH_PROBE_SECONDS
+                todo.append(("待重试", True))
+                limit_net = 1
         for status, due in todo:
-            for rec in self.store.by_status(status, limit=100, due=due):
+            n = 100 if status in _OFFLINE_STATES else limit_net
+            for rec in self.store.by_status(status, limit=n, due=due):
+                if af and status not in _OFFLINE_STATES:
+                    af["probe_path"] = rec["path"]           # 指定这一个去试探
                 self.spawn(rec["path"])
 
     # ---------- 状态机 ----------
@@ -886,6 +956,10 @@ class Uploader:
             self.store.set(path, status="待秒传")
             rec = self.store.get(path)
 
+        # 115 登录失效期间，刚算完 SHA1 的文件也别急着联网（见 _hold_for_auth）
+        if self._hold_for_auth(path):
+            return
+
         # 2) 目录：先建好（保留本地相对结构），秒传/分块上传共用这个 pid
         cloud_dir = resolve_upload_target(path, self.cfg["paths"]["source"],
                                           self.cfg["paths"]["target_root"],
@@ -913,11 +987,15 @@ class Uploader:
             try:
                 hit, info = await self.mgr.rapid(path, rec["size"], rec["sha1"] or "", pid)
             except Exception as exc:  # noqa: BLE001
+                if is_auth_error(exc):
+                    raise                          # 登录失效不是「未命中」：交给 spawn 的断路器
                 msg = str(exc)
                 if "10014" in msg or "目录不存在" in msg:
                     await self.mgr.forget_pid(cloud_dir)
                     pid = await self.mgr.ensure_pid(cloud_dir)
                 hit, info = False, {"reason": msg}
+            else:
+                self._auth_ok()                    # 秒传请求正常返回（命中或未命中）= 登录有效
             tally = _SHARED["rapid_round"]
             tally["checked"] += 1
             tally["hit" if hit else "miss"] += 1
@@ -1001,6 +1079,7 @@ class Uploader:
                 # 按「新内容」重新入队；绝不能写「已上传」把 scanner 的重置盖掉。
                 self._requeue_changed_file(path)
                 return
+            self._auth_ok()
             store.set(path, status="已上传", progress=100.0, upload_mode="normal",
                       file_id=str((result or {}).get("file_id", "")),
                       message=f"分块上传完成 → {cloud_dir}")

@@ -4763,6 +4763,138 @@ async def case_max_upload_size():
                 "0=不限制；秒传命中不受影响")
 
 
+class P115AuthenticationError(OSError):
+    """与 p115client 同名同 errno 的替身（按类名/errno 识别，不依赖真实库）。"""
+
+
+async def case_auth_failure_breaker():
+    """[71] 115 登录失效（cookie 过期）：不当「秒传未命中」（不涨 retry_count），不累计到「错误」，
+    暂停向 115 发请求只定时试探，面板有提示，更新 cookie 后自动恢复。"""
+    import errno as _e
+    import p115 as p115mod
+    import uploader as upmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=60, fail_first=0,
+                                             mode="rapid_only", long_interval=900)
+    try:
+        upmod._SHARED["auth_fail"] = None
+        paths = [write_file(src, f"剧/E{i:02d}.mkv", 1024 * 1024) for i in range(4)]
+        scanner.scan_once(store, cfg)
+        for p in paths:                                       # 先把 SHA1 算好，只看联网阶段
+            await sha1_of(p, store.get(p), store)
+            store.set(p, status="待秒传")
+
+        calls = {"n": 0}
+        real = mgr.rapid
+
+        async def expired(*a, **k):
+            calls["n"] += 1
+            raise P115AuthenticationError(getattr(_e, "EAUTH", 0) or 1, "login required")
+
+        mgr.rapid = expired
+        assert p115mod.is_auth_error(P115AuthenticationError(1, "x"))
+        assert p115mod.is_auth_error(RuntimeError("wrap")) is False
+        wrapped = RuntimeError("分块上传失败")
+        wrapped.__cause__ = P115AuthenticationError(1, "x")
+        assert p115mod.is_auth_error(wrapped)
+
+        # 连续 5 轮：原来 3 次异常就标「错误」、或每次都算一次未命中
+        for _ in range(5):
+            for p in paths:
+                store.set(p, next_retry_at=0, status="待重试")
+            up.dispatch()
+            for _ in range(60):
+                await asyncio.sleep(0.02)
+                if not up._active:
+                    break
+            upmod._SHARED["auth_fail"]["next_probe"] = 0       # 让下一轮可以试探
+        for p in paths:
+            r = store.get(p)
+            assert r["status"] == "待重试", r
+            assert (r["retry_count"] or 0) == 0 and r["first_failed_at"] is None, r
+            assert "登录失效" in (r["message"] or ""), r
+        assert upmod._SHARED["auth_fail"], "断路器没记下"
+        assert webui._payload(cfg, store, {})["auth_failed"], "面板数据里没有登录失效提示"
+        assert "d.auth_failed" in open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+
+        # 断路器期间：dispatch 不再向 115 发请求，到试探时间只放 1 个文件去试
+        up._err_streak.clear()
+        n0 = calls["n"]
+        for p in paths:
+            store.set(p, next_retry_at=0, status="待重试")
+        upmod._SHARED["auth_fail"]["next_probe"] = time.time() + 300
+        up.dispatch()
+        await asyncio.sleep(0.2)
+        assert calls["n"] == n0, "登录失效期间还在打 115"
+        upmod._SHARED["auth_fail"]["next_probe"] = 0
+        up.dispatch()
+        for _ in range(60):
+            await asyncio.sleep(0.02)
+            if not up._active:
+                break
+        assert calls["n"] == n0 + 1, f"试探应只放 1 个文件，实际 {calls['n'] - n0}"
+
+        # 换 cookie（重建 Uploader）→ 立刻放开；115 恢复后正常命中、断路器清除
+        mgr.rapid = real
+        up2 = Uploader(cfg, store, mgr)
+        assert upmod._SHARED["auth_fail"] is None
+        for p in paths:
+            store.set(p, next_retry_at=0, status="待重试")
+        up2.dispatch()
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if not up2._active:
+                break
+        assert all(store.get(p)["status"] == "已上传" for p in paths), [store.get(p)["status"] for p in paths]
+        assert upmod._SHARED["auth_fail"] is None
+        PASS.append("[71] 115 登录失效：不算未命中（retry_count 不涨）、不累计成「错误」，暂停向 115 发请求"
+                    "只定时试探 1 个文件，面板有提示，换 cookie 后自动恢复")
+    finally:
+        upmod._SHARED["auth_fail"] = None
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_state_backup():
+    """[72] 状态库每天在线备份一份（state.db.bak）：可打开、数据一致；未到期不重复备份；失败不影响运行。"""
+    import sqlite3
+
+    import main as mainmod
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        for i in range(50):
+            store.add(os.path.join(src, f"f{i}.mkv"), 100 + i, 1.0 + i)
+        bak = mainmod.backup_path(cfg)
+        assert bak.endswith("state.db.bak") and mainmod.backup_due(cfg)
+        size = store.backup(bak)
+        assert size > 0 and not os.path.exists(bak + ".tmp")
+        con = sqlite3.connect(bak)
+        assert con.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 50
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        con.close()
+        assert not mainmod.backup_due(cfg)
+        assert mainmod.backup_due(cfg, now=time.time() + mainmod.BACKUP_INTERVAL + 5)
+
+        # 主循环：到期就备份；没到期不动
+        os.unlink(bak)
+        stop = asyncio.Event()
+        svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=True, stop=stop))
+        for _ in range(60):
+            await asyncio.sleep(0.1)
+            if os.path.exists(bak):
+                break
+        assert os.path.exists(bak), "主循环没有做备份"
+        m1 = os.path.getmtime(bak)
+        await asyncio.sleep(0.3)
+        stop.set()
+        await asyncio.wait_for(svc, timeout=15)
+        assert os.path.getmtime(bak) == m1
+        PASS.append("[72] 状态库每天在线备份（state.db.bak，integrity_check ok、行数一致）；"
+                    "未到期不重复；主循环启动后自动补备份")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -4829,6 +4961,8 @@ async def main():
     await case_ino_backfill()
     await case_part_inplace_retry()
     await case_max_upload_size()
+    await case_auth_failure_breaker()
+    await case_state_backup()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

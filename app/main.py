@@ -67,6 +67,23 @@ _WAKE_POLL = 0.5
 # ★ 巡检**必须 spawn 到后台**（见 `Uploader.spawn_sweep`）：前台 await 会把主循环按住。
 SWEEP_INTERVAL = 300.0
 
+# 状态库每隔多久备份一份（秒）。备份文件放在库旁边：state.db.bak，只留一份。
+# 库丢了 = 所有文件 SHA1 重算、分块断点作废。备份用 SQLite 在线备份 API，在线程里跑。
+BACKUP_INTERVAL = 86400.0
+
+
+def backup_path(cfg: dict) -> str:
+    return str(cfg["state"]["db"]) + ".bak"
+
+
+def backup_due(cfg: dict, now: float | None = None) -> bool:
+    """备份文件不存在或已经超过 BACKUP_INTERVAL 就该备份了（重启也认文件时间，不会每次启动都拷）。"""
+    try:
+        age = (time.time() if now is None else now) - os.path.getmtime(backup_path(cfg))
+    except OSError:
+        return True
+    return age >= BACKUP_INTERVAL
+
 
 def beat(state: dict) -> None:
     """主循环心跳（monotonic 秒）。/health 据此判断主循环是不是卡住了（见 webui.health_status）。
@@ -161,6 +178,7 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
 
     last_cookie_sync = 0.0
     last_sweep = 0.0          # 上次同集巡检的时间（monotonic）
+    last_backup_try = -1e9    # 上次尝试备份状态库的时间（monotonic）
     cookie_sig = None        # (mtime_ns, size)：文件没动就连读都不读，只做一次 stat
     try:
         while not stop.is_set():
@@ -221,6 +239,14 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
                         # 场景下两路同时上传同一个文件），且不受并发上限约束。
                         uploader.spawn(one)
                     uploader.dispatch()
+                # 失败（磁盘满 / 权限）每小时最多重试一次，别每轮都拷
+                if time.monotonic() - last_backup_try >= 3600 and backup_due(cfg):
+                    last_backup_try = time.monotonic()
+                    try:
+                        size = await asyncio.to_thread(store.backup, backup_path(cfg))
+                        logger.info("状态库已备份：%s（%.1f MB）", backup_path(cfg), size / 1024 / 1024)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("状态库备份失败（不影响上传）：%s", exc)
                 # 同集巡检（用户诉求：「上传到 115 以后校验那个文件夹里有没有相同集数的视频」）。
                 # **纯云端视角**：只用「库里出现过的 target_dir + paths.target_root」当
                 # 入口路径，靠 115 条目自身的时间字段判「谁是后传的」—— 因为用户明确

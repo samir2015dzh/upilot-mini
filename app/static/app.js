@@ -134,6 +134,7 @@ function renderOverview(d) {
   $("#queue-list").innerHTML = ["待处理", "待秒传", "待重试", "待上传", "错误"]
     .map(k => `<div class="kv"><span>${k}</span><span>${q[k] || 0} 个</span></div>`).join("");
   const hints = [];
+  if (d.auth_failed) hints.push(`<div class="hint err">115 登录失效（cookie 过期或被踢下线）：已暂停向 115 发请求，不计入重试次数。请到「设置 → 115 账号」更新 cookie，更新后自动继续</div>`);
   if (S.paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务（在途任务会跑完），点「恢复调度」继续</div>');
   if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
   if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「任务明细」，可点「失败项重新入队」重试</div>`);

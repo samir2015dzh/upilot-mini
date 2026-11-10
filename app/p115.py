@@ -123,6 +123,24 @@ def is_transient(exc: Exception) -> bool:
     return isinstance(exc, HTTPError) and exc.code in TRANSIENT_HTTP_CODES
 
 
+def is_auth_error(exc: BaseException | None) -> bool:
+    """115 登录失效 / cookie 过期 / 被踢下线这类认证错误（沿着 __cause__ 找）。
+
+    p115client 的认证异常是 P115AuthenticationError / P115LoginError，errno = EAUTH。
+    按类名和 errno 判，不依赖 import p115client（测试和 dry-run 里没有它）。
+    """
+    seen = 0
+    while exc is not None and seen < 5:
+        if any(c.__name__ in ("P115AuthenticationError", "P115LoginError")
+               for c in type(exc).__mro__):
+            return True
+        eauth = getattr(_errno, "EAUTH", None)
+        if eauth is not None and getattr(exc, "errno", None) == eauth:
+            return True
+        exc, seen = exc.__cause__, seen + 1
+    return False
+
+
 def normalize_cloud_path(p: str) -> str:
     """云端路径规范化：合并连续 `/`、丢弃 `.` 与 `..` 段。
 
