@@ -5952,6 +5952,14 @@ def case_mobile_panel_buttons():
     assert "window.confirm(" not in js and 'confirm("删掉这条记录' not in js
     assert "font-size:16px" in css and "min-height:44px" in login and "font-size:16px" in login
     assert "infinite" not in css and "backdrop-filter" not in css
+    # 环境指示：标题旁小圆点，可见文字改到 title / aria-label；面板 dry-run 提示仍保留
+    assert 'id="env-pill"' in html and "class=\"pill\" id=\"env-pill\"" not in html
+    assert ".env-dot{" in css and ".env-dot.amber{" in css
+    assert 'd.dry_run ? "dry-run 离线自检 · 数字为模拟" : "在线运行"' in js
+    assert 'env.title = envLabel' in js and 'setAttribute("aria-label", envLabel)' in js
+    assert '<span class="dot amber"></span>dry-run 离线自检' not in js
+    assert '<span class="dot"></span>在线运行' not in js
+    assert "dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射" in js
     # 不引入重型依赖（注释里可以提到参考项目，但不能真的引用它们的脚本）
     joined = html + css + js
     assert "<script" in html  # 只有本地 app.js
