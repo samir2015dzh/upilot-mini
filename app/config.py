@@ -108,6 +108,10 @@ DEFAULTS: dict = {
         "cleanup_max_delete": 3,
         # 分块上传用的阿里云 OSS 地址。115 换了存储桶区域时改这里即可，不用等发版。
         "oss_endpoint": "https://oss-cn-shenzhen.aliyuncs.com",
+        # 普通上传（分块）的单文件大小上限（GiB），超过的直接判「错误」而不是传到一半被拒。
+        # 115 官方 VIP 说明页：体验/月费/年费 VIP 单文件最大 115GB（原石用户 5GB、尝鲜 15GB）。
+        # https://vip.115.com/?ac=information&ct=info   0 = 不限制。秒传不受影响。
+        "max_file_gb": 115,
     },
     "retry": {"interval_seconds": 60, "max_count": 5, "max_hours": 12,
               "long_interval_seconds": 900,

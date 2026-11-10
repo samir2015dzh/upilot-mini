@@ -108,7 +108,7 @@ class Store:
             return dict(row) if row else None
 
     def scan_lookup(self, paths: list[str]) -> dict[str, tuple]:
-        """扫描用：批量查 path → (size, mtime, status, stable_count)，只返回库里有的。
+        """扫描用：批量查 path → (size, mtime, status, stable_count, ino)，只返回库里有的。
 
         原来扫描对每个文件单独 SELECT 一次（2 万个文件 = 2 万次查询，占一轮扫描 CPU 的
         八成以上）。现在按目录批量查（每批最多 500 个，避开 SQLite 变量个数上限）。
@@ -120,9 +120,9 @@ class Store:
                 batch = paths[i:i + 500]
                 marks = ",".join("?" * len(batch))
                 for r in self.db.execute(
-                        f"SELECT path, size, mtime, status, stable_count FROM files WHERE path IN ({marks})",
+                        f"SELECT path, size, mtime, status, stable_count, ino FROM files WHERE path IN ({marks})",
                         batch):
-                    out[r[0]] = (r[1], r[2], r[3], r[4])
+                    out[r[0]] = (r[1], r[2], r[3], r[4], r[5])
         return out
 
     def find_sha1(self, ino: str | None, size: int, mtime: float, exclude_path: str) -> str | None:
@@ -142,7 +142,8 @@ class Store:
         return row[0] if row else None
 
     def apply_scan(self, new_files: list[tuple],
-                   bumps: list[tuple[str, int]]) -> None:
+                   bumps: list[tuple[str, int]],
+                   ino_fill: list[tuple] | None = None) -> None:
         """扫描结果**一个事务**写回：新文件/被改写的文件入队、未稳定文件推进计数。
 
         原来每个文件一次 UPDATE/INSERT + commit（2 万个新文件 = 2 万次提交）。
@@ -150,7 +151,7 @@ class Store:
         推进计数只改 stable_count（并刷新 updated_at），绝不碰 status。
         bumps 里是 (path, 新计数)，要求库里当前值 = 新计数 - 1。
         """
-        if not new_files and not bumps:
+        if not new_files and not bumps and not ino_fill:
             return
         now = time.time()
         with self.lock:
@@ -168,6 +169,12 @@ class Store:
                     self.db.executemany(
                         "UPDATE files SET stable_count=?, updated_at=? WHERE path=? AND stable_count=?",
                         [(n, now, p, n - 1) for p, n in bumps])
+                if ino_fill:
+                    # 升级前入库的记录没有 inode：磁盘上的文件仍是记录里那份（size/mtime 一致）
+                    # 时补上，只补空值，不碰其他列（也不动 updated_at，免得顶到面板「最近活动」）。
+                    self.db.executemany(
+                        "UPDATE files SET ino=? WHERE path=? AND ino IS NULL AND size=? AND mtime=?",
+                        [(i, p, sz, mt) for p, sz, mt, i in ino_fill])
                 self.db.commit()
             except Exception:
                 self.db.rollback()
