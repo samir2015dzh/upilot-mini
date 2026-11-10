@@ -56,7 +56,7 @@ from episode import (  # noqa: E402
     VIDEO_SUFFIXES, episode_key, parse_episode, titles_compatible,
 )
 
-__all__ = ["VIDEO_SUFFIXES", "episode_key"]
+__all__ = ["VIDEO_SUFFIXES", "episode_key", "RateLimitedError", "is_rate_limited", "is_soft_busy"]
 
 
 def upload_mark(result) -> str:
@@ -109,6 +109,141 @@ def is_auth_error(exc: BaseException | None) -> bool:
         if eauth is not None and getattr(exc, "errno", None) == eauth:
             return True
         exc, seen = exc.__cause__, seen + 1
+    return False
+
+
+# 115 限流 / 风控（全站访问上限），与「秒传未命中」「登录失效」都不同。
+#
+# 借鉴 MoviePilot 对 115 开放接口的共享冷却：HTTP 429 或返回文案
+# 「已达到当前访问上限」时，全体接口进入冷却，而不是把这次失败当成业务结果。
+# https://github.com/jxxghp/MoviePilot/blob/72d940b835cf6dae5161d4b66b24dc39ba612ccf/app/modules/filemanager/storages/u115.py
+# 冷却时长我们改成「有上限的指数退避 + equal jitter」，避免一次抖动就空等一整小时：
+# https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+#
+# 115 业务码（p115client.client.check_response 的映射，0.0.9.7.2）：
+#   590075 「操作太频繁，请稍候再试」→ EBUSY  —— 全站限频，算硬限流
+#   990009 / 990019 / 990005 / 51012   → EBUSY  —— 上一个复制/删除还没做完，只是忙
+#   40110000 「请求异常需要重试」      → EAGAIN —— 单次请求失败，短重试即可
+# 后两类走 is_soft_busy，只推迟这一个文件，不把全部上传停掉。
+RATE_LIMIT_HTTP = (429, 405)
+RATE_LIMIT_TEXT = ("已达到当前访问上限", "访问上限", "操作过于频繁", "操作太频繁", "触发风控")
+RATE_LIMIT_ERRNOS = (590075,)
+SOFT_BUSY_ERRNOS = (990005, 990009, 990019, 51012, 40110000)
+SOFT_BUSY_TEXT = ("尚未执行完成", "类似任务正在处理", "请求异常需要重试")
+
+
+class RateLimitedError(OSError):
+    """115 硬限流 / 风控。不算秒传未命中，也不该在短间隔里原地连试。"""
+
+    def __init__(self, message: str = "115 限流或风控", resp=None):
+        super().__init__(_errno.EAGAIN, message)
+        self.resp = resp
+
+
+def _walk_causes(obj: BaseException | None):
+    seen, cur, n = set(), obj, 0
+    while cur is not None and n < 6 and id(cur) not in seen:
+        yield cur
+        seen.add(id(cur))
+        cur, n = cur.__cause__, n + 1
+
+
+def _as_mapping(obj):
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, RateLimitedError) and isinstance(obj.resp, dict):
+        return obj.resp
+    if isinstance(obj, BaseException):
+        for a in obj.args:
+            if isinstance(a, dict):
+                return a
+    return None
+
+
+def _115_code(obj) -> int | None:
+    d = _as_mapping(obj)
+    if not d:
+        return None
+    for k in ("errno", "errNo", "errcode", "errCode", "code", "msg_code"):
+        v = d.get(k)
+        if v in (None, "", "0", 0):
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n >= 1000:
+            return n
+    return None
+
+
+def _blob(obj) -> str:
+    d = _as_mapping(obj)
+    parts = [str(obj or "")]
+    if d:
+        for k in ("error", "message", "msg", "errno"):
+            if d.get(k) not in (None, ""):
+                parts.append(str(d.get(k)))
+    return " ".join(parts)
+
+
+def is_rate_limited(obj) -> bool:
+    """这是不是 115 的硬限流 / 风控（访问上限、429、操作太频繁）。
+
+    命中时调用方应暂停向 115 发请求，且绝不能当成「秒传未命中」去加 retry_count。
+    """
+    if obj is None:
+        return False
+    if isinstance(obj, RateLimitedError):
+        return True
+    items = [obj]
+    if isinstance(obj, BaseException):
+        items = list(_walk_causes(obj))
+    for it in items:
+        if isinstance(it, RateLimitedError):
+            return True
+        code = _115_code(it)
+        if code in RATE_LIMIT_ERRNOS:
+            return True
+        text = _blob(it)
+        if any(s in text for s in RATE_LIMIT_TEXT):
+            return True
+        from urllib.error import HTTPError
+        if isinstance(it, HTTPError) and it.code in RATE_LIMIT_HTTP:
+            return True
+        status = getattr(it, "status", None) or getattr(it, "code", None)
+        try:
+            if int(status) in RATE_LIMIT_HTTP:
+                return True
+        except (TypeError, ValueError):
+            pass
+        d = _as_mapping(it)
+        if d:
+            for k in ("status_code", "status", "code"):
+                try:
+                    if int(d.get(k)) in RATE_LIMIT_HTTP:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+
+def is_soft_busy(obj) -> bool:
+    """上一个操作还没做完 / 单次请求要重试：只推迟这一个文件，不停掉全部任务。"""
+    if obj is None or is_rate_limited(obj) or (
+            isinstance(obj, BaseException) and is_auth_error(obj)):
+        return False
+    items = [obj]
+    if isinstance(obj, BaseException):
+        items = list(_walk_causes(obj))
+    for it in items:
+        if _115_code(it) in SOFT_BUSY_ERRNOS:
+            return True
+        if any(s in _blob(it) for s in SOFT_BUSY_TEXT):
+            return True
+        if isinstance(it, OSError) and getattr(it, "errno", None) in (
+                _errno.EAGAIN, _errno.EBUSY):
+            return True
     return False
 
 
@@ -369,6 +504,10 @@ class P115:
             try:
                 return await fn()
             except Exception as exc:  # noqa: BLE001
+                # 硬限流 / 风控：短间隔原地连试只会把冷却拉得更长，立刻上抛，
+                # 由 Uploader 的共享冷却接手（借鉴 MoviePilot 的全体接口冷却）。
+                if is_rate_limited(exc):
+                    raise
                 if attempt < self.transient_retries and is_transient(exc):
                     backoff = 2.0 * (2 ** attempt) + random.uniform(0, 0.5)
                     logger.warning("%s 瞬态错误（第 %d 次重试，等待 %.1fs）：%s",
@@ -849,6 +988,10 @@ class P115:
             )
 
         resp = await self._retry_transient(call, f"秒传初始化 {fname}")
+        # check_response 通常会把限流变成异常；万一返回了 state:false 的正文，
+        # 也要认出来，不能落到下面被当成「秒传未命中」。
+        if is_rate_limited(resp):
+            raise RateLimitedError(_blob(resp) or "115 限流或风控", resp)
         data = resp.get("data") or {}
         hit = resp.get("reuse") is True and resp.get("state") is True
         info = {
