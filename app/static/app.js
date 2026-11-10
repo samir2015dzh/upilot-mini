@@ -139,6 +139,13 @@ function renderOverview(d) {
   if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
   if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「任务明细」，可点「失败项重新入队」重试</div>`);
   if (!hints.length) hints.push('<div class="hint">一切正常：队列为空，没有报错</div>');
+  // 最近的洗板替换（同一集只留最新那份）：保留了谁、把谁移进了回收站、凭什么判新旧
+  (d.replacements || []).slice(0, 5).forEach(r => {
+    const gone = (r.removed || []).map(esc).join("、");
+    hints.push(r.dry
+      ? `<div class="hint warn">洗板（仅记录，未删）${fmtAgo(r.at)}：最新是 ${esc(r.kept)}；本该清掉 ${gone}（${esc(r.basis)}）</div>`
+      : `<div class="hint">洗板替换 ${fmtAgo(r.at)}：保留最新的 ${esc(r.kept)}；旧版 ${gone} 已移入 115 回收站（${esc(r.basis)}）</div>`);
+  });
   $("#hints").innerHTML = hints.join("");
 
   const rec = d.recent || [];

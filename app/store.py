@@ -235,6 +235,13 @@ class Store:
         with self.lock:
             return [dict(r) for r in self.db.execute(sql, args).fetchall()]
 
+    def uploaded_records(self) -> list[dict]:
+        """所有「已上传」记录的几列（洗板判新旧用：本地 mtime / 首次入库时间 / 云端标识）。"""
+        with self.lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT path, size, mtime, created_at, file_id, target_dir "
+                "FROM files WHERE status='已上传'").fetchall()]
+
     def counts(self) -> dict:
         with self.lock:
             rows = self.db.execute("SELECT status, COUNT(*) c FROM files GROUP BY status").fetchall()

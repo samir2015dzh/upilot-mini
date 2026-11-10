@@ -332,6 +332,15 @@ def _auth_failed() -> dict | None:
         return None
 
 
+def _replacements() -> list[dict]:
+    """最近的洗板替换记录（uploader 里记的，最新在前）；取不到就当没有。"""
+    try:
+        from uploader import _SHARED
+        return list(_SHARED["replaced"])
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _payload(cfg: dict, store, state: dict) -> dict:
     up, rt, sc = cfg["upload"], cfg["retry"], cfg["scan"]
     a = auth_cfg(cfg)
@@ -341,6 +350,7 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "dry_run": bool(state.get("dry_run")),
         "paused": bool(state.get("paused")),
         "auth_failed": _auth_failed(),
+        "replacements": _replacements(),
         "scan_rounds": state.get("scan_rounds", 0),
         "last_scan": state.get("last_scan"),
         "server_time": time.time(),
