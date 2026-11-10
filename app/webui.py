@@ -323,6 +323,15 @@ def maybe_gzip(body: bytes, ctype: str, accept: str | None) -> tuple[bytes, bool
     return body, False
 
 
+def _auth_failed() -> dict | None:
+    """115 登录失效断路器的状态（uploader.auth_status）；取不到就当没有。"""
+    try:
+        from uploader import auth_status
+        return auth_status()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _payload(cfg: dict, store, state: dict) -> dict:
     up, rt, sc = cfg["upload"], cfg["retry"], cfg["scan"]
     a = auth_cfg(cfg)
@@ -331,6 +340,7 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "ok": True,
         "dry_run": bool(state.get("dry_run")),
         "paused": bool(state.get("paused")),
+        "auth_failed": _auth_failed(),
         "scan_rounds": state.get("scan_rounds", 0),
         "last_scan": state.get("last_scan"),
         "server_time": time.time(),
