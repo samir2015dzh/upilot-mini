@@ -118,7 +118,7 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 | `scan.include_suffixes` | 见示例（视频扩展名） | 只处理这些扩展名；留空 `[]` 表示不过滤。默认只传视频本体，整库挂进来也不会把 `.strm`/`.nfo`/图片传上去 |
 | `scan.exclude_dirs` | `[]` | 相对监控根目录的路径片段（如 `["Sample","extras"]`），命中则整棵子树跳过 |
 | `upload.delete_after_upload` | `false` | 传完就删掉监控目录里的源文件本体（破坏性，默认关）。播放不受影响——symedia 建好 strm 后是直接从云端读的；只删文件不删目录 |
-| `upload.mode` | `rapid_only` | `rapid_only` = 只用秒传，未命中就排队等，**永不普通上传**；`rapid_then_upload` = 秒传优先，重试耗尽后转分块上传 |
+| `upload.mode` | `rapid_only` | `rapid_only` = 只用秒传，未命中就排队等，**永不普通上传**；`rapid_then_upload` = 秒传优先，重试耗尽后转分块上传。**只有明确写 `rapid_then_upload` 才会真传**：空值、拼写错误都按 `rapid_only` 处理（并在日志里警告） |
 | `upload.small_file_mb` | 10 | 仅 `rapid_then_upload`：秒传未命中且小于该值直接上传 |
 | `upload.concurrency` | 2 | 同时在处理的文件数 |
 | `upload.max_file_gb` | 115 | 普通上传（分块）的单文件上限（GiB），超过的直接标「错误」不白传；115 官方 VIP 单文件最大 115GB（原石 5GB、尝鲜 15GB）。`0` = 不限制；秒传不受影响 |
@@ -136,6 +136,8 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 `upload.mode: rapid_only` 时，这条链路**根本没有普通上传**：秒传不命中就把文件放回「待重试」，前 `retry.max_count` 轮每 60 秒发一次校验请求，之后每 15 分钟发一次，一直到云端出现同 hash 为止 —— 全程零上行，一分钱流量不花。
 
 为什么这招管用：115 的秒传是**全站 hash 索引**，不只看你自己的盘。新剧集刚出时云端没有，过一阵别人传上去，你这边下一次校验就直接命中（实测：`甲剧 S01E27 2160p` 1290 MB 秒传命中，零上行）。想手动催一下就在面板点「提前重试秒传」或 `POST /api/retry-now`。
+
+从 `rapid_then_upload` 切回 `rapid_only` 时，库里残留的「上传中」断点记录**不会续传**，统一回到秒传重试队列；代码里分块上传入口另有一道硬保险，纯秒传模式绝不进入。
 
 代价：云端一辈子没出现同 hash 的文件，它就一直躺在「待重试」里（不占带宽、不占硬盘，只占一条记录）。想让它最终落地上传，把 `upload.mode` 换回 `rapid_then_upload`。
 

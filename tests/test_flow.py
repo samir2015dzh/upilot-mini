@@ -4895,6 +4895,91 @@ async def case_state_backup():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def case_core_rapid_only_contract():
+    """[73] 核心契约 A/B 端到端：
+    A 递归扫描 + 云端镜像本地文件夹结构；
+    B 默认配置下秒传一直未命中 → 一直重试、永远不普通上传（连配置写空/写错、库里残留断点都不行）。"""
+    import uploader as upmod
+
+    # ---- A：嵌套目录 → 云端目录镜像 ----
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=0, fail_first=0,
+                                             mode="rapid_only")
+    try:
+        files = ["剧A/Season 1/E01.mkv", "剧A/Season 1/E02.mkv", "剧A/Season 2/E01.mkv",
+                 "剧B/Specials/OP.mp4", "电影/Movie (2020)/Movie.mkv", "根目录.mkv"]
+        for f in files:
+            write_file(src, f, 2048)
+        scanner.scan_once(store, cfg)
+        up.dispatch()
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if not up._active and all(r["status"] == "已上传" for r in store.list_tasks(limit=50)[0]):
+                break
+        rows, total = store.list_tasks(limit=50)
+        assert total == len(files) and all(r["status"] == "已上传" and r["upload_mode"] == "rapid" for r in rows), rows
+        got = {os.path.relpath(r["path"], src).replace(os.sep, "/"): r["target_dir"] for r in rows}
+        assert got == {
+            "剧A/Season 1/E01.mkv": "/UPILOT-mini/剧A/Season 1",
+            "剧A/Season 1/E02.mkv": "/UPILOT-mini/剧A/Season 1",
+            "剧A/Season 2/E01.mkv": "/UPILOT-mini/剧A/Season 2",
+            "剧B/Specials/OP.mp4": "/UPILOT-mini/剧B/Specials",
+            "电影/Movie (2020)/Movie.mkv": "/UPILOT-mini/电影/Movie (2020)",
+            "根目录.mkv": "/UPILOT-mini",
+        }, got
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- B：默认配置，永远未命中 ----
+    for raw_mode in (None, "default", "", "rapid_only", "RAPID-ONLY", "rapid_then_upload "):
+        cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=0, fail_first=10 ** 9,
+                                                 mode="rapid_only", long_interval=0)
+        try:
+            if raw_mode == "default":
+                cfg["upload"].pop("mode", None)              # 配置里根本没写
+                cfg["upload"]["mode"] = cfgmod.DEFAULTS["upload"]["mode"]
+            else:
+                cfg["upload"]["mode"] = raw_mode
+            cfg["retry"]["max_hours"] = 0                    # 「rapid_then_upload」才看它，这里要证明纯秒传不看
+            cfg["retry"]["max_count"] = 1
+            up = Uploader(cfg, store, mgr)
+            explicit_real = str(raw_mode or "").strip().lower() == "rapid_then_upload"
+            assert up.rapid_only == (not explicit_real), (raw_mode, up.mode)
+            if explicit_real:
+                continue                                      # 显式 rapid_then_upload 是允许真传的
+            mp = {"n": 0}
+            real_mp = mgr.multipart
+
+            async def spy(*a, **k):
+                mp["n"] += 1
+                return await real_mp(*a, **k)
+
+            mgr.multipart = spy
+            p = write_file(src, "剧/E01.mkv", 3 * 1024 * 1024)
+            small = write_file(src, "剧/cover.jpg", 100)
+            scanner.scan_once(store, cfg)
+            # 库里残留一份「上传中 + 分块断点」（从 rapid_then_upload 切回来的现场）
+            store.set(p, status="上传中", upload_id="u1", upload_oss_url="https://oss/x",
+                      upload_callback="{}", upload_partsize=1048576)
+            for _ in range(40):
+                for q in (p, small):
+                    if store.get(q)["status"] == "待重试":
+                        store.set(q, next_retry_at=0, first_failed_at=time.time() - 30 * 86400)
+                    await up._process(q)
+            for q in (p, small):
+                r = store.get(q)
+                assert r["status"] == "待重试", (raw_mode, r["status"], r["message"])
+                assert (r["retry_count"] or 0) >= 30 and r["upload_mode"] is None, (raw_mode, r)
+            assert mp["n"] == 0, f"mode={raw_mode!r}：纯秒传下发生了 {mp['n']} 次普通上传"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    assert cfgmod.DEFAULTS["upload"]["mode"] == "rapid_only"
+    assert cfgmod.normalize_upload_mode(None) == "rapid_only" and cfgmod.normalize_upload_mode("typo") == "rapid_only"
+    assert cfgmod.normalize_upload_mode("rapid_then_upload") == "rapid_then_upload"
+    PASS.append("[73] 核心契约：嵌套目录 6 个文件秒传后云端目录与本地一一镜像；默认/空/写错的 upload.mode "
+                "下秒传一直未命中 → 重试 40 轮（超过 max_count/max_hours）仍是待重试、普通上传 0 次，"
+                "库里残留的「上传中+断点」也不续传；只有明确写 rapid_then_upload 才会真传")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -4963,6 +5048,7 @@ async def main():
     await case_max_upload_size()
     await case_auth_failure_breaker()
     await case_state_backup()
+    await case_core_rapid_only_contract()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

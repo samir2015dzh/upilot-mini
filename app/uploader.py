@@ -15,6 +15,7 @@ import os
 import threading
 import time
 
+import config as cfgmod
 from notify import Notifier
 from p115 import P115 as _P115, episode_key, is_auth_error, resolve_upload_target
 
@@ -253,7 +254,10 @@ class Uploader:
         # stable_count 停在 2，而上传器还拿着旧的 5 比较，文件会永远卡在「待处理」。
         # 一律现读，与 scanner.py 保持一致。
         # 纯秒传：只发校验请求，命中与否取决于云端 hash 索引；未命中就等下一轮，永不普通上传
-        self.mode = str(up.get("mode") or "rapid_then_upload")
+        # 只有明确写 rapid_then_upload 才会普通上传；空值/写错都按 rapid_only（见 normalize_upload_mode）
+        self.mode = cfgmod.normalize_upload_mode(up.get("mode"))
+        if str(up.get("mode") or "").strip().lower() not in ("rapid_only", "rapid_then_upload"):
+            logger.warning("upload.mode=%r 不认识，按 rapid_only（只秒传、不普通上传）处理", up.get("mode"))
         self.rapid_only = self.mode == "rapid_only"
         self.long_interval = int(rt.get("long_interval_seconds") or 900)
         # 长间隔按文件「等了多久」逐级放慢（见 long_retry_interval）。缺省档位见 config.DEFAULTS
@@ -977,9 +981,10 @@ class Uploader:
         # 这种带完整断点的「待重试」到期后同样直接续传，不再先绕一圈秒传。
         has_breakpoint = all(rec.get(k) for k in
                              ("upload_id", "upload_oss_url", "upload_callback"))
-        resume_upload = has_breakpoint and (
-            rec["status"] == "上传中"
-            or (rec["status"] == "待重试" and not self.rapid_only))
+        # 纯秒传下一律不续传：库里残留的「上传中」+断点是从 rapid_then_upload 切回来之前留下的，
+        # 续传 = 真实上传，违背「只秒传」。这些记录改走秒传重试队列。
+        resume_upload = (not self.rapid_only) and has_breakpoint and (
+            rec["status"] == "上传中" or rec["status"] == "待重试")
         if resume_upload:
             logger.info("恢复被打断的分块上传（断点续传）：%s", os.path.basename(path))
         while not resume_upload:
@@ -1062,6 +1067,13 @@ class Uploader:
             return                                       # 到期由调度器重新拾起
 
         # 4) 分块上传（带断点续传）
+        # 硬保险：纯秒传绝不进入普通上传。正常路径上面的 rapid_only 分支已经 return 了，
+        # 走到这里只可能是以后改代码时引入的漏洞 —— 宁可停在重试队列也不真传。
+        if self.rapid_only:
+            logger.error("BUG：纯秒传模式走到了普通上传分支，已拦截：%s", os.path.basename(path))
+            store.set(path, status="待重试", next_retry_at=time.time() + self.long_interval,
+                      message="纯秒传模式：不普通上传（内部保护）")
+            return
         # 超过 115 单文件上限的，传多少都会在最后被拒：先拦住，别白占几十上百 GB 上行。
         if self.max_upload_bytes and rec["size"] > self.max_upload_bytes:
             gb = rec["size"] / 1024 ** 3

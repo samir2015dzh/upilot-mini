@@ -360,9 +360,9 @@ def _payload(cfg: dict, store, state: dict) -> dict:
             "stable_rounds": sc["stable_rounds"],
             "concurrency": up["concurrency"],
             "small_file_mb": up["small_file_mb"],
-            "upload_mode": up.get("mode") or "rapid_then_upload",
+            "upload_mode": cfgmod.normalize_upload_mode(up.get("mode")),
             "upload_mode_label": cfgmod.UPLOAD_MODE_LABELS.get(
-                up.get("mode") or "rapid_then_upload", up.get("mode") or ""),
+                cfgmod.normalize_upload_mode(up.get("mode")), ""),
             "partsize_mb": up["partsize_mb"],
             "init_min_interval": up["init_min_interval"],
             "retry_interval": rt["interval_seconds"],
