@@ -5286,6 +5286,26 @@ async def case_sweep_local_order():
                 "不同扩展名算同集、仅记录不删、超上限不动手、其它集不碰")
 
 
+def case_panel_lightweight():
+    """[76] 面板保持轻量：没有持续动画 / 模糊 / 网络字体 / CDN；深浅主题都有令牌；轮询仍随页面可见性暂停。"""
+    import re as _re
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "static")
+    css = open(os.path.join(root, "app.css"), encoding="utf-8").read()
+    html = open(os.path.join(root, "index.html"), encoding="utf-8").read()
+    login = open(os.path.join(root, "login.html"), encoding="utf-8").read()
+    js = open(os.path.join(root, "app.js"), encoding="utf-8").read()
+    for name, text in (("app.css", css), ("login.html", login)):
+        assert "infinite" not in text, f"{name}：不许有持续动画（常驻后台会一直吃 CPU/GPU）"
+        assert "backdrop-filter" not in text, f"{name}：不许用模糊背景"
+        assert "@font-face" not in text and "fonts.googleapis" not in text
+    for name, text in (("index.html", html), ("login.html", login), ("app.css", css), ("app.js", js)):
+        assert not _re.search(r"https?://(?!www\.w3\.org)", _re.sub(r"<!--.*?-->", "", text, flags=_re.S)) \
+            or name == "app.js", f"{name}：不许引用外部资源（CDN / 网络字体）"
+    assert "prefers-color-scheme:light" in css and "data-theme=light" in css, "缺浅色主题"
+    assert "visibilitychange" in js and "document.hidden" in js, "轮询必须随页面可见性暂停"
+    PASS.append("[76] 面板轻量：无持续动画/模糊/网络字体/CDN；深色默认 + 跟随系统浅色 + 可手动切换；后台标签页暂停轮询")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5357,6 +5377,7 @@ async def main():
     await case_core_rapid_only_contract()
     await case_replace_newest_episode()
     await case_sweep_local_order()
+    case_panel_lightweight()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

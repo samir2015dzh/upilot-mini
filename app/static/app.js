@@ -486,6 +486,18 @@ function bind() {
   $("#btn-retry").onclick = () => act("/api/retry-now", "已提前重试");
   $("#btn-requeue").onclick = () => act("/api/requeue", "已重新入队");
   $("#btn-sweep").onclick = () => act("/api/sweep", "已触发同集核对");
+  // 主题：自动（跟随系统）→ 深色 → 浅色，选择记在浏览器里；没有任何动画/监听器，零开销
+  const THEMES = ["auto", "dark", "light"], THEME_LABEL = { auto: "自动", dark: "深色", light: "浅色" };
+  const curTheme = () => document.documentElement.dataset.theme || "auto";
+  const showTheme = () => { $("#theme-label").textContent = THEME_LABEL[curTheme()]; };
+  showTheme();
+  $("#btn-theme").onclick = () => {
+    const next = THEMES[(THEMES.indexOf(curTheme()) + 1) % THEMES.length];
+    if (next === "auto") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("upilot-theme", next); } catch (e) { /* 隐私模式写不了就算了 */ }
+    showTheme();
+  };
   $("#btn-refresh").onclick = () => { S.lastFetch = Date.now(); refreshOverview(); if (S.tab === "tasks") loadTasks(); toast("已刷新"); };
   $("#btn-pause").onclick = () => act(S.paused ? "/api/resume" : "/api/pause", S.paused ? "已恢复调度" : "已暂停调度");
   $("#btn-logout").onclick = () => { location.href = "/logout"; };
