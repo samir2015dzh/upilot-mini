@@ -5306,6 +5306,16 @@ def case_panel_lightweight():
     PASS.append("[76] 面板轻量：无持续动画/模糊/网络字体/CDN；深色默认 + 跟随系统浅色 + 可手动切换；后台标签页暂停轮询")
 
 
+def case_hint_tone():
+    """[77] 设置页说明保持简短：每项一句话（≤ 80 字），警示语（danger_note）≤ 60 字，别再写成小作文。"""
+    for g in cfgmod.FIELD_GROUPS:
+        for f in g["fields"]:
+            h = f.get("hint", "")
+            assert len(h) <= 80, f"{f['key']} 的说明太长（{len(h)} 字），一句话讲完，细节放 README 附录"
+            assert len(f.get("danger_note", "")) <= 60, f"{f['key']} 的警示语太长"
+    PASS.append("[77] 设置页每项说明 ≤ 80 字、警示语 ≤ 60 字（防止再写成小作文）")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5378,6 +5388,7 @@ async def main():
     await case_replace_newest_episode()
     await case_sweep_local_order()
     case_panel_lightweight()
+    case_hint_tone()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
