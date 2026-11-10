@@ -827,7 +827,7 @@ async def case_rapid_only_mode():
         scanner.scan_once(store, cfg)
         rec = await drive(up, store, small, rounds=1)
         assert rec["status"] == "待重试", rec
-        assert rec["retry_count"] == 1 and "纯秒传" in (rec["message"] or ""), rec
+        assert rec["retry_count"] == 1 and "不会真上传" in (rec["message"] or ""), rec
         assert rec["next_retry_at"] > time.time() + 30, rec        # 真在等 60 秒，不是马上重来
         assert rec["upload_mode"] is None, rec                    # 一次普通上传都没发生过
 
@@ -839,7 +839,7 @@ async def case_rapid_only_mode():
             await up._process(big)
         rb = store.get(big)
         assert rb["status"] == "待重试" and rb["retry_count"] >= 6, rb
-        assert "300s" in (rb["message"] or ""), rb["message"]     # 已切到长间隔
+        assert "5 分钟" in (rb["message"] or "") and "不会真上传" in (rb["message"] or ""), rb["message"]
         assert rb["upload_mode"] is None, rb
 
         # 3) 纯秒传下「待上传」不允许停在原地：会被派发，且 _process 立刻把它拉回重试队列。
@@ -5582,7 +5582,7 @@ async def case_rate_limit_breaker():
             scanner.scan_once(store2, cfg2)
             rec = await drive(up3, store2, pmiss, rounds=2)
             assert rec["status"] == "待重试" and (rec["retry_count"] or 0) >= 1, rec
-            assert "未命中" in (rec["message"] or ""), rec
+            assert "不会真上传" in (rec["message"] or "") and "后再问" in (rec["message"] or ""), rec
             assert upmod._SHARED["rate_limit"] is None
         finally:
             shutil.rmtree(tmp2, ignore_errors=True)
@@ -5905,6 +5905,26 @@ def case_scan_large_library_sidecars():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def case_retry_status_copy():
+    """[85] 纯秒传未命中的等待文案说人话：面板不再把「有人在等秒传」写成队列为空。"""
+    from uploader import wait_text
+    assert wait_text(0) == "0 秒" and wait_text(45) == "45 秒"
+    assert wait_text(60) == "60 秒" and wait_text(90) == "2 分钟"
+    assert wait_text(300) == "5 分钟" and wait_text(3600) == "1 小时"
+    assert wait_text(21600) == "6 小时" and wait_text(2 * 86400) == "2 天"
+
+    from pathlib import Path
+    js = Path(__file__).resolve().parents[1].joinpath("app", "static", "app.js").read_text(encoding="utf-8")
+    assert "队列为空" not in js
+    assert "没有待处理文件，也没有报错" in js
+    assert "有 ${nRetry} 个文件在等秒传：云端还没有相同文件，会自动再问，不会真上传" in js
+    assert "约 ${fmtWait(left)} 后再问" in js
+    assert "倒计时 ${left}s" not in js
+    PASS.append("[85] 纯秒传等待文案说人话（5 分钟/1 小时，不写 300s）；"
+                "面板在有待重试时不再写「队列为空」，idle 时才说没有待处理文件")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5985,6 +6005,7 @@ async def main():
     await case_sidecar_still_writing()
     case_config_startup_validation()
     case_scan_large_library_sidecars()
+    case_retry_status_copy()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
