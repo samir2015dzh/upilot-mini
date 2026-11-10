@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import logging
 import mmap
@@ -17,6 +18,7 @@ import time
 
 import config as cfgmod
 from notify import Notifier
+import episode
 from p115 import P115 as _P115, episode_key, is_auth_error, resolve_upload_target
 
 logger = logging.getLogger("upilot.upload")
@@ -62,7 +64,9 @@ _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  "rapid_round": {"checked": 0, "hit": 0, "miss": 0},
                  # 115 登录失效断路器：None = 正常；否则 {"since","message","next_probe"}。
                  # 失效期间 dispatch 只放行「不联网」的状态，每 AUTH_PROBE_SECONDS 才试探一次。
-                 "auth_fail": None}
+                 "auth_fail": None,
+                 # 最近的洗板替换记录（面板「最近洗板替换」；重启即清空，完整历史在日志里）
+                 "replaced": collections.deque(maxlen=30)}
 
 # 登录失效后多久再试探一次 115（同时也是该文件下次重试的间隔）
 AUTH_PROBE_SECONDS = 300.0
@@ -266,6 +270,8 @@ class Uploader:
         self.delete_after = bool(up.get("delete_after_upload"))
         # 洗板：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
         self.cleanup_prev = bool(up.get("cleanup_previous_versions"))
+        self.cleanup_dry = bool(up.get("cleanup_dry_run"))
+        episode.set_title_match(up.get("cleanup_title_match"))
         self.cleanup_max = int(up.get("cleanup_max_delete") or 3)
         # 普通上传的单文件上限（字节，0 = 不限）。见 config.DEFAULTS["upload"]["max_file_gb"]
         try:
@@ -730,6 +736,7 @@ class Uploader:
 
         removed = 0
         scanned = 0
+        lookup = self._local_lookup()
         for td in roots:
             # ★ 只查缓存、**不建目录**：巡检对「云端早已不存在的 target_dir」不能
             # 触发 fs_makedirs（那会凭空建出空目录树）。拿不到 cid 说明这目录从没被
@@ -751,46 +758,114 @@ class Uploader:
             for _dcid, items in tree:
                 scanned += 1
                 files = [r for r in items if r.get("fid") not in (None, "")]
-                groups: dict[str, list[dict]] = {}
-                for r in files:
-                    k = episode_key(str(r.get("n") or r.get("name") or ""))
-                    if k:
-                        groups.setdefault(k, []).append(r)
-                for k, grp in groups.items():
-                    if len(grp) < 2:
-                        continue                            # 该目录里这一集只有一条，正常
-                    ts = [(self._cloud_ts(r), r) for r in grp]
-                    newest = max(t for t, _ in ts)
-                    if newest <= 0:
-                        logger.info("同集巡检：%s（目录 %s）有 %d 条同集文件，"
-                                    "但 115 条目没有可用时间字段，分不清哪条是后传的，本次不动手",
-                                    k, td, len(grp))
+                items_ = [(r, str(r.get("n") or r.get("name") or "")) for r in files]
+                for grp in episode.group_same_episode(items_):
+                    k = episode_key(str(grp[0].get("n") or grp[0].get("name") or "")) or "?"
+                    rk = _P115.rank_same_episode(grp, lookup)
+                    if "ranks" not in rk:
+                        logger.info("同集巡检：%s（目录 %s）有 %d 条同集文件：%s",
+                                    k, td, len(grp), rk["note"])
                         continue
-                    victims = [r for t, r in ts if t < newest]
+                    ranks, basis = rk["ranks"], rk["basis"]
+                    top = max(ranks)
+                    keeper = grp[ranks.index(top)]
+                    keeper_name = str(keeper.get("n") or keeper.get("name") or "")
+                    victims = [r for t, r in zip(ranks, grp, strict=True) if t < top]
                     if not victims:
-                        continue                            # 时间戳都一样（同批），不动手
+                        continue
                     if limit > 0 and len(victims) > limit:
                         logger.info("同集巡检：%s 同集旧版本 %d 个，超过上限 %d，本次不动手",
                                     k, len(victims), limit)
                         continue
+                    if self.cleanup_dry:
+                        names = [str(r.get("n") or r.get("name") or "") for r in victims]
+                        logger.info("同集巡检【仅记录，未删除】：%s 是最新（%s），本该移入回收站：%s",
+                                    keeper_name, basis, "、".join(names))
+                        self._record_replacement(td, keeper_name, names, basis, dry=True)
+                        continue
+                    gone: list[str] = []
                     for r in victims:
                         fid = r.get("fid")
                         name = str(r.get("n") or r.get("name") or "")
                         try:
                             if await self.mgr.delete_file(fid):
                                 removed += 1
-                                logger.info("同集巡检：%s 保留最后上传的那条，已移入 115 回收站 %s",
-                                            k, name)
+                                gone.append(name)
+                                logger.info("洗板替换（巡检）：保留 %s，已把旧版 %s 移入 115 回收站（判据：%s）",
+                                            keeper_name, name, basis)
                             else:
                                 logger.warning("同集巡检：删除失败 %s", name)
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("同集巡检：删除出错 %s：%s", name, exc)
+                    if gone:
+                        self._record_replacement(td, keeper_name, gone, basis, dry=False)
         if removed:
             cache = getattr(self, "_dir_cache", None)
             if isinstance(cache, dict):
                 cache.clear()                               # 内容变了，缓存作废
         return {"removed": removed, "dirs": scanned,
                 "note": f"扫了 {scanned} 个云端目录，清掉 {removed} 个同集旧版"}
+
+    def _local_lookup(self, records: list[dict] | None = None):
+        """云端条目 → 本地「下载时间」`(mtime, 首次入库时间)`；对不上返回 None。
+
+        用状态库里「已上传」的记录对：先按云端标识（秒传落库的 file_id 是 pickcode，
+        与目录条目的 `pc` 一致），再按「文件名 + 大小」。有歧义（同一标识/同名同大小对应多个
+        不同时间）一律返回 None —— 调用方会退回云端上传时间，宁可保守也不凭猜测删文件。
+        库里记录在本地文件被收尾删除后依然在（source_deleted=1），所以与
+        delete_after_upload 无关。
+        """
+        idx: dict = {}
+
+        def build() -> None:
+            # 惰性：只有真的出现「同集 ≥2 条」需要裁决时才读库（每次秒传命中都读一遍全表太浪费）
+            try:
+                recs = records if records is not None else self.store.uploaded_records()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取本地记录失败（洗板改用云端时间判新旧）：%s", exc)
+                recs = []
+            by_mark: dict[str, tuple | None] = {}
+            by_name: dict[tuple, tuple | None] = {}
+
+            def put(d: dict, k, t: tuple) -> None:
+                d[k] = t if k not in d or d[k] == t else None      # None = 有歧义
+
+            for rec in recs:
+                try:
+                    t = (float(rec.get("mtime") or 0.0), float(rec.get("created_at") or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                mark = str(rec.get("file_id") or "").strip()
+                if mark and mark not in ("0", "None"):
+                    put(by_mark, mark, t)
+                try:
+                    put(by_name, (os.path.basename(str(rec.get("path") or "")), int(rec.get("size") or 0)), t)
+                except (TypeError, ValueError):
+                    pass
+
+            idx["mark"], idx["name"] = by_mark, by_name
+
+        def lookup(row: dict):
+            if not idx:
+                build()
+            by_mark, by_name = idx["mark"], idx["name"]
+            for k in ("pc", "fid", "file_id"):
+                v = str(row.get(k) or "")
+                if v and v in by_mark:
+                    return by_mark[v]
+            try:
+                size = int(row.get("s") or row.get("size") or 0)
+            except (TypeError, ValueError):
+                return None
+            return by_name.get((str(row.get("n") or row.get("name") or ""), size))
+
+        return lookup
+
+    def _record_replacement(self, cloud_dir: str, kept: str, removed: list[str],
+                            basis: str, dry: bool) -> None:
+        """记一条洗板替换事件，面板「最近洗板替换」显示（内存里最近 30 条，完整历史看日志）。"""
+        _SHARED["replaced"].appendleft({"at": time.time(), "dir": cloud_dir, "kept": kept,
+                                        "removed": list(removed), "basis": basis, "dry": bool(dry)})
 
     async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
         """上传成功后：云端同一集只留**刚上传的那条**，其余移入 115 回收站。
@@ -815,8 +890,9 @@ class Uploader:
         cur = self.store.get(local_path) or {}
         keep_fid = str(cur.get("file_id") or "")
         try:
-            res = await self.mgr.cleanup_episode_newest(pid, name, self.cleanup_max,
-                                                        keep_fid=keep_fid)
+            res = await self.mgr.cleanup_episode_newest(
+                pid, name, self.cleanup_max, keep_fid=keep_fid,
+                local_lookup=self._local_lookup(), dry_run=self.cleanup_dry)
         except AttributeError:
             # 兼容测试替身 / 旧实现（没有纯云端判据时退回老路径）
             try:
@@ -836,7 +912,11 @@ class Uploader:
             logger.warning("洗板清理出错（不影响上传）：%s", exc)
             return
         deleted = list((res or {}).get("deleted") or [])
+        would = list((res or {}).get("would_delete") or [])
         note = str((res or {}).get("note") or "")
+        if (deleted or would) and (res or {}).get("kept"):
+            self._record_replacement(cloud_dir, str(res["kept"]), deleted or would,
+                                     str(res.get("basis") or ""), dry=not deleted)
         if deleted:
             logger.info("洗板清理：%s 就位，云端同集旧版本已清 %s", name, "、".join(deleted))
         elif note and note != "没有旧版本":
@@ -844,6 +924,8 @@ class Uploader:
         tail = ""
         if deleted:
             tail = f"｜云端同集旧版本已清 {len(deleted)} 个：" + "、".join(deleted)
+        elif would:
+            tail = "｜洗板（仅记录）本该清：" + "、".join(would)
         elif note and note != "没有旧版本":
             tail = f"｜洗板清理：{note}"
         if tail:

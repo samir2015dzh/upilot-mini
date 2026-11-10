@@ -1027,24 +1027,56 @@ async def case_delete_after_upload():
 
 
 def case_episode_key():
-    """[17] 同一集归一化：画质标签（DV / HDR / WEB-DL…）不参与比较。"""
+    """[17] 同一集归一化：画质标签不参与；**扩展名也不参与**（mkv / mp4 是同一集）；
+    剧名按 title_match 比；认得出 1x01 / EP01 / 第十二集 / 动漫 " - 05 " 等写法。"""
+    import episode as epmod
     from p115 import episode_key as K
 
     dv = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL DV TX DemoWeb].mkv"
     nov = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"
-    assert K(dv) == K(nov) == "甲剧 (2026)|s01e031|.mkv", (K(dv), K(nov))
-    assert K("Show.S01E31.2160p.DV.mkv") == K("Show.S01E31.2160p.mkv") == "show|s01e031|.mkv"
-    assert K("甲剧 第31集 [1080p].mkv") == K("甲剧 第31集 [2160p].mkv") == "甲剧|e031|.mkv"
+    assert K(dv) == K(nov) == "s01e031", (K(dv), K(nov))
+    assert K("Show.S01E31.2160p.DV.mkv") == K("Show.S01E31.2160p.mkv") == "s01e031"
+    assert K("甲剧 第31集 [1080p].mkv") == K("甲剧 第31集 [2160p].mkv") == "e031"
 
     assert K(dv) != K(dv.replace("E31", "E32")), "不同集不该算同一集"
-    assert K(dv) != K(dv.replace("甲剧", "别的剧")), "不同剧不该算同一集"
-    assert K(dv) != K(dv.replace(".mkv", ".mp4")), "不同扩展名不该算同一集"
+    assert K(dv) == K(dv.replace(".mkv", ".mp4")) == K("Show.S01E31.ts"), "扩展名不参与：mkv/mp4/ts 同一集"
+    assert K("S01E01.mkv") == K("s01e01.mp4") == K("Show.Name.s01.e01.1080p.avi")
+    assert K("Show S01E01.mkv") != K("Show S02E01.mkv"), "不同季不同集"
+
+    # 其它写法
+    assert K("Show 1x05.mkv") == K("Show.S01E05.mp4") == "s01e005"
+    assert K("Show Season 2 Episode 3.mkv") == "s02e003"
+    assert K("某剧 第二季 第十二集.mkv") == "s02e012" and K("某剧 第12集.mkv") == "e012"
+    assert K("Show EP05.mp4") == "e005" and K("Show S02 EP05.mp4") == "s02e005"
+    assert K("[ANi] Show - 05 [1080p].mp4") == K("[Other] Show - 05v2 [720p].mkv") == "e005"
+    assert K("Show.S01E01-E02.mkv") == "s01e001-e002" != K("Show.S01E01.mkv"), "多集区间单独成键，不与单集混"
+    assert K("Show S01E01-1080p.mkv") == "s01e001", "后面跟分辨率不是多集区间"
+    assert K("Show 1920x1080.mkv") is None and K("Movie (2012).mkv") is None
+    assert K("Movie - 2012.mkv") is None, "4 位年份不是集号"
 
     assert K("甲剧 (2026) [tmdbid=100001] S01E31 [2160p].nfo") is None, "非视频不参与"
     assert K("甲剧 (2026) [tmdbid=100001] [2160p WEB-DL].mkv") is None, "认不出季集就一律不动"
     assert K("") is None
-    PASS.append("[17] 同集归一化：带不带 DV 判成同一集；不同集/剧/扩展名能区分；"
-                "非视频与认不出季集的都不参与")
+
+    # 剧名兼容（auto）：同一文件夹多部剧时，A 剧的 S01E01 不是 B 剧的 S01E01
+    P = epmod.parse_episode
+    try:
+        epmod.set_title_match("auto")
+        assert epmod.titles_compatible(P("甲剧 (2026) S01E01.mkv"), P("甲剧.S01E01.HDR.mp4"))
+        assert epmod.titles_compatible(P("Show Name S01E01.mkv"), P("show.name.2026.S01E01.mp4"))
+        assert epmod.titles_compatible(P("S01E01.mkv"), P("Show S01E01.mp4")), "一方没剧名按同剧"
+        assert not epmod.titles_compatible(P("Alpha S01E01.mkv"), P("Beta S01E01.mkv"))
+        assert not epmod.titles_compatible(P("狂飙 S01E01.mkv"), P("甲剧 S01E01.mkv"))
+        assert epmod.titles_compatible(P("Alpha S01E01.mkv"), P("Beta S01E01.mkv"), "ignore")
+        assert not epmod.titles_compatible(P("Show Name S01E01.mkv"), P("Show S01E01.mkv"), "same")
+        groups = epmod.group_same_episode([(1, "Alpha S01E01.mkv"), (2, "Beta S01E01.mkv"),
+                                           (3, "alpha.S01E01.mp4"), (4, "Beta S01E02.mkv")])
+        assert groups == [[1, 3]], groups
+    finally:
+        epmod.set_title_match("auto")
+    assert epmod.cn_to_int("十二") == 12 and epmod.cn_to_int("二十") == 20 and epmod.cn_to_int("一百零五") == 105
+    PASS.append("[17] 同集归一化：画质标签与扩展名都不参与（S01E01 mkv/mp4/ts 同一集）；认得 1x01 / Season N Episode M / "
+                "EP01 / 第十二集 / 动漫「 - 05 」；多集区间单独成键；年份/分辨率不误判；auto 下多部剧同集号不混")
 
 
 async def case_cleanup_previous_versions():
@@ -1252,6 +1284,11 @@ def case_config_roundtrip():
 
     # 2) 打开开关 → 内存命中 → form_payload 回 true（面板重新渲染不回弹）
     cfg = copy.deepcopy(cfgmod.DEFAULTS)
+    # 洗板默认开（核心需求），开关保留；仅记录模式默认关；剧名判断默认 auto
+    assert cfg["upload"]["cleanup_previous_versions"] is True
+    assert cfg["upload"]["cleanup_dry_run"] is False and cfg["upload"]["cleanup_title_match"] == "auto"
+    cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": False})
+    assert cfg["upload"]["cleanup_previous_versions"] is False
     res = cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": True,
                                     "upload.cleanup_max_delete": 5})
     assert "upload.cleanup_previous_versions" in res["changed"], res
@@ -1283,6 +1320,7 @@ def case_config_roundtrip():
         cfgmod.CONFIG_PATH = Path(tmp) / "config.yaml"
         try:
             cfg2 = copy.deepcopy(cfgmod.DEFAULTS)
+            cfgmod.apply_values(cfg2, {"upload.cleanup_previous_versions": False})
             cfgmod.apply_values(cfg2, {"upload.cleanup_previous_versions": True})
             cfgmod.save(cfg2)
             text = cfgmod.CONFIG_PATH.read_text(encoding="utf-8")
@@ -2626,6 +2664,9 @@ async def case_same_episode_no_mutual_delete():
 
         p1 = write_file(src, f"{rel_dir}/{dv}", 3 * 1024 * 1024)
         p2 = write_file(src, f"{rel_dir}/{nov}", 3 * 1024 * 1024)
+        now = time.time()
+        os.utime(p1, (now - 600, now - 600))          # DV 版是先下载的（旧）
+        os.utime(p2, (now, now))                       # 无 DV 版后下载（新）
         scanner.scan_once(store, cfg)
         scanner.scan_once(store, cfg)
 
@@ -2633,10 +2674,11 @@ async def case_same_episode_no_mutual_delete():
         rec2 = await drive(up, store, p2)
         assert rec1["status"] == "已上传" and rec2["status"] == "已上传", \
             (rec1["status"], rec2["status"])
-        # 两个都在本地 → 都是正当版本 → 谁都不该被当旧版删掉
-        assert gone == [], f"同集两个都在本地时不该删任何东西：{gone}"
+        # 洗板「只留最新」：两个都在本地时按本地下载时间裁决 —— 旧的 DV 版被清、新的留下；
+        # 裁决是确定性的（永远不删最新那条），所以两个版本不可能互删到云端一个不剩
+        assert gone == [f"stub-{p1}"], f"应只清掉先下载的那个版本：{gone}"
         combined = (rec1.get("message") or "") + (rec2.get("message") or "")
-        assert "同集旧版本已清" not in combined, combined
+        assert "同集旧版本已清" in combined, combined
 
         # _same_episode_keeps 的判据：本地在 → 保护
         _fids, names = up._same_episode_keeps(cloud_dir, p2)
@@ -3148,7 +3190,7 @@ async def case_cloud_only_episode_cleanup():
            "n": "甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv",
            "s": 1286794717, "te": "1789985493", "tp": "1789985493", "tu": "1789985493",
            "t": "2026-09-21 18:11", "pc": "abcd0demo0pick003", "ico": "mkv"}
-    assert p115.episode_key(HDR["n"]) == p115.episode_key(PLN["n"]) == "甲剧 (2026)|s01e033|.mkv"
+    assert p115.episode_key(HDR["n"]) == p115.episode_key(PLN["n"]) == "s01e033"
 
     # ---- A) 时间字段解析（真机字段值逐字）----
     assert p115.P115.cloud_ts(HDR) == 1789989329.0
@@ -3206,7 +3248,7 @@ async def case_cloud_only_episode_cleanup():
     c3 = _Cloud([PLN, HDR])
     r3 = await mgr_of(c3).cleanup_episode_newest(700, PLN["n"], 3, keep_fid=PLN["pc"])
     assert len(c3.f) == 2, f"该让位不动手，实际删了：{names(c3)}"
-    assert "不是云端最新" in r3["note"], r3
+    assert "不是最新" in r3["note"], r3
 
     # ---- E) 无时间字段（测试替身那种）→ 保守不动手 + 可见 note ----
     c4 = _Cloud([{"fid": "1", "n": PLN["n"], "s": 1, "ico": "mkv"},
@@ -3279,12 +3321,17 @@ async def case_cloud_only_episode_cleanup():
         # ---- J) 名字对不上时必须给出**可见** note（不能静默「没有旧版本」）----
         rt2 = _RT([PLN, HDR])
         up.mgr = rt2
-        p_odd = os.path.join(src, "TVs/Drama", "甲剧.S01E33.HDR.mkv")   # 剧名段与云端不同
+        p_odd = os.path.join(src, "TVs/Drama", "Other.Show.S01E33.HDR.mkv")   # 剧名与云端不兼容
         store.add(p_odd, 1, 1.0)
         store.set(p_odd, status="已上传", target_dir=cloud_dir, file_id="x", source_deleted=1)
-        r_odd = await rt2.cleanup_episode_newest(700, "甲剧.S01E33.HDR.mkv", 3, keep_fid="x")
-        assert len(rt2.f) == 2, "名字对不上时不该动手"
-        assert "对不上" in r_odd["note"], f"名字对不上必须可见：{r_odd}"
+        r_odd = await rt2.cleanup_episode_newest(700, "Other.Show.S01E33.HDR.mkv", 3, keep_fid="x")
+        assert len(rt2.f) == 2, "剧名对不上时不该动手"
+        assert "剧名" in r_odd["note"] and "cleanup_title_match" in r_odd["note"], \
+            f"剧名对不上必须可见：{r_odd}"
+        # 剧名只是写法不同（点分 vs 带年份/标签）= 同一部剧，照常清理
+        rt3 = _RT([PLN, HDR])
+        r_ok = await rt3.cleanup_episode_newest(700, "甲剧.S01E33.HDR.mkv", 3, keep_fid=HDR["pc"])
+        assert list(rt3.f) == [HDR["fid"]] and r_ok["deleted"] == [PLN["n"]], r_ok
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -4899,8 +4946,6 @@ async def case_core_rapid_only_contract():
     """[73] 核心契约 A/B 端到端：
     A 递归扫描 + 云端镜像本地文件夹结构；
     B 默认配置下秒传一直未命中 → 一直重试、永远不普通上传（连配置写空/写错、库里残留断点都不行）。"""
-    import uploader as upmod
-
     # ---- A：嵌套目录 → 云端目录镜像 ----
     cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, retry_interval=0, fail_first=0,
                                              mode="rapid_only")
@@ -4949,9 +4994,9 @@ async def case_core_rapid_only_contract():
             mp = {"n": 0}
             real_mp = mgr.multipart
 
-            async def spy(*a, **k):
-                mp["n"] += 1
-                return await real_mp(*a, **k)
+            async def spy(*a, _mp=mp, _real=real_mp, **k):
+                _mp["n"] += 1
+                return await _real(*a, **k)
 
             mgr.multipart = spy
             p = write_file(src, "剧/E01.mkv", 3 * 1024 * 1024)
@@ -4978,6 +5023,262 @@ async def case_core_rapid_only_contract():
     PASS.append("[73] 核心契约：嵌套目录 6 个文件秒传后云端目录与本地一一镜像；默认/空/写错的 upload.mode "
                 "下秒传一直未命中 → 重试 40 轮（超过 max_count/max_hours）仍是待重试、普通上传 0 次，"
                 "库里残留的「上传中+断点」也不续传；只有明确写 rapid_then_upload 才会真传")
+
+
+async def case_replace_newest_episode():
+    """[74] 洗板：同集（不论扩展名/名字）只留最新下载的那份 —— 端到端（mock 115：建目录/秒传/删除）。
+
+    S01E01.mkv 先下载、S01E01.mp4 后下载 → mp4 秒传成功后 mkv 被移进 115 回收站（本地文件不动）。
+    旧代码：扩展名在键里，mkv 与 mp4 不算同一集，什么都不会发生。"""
+    import uploader as upmod
+    from p115 import StubP115 as _Stub
+
+    class TsStub(_Stub):
+        """在 dry-run 替身上加：云端条目带上传时间 te、删除可见、删掉的不再出现在列表里。"""
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.te: dict[str, int] = {}
+            self.gone: list[str] = []
+
+        async def list_dir(self, pid, use_cache=True):
+            rows = await super().list_dir(pid, use_cache)
+            out = []
+            for r in rows:
+                if r["fid"] in self.gone:
+                    continue
+                r = dict(r)
+                if r["n"] in self.te:
+                    r["te"] = self.te[r["n"]]
+                out.append(r)
+            return out
+
+        async def delete_file(self, file_id):
+            self.gone.append(file_id)
+            return True
+
+    def env(**up_cfg):
+        cfg, store, _m, _u, tmp, src = make_env(mode="rapid_only", fail_first=0)
+        cfg["upload"].update(up_cfg)
+        mgr = TsStub(cfg, store, fail_first=0)
+        return cfg, store, mgr, Uploader(cfg, store, mgr), tmp, src
+
+    now = time.time()
+    D = "剧/Season 1"
+    OLD, NEW = "Show.S01E01.1080p.BluRay.mkv", "Show.S01E01.2160p.WEB-DL.mp4"
+
+    # ---- 默认配置：洗板开着（核心需求默认生效）----
+    assert cfgmod.DEFAULTS["upload"]["cleanup_previous_versions"] is True
+
+    # ---- S1：mkv 先、mp4 后 → mp4 就位后 mkv 进回收站；本地文件不动；面板有记录 ----
+    _SHARED = upmod._SHARED
+    _SHARED["replaced"].clear()
+    cfg, store, mgr, up, tmp, src = env()
+    try:
+        p_old = write_file(src, f"{D}/{OLD}", 2 * 1024 * 1024)
+        p_new = write_file(src, f"{D}/{NEW}", 3 * 1024 * 1024)
+        os.utime(p_old, (now - 3600, now - 3600))
+        os.utime(p_new, (now, now))
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        r_old = await drive(up, store, p_old)
+        assert r_old["status"] == "已上传" and mgr.gone == [], "新版还没传，旧版不能动"
+        r_new = await drive(up, store, p_new)
+        assert r_new["status"] == "已上传"
+        assert mgr.gone == [f"stub-{p_old}"], f"mkv 应被替换掉：{mgr.gone}"
+        assert os.path.exists(p_old) and os.path.exists(p_new), "本地文件一个都不能删"
+        ev = list(_SHARED["replaced"])
+        assert len(ev) == 1 and ev[0]["kept"] == NEW and ev[0]["removed"] == [OLD] \
+            and ev[0]["basis"] == "本地下载时间" and ev[0]["dry"] is False, ev
+        import webui
+        assert webui._replacements()[0]["kept"] == NEW, "面板接口要带上洗板记录"
+        assert "洗板替换" in open(os.path.join(os.path.dirname(webui.__file__), "static", "app.js"),
+                                  encoding="utf-8").read()
+
+        # ---- S1b：关掉开关 → 什么都不删 ----
+        mgr.gone.clear()
+        cfg["upload"]["cleanup_previous_versions"] = False
+        up2 = Uploader(cfg, store, mgr)
+        await up2._cleanup_prev_versions("/UPILOT-mini/" + D, await mgr.ensure_pid("/UPILOT-mini/" + D), p_new)
+        assert mgr.gone == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- S2：老版本的秒传反而更晚命中（云端时间 mkv 更新）—— 仍然留后下载的 mp4 ----
+    cfg, store, mgr, up, tmp, src = env()
+    try:
+        p_old = write_file(src, f"{D}/{OLD}", 2 * 1024 * 1024)
+        p_new = write_file(src, f"{D}/{NEW}", 3 * 1024 * 1024)
+        os.utime(p_old, (now - 3600, now - 3600))
+        os.utime(p_new, (now, now))
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        mgr.te = {NEW: 1000, OLD: 2000}                 # 云端上传时间：mkv 更晚（会骗人）
+        await drive(up, store, p_new)
+        assert mgr.gone == []
+        await drive(up, store, p_old)                    # 老 mkv 后秒传上去
+        assert mgr.gone == [f"stub-{p_old}"], f"应删老 mkv、留后下载的 mp4：{mgr.gone}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- S3：对不上本地记录（别的工具传的）→ 退回云端上传时间，仍可用 ----
+    cfg, store, mgr, up, tmp, src = env()
+    try:
+        p_new = write_file(src, f"{D}/{NEW}", 3 * 1024 * 1024)
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        pid = await mgr.ensure_pid("/UPILOT-mini/" + D)
+        # 云端里有一条库里没有的同集旧文件（不在 DB）：用子类把它塞进列表
+        orig = mgr.list_dir
+
+        async def with_foreign(pid_, use_cache=True):
+            rows = await orig(pid_, use_cache)
+            return rows + [{"fid": "foreign-1", "n": "Show S01E01 老版本.mkv", "s": 777, "te": 500, "pc": "fp1"}]
+
+        mgr.list_dir = with_foreign
+        mgr.te = {NEW: 900}
+        await drive(up, store, p_new)
+        assert mgr.gone == ["foreign-1"], mgr.gone
+        assert pid
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- S4：新版还没上传成功 → 云端永远不会被清空；新版到了才删旧的 ----
+    cfg, store, mgr, up, tmp, src = env()
+    try:
+        A, B, C = "Show.S01E02.720p.mp4", "Show.S01E02.1080p.mkv", "Show.S01E02.2160p.mkv"
+        pa = write_file(src, f"{D}/{A}", 1 * 1024 * 1024)
+        pb = write_file(src, f"{D}/{B}", 2 * 1024 * 1024)
+        pc = write_file(src, f"{D}/{C}", 3 * 1024 * 1024)
+        for p_, age in ((pa, 7200), (pb, 3600), (pc, 0)):
+            os.utime(p_, (now - age, now - age))
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        await drive(up, store, pa)
+        await drive(up, store, pb)          # B 比 A 新 → A 被清，云端剩 B
+        assert mgr.gone == [f"stub-{pa}"], mgr.gone
+        remaining = [r["n"] for r in await mgr.list_dir(await mgr.ensure_pid("/UPILOT-mini/" + D))]
+        assert remaining == [B], remaining   # C 还没传：云端留着最近的 B，不会一条不剩
+        await drive(up, store, pc)
+        assert mgr.gone == [f"stub-{pa}", f"stub-{pb}"], mgr.gone
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- S5：仅记录模式 → 不删，只留日志/面板记录 ----
+    _SHARED["replaced"].clear()
+    cfg, store, mgr, up, tmp, src = env(cleanup_dry_run=True)
+    try:
+        p_old = write_file(src, f"{D}/{OLD}", 2 * 1024 * 1024)
+        p_new = write_file(src, f"{D}/{NEW}", 3 * 1024 * 1024)
+        os.utime(p_old, (now - 3600, now - 3600))
+        os.utime(p_new, (now, now))
+        scanner.scan_once(store, cfg)
+        scanner.scan_once(store, cfg)
+        await drive(up, store, p_old)
+        rec = await drive(up, store, p_new)
+        assert mgr.gone == [], "仅记录模式不许真删"
+        ev = list(_SHARED["replaced"])
+        assert len(ev) == 1 and ev[0]["dry"] is True and ev[0]["removed"] == [OLD], ev
+        assert "仅记录" in (rec.get("message") or ""), rec.get("message")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- S6：同文件夹里两部不同的剧同集号 —— auto 不动；ignore 才按季集号替换 ----
+    for mode, expect_gone in (("auto", 0), ("same", 0), ("ignore", 1)):
+        cfg, store, mgr, up, tmp, src = env(cleanup_title_match=mode)
+        try:
+            pa = write_file(src, "flat/Alpha.S01E01.mkv", 1 * 1024 * 1024)
+            pb = write_file(src, "flat/Beta.S01E01.mp4", 2 * 1024 * 1024)
+            os.utime(pa, (now - 3600, now - 3600))
+            os.utime(pb, (now, now))
+            scanner.scan_once(store, cfg)
+            scanner.scan_once(store, cfg)
+            await drive(up, store, pa)
+            await drive(up, store, pb)
+            assert len(mgr.gone) == expect_gone, (mode, mgr.gone)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    PASS.append("[74] 洗板只留最新：S01E01.mkv 先下载、S01E01.mp4 后下载 → mp4 秒传成功后 mkv 进回收站（本地文件不动、面板有记录）；"
+                "老版本秒传更晚命中也按本地下载时间留 mp4；库里对不上才退回云端上传时间；新版未传成功云端不会被清空；"
+                "仅记录模式不删；同文件夹两部剧同集号 auto/same 不动、ignore 才替换；默认开启、开关关了不删")
+
+
+async def case_sweep_local_order():
+    """[75] 巡检（每 5 分钟）：同集多条按本地下载时间判新旧（对不上才退回云端时间），
+    扩展名不同也算同集，仅记录模式不删，超过上限不动手。"""
+    import uploader as upmod
+
+    class _C:
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def fs_files(self, payload, async_=True):
+            return {"state": True, "data": [dict(r) for r in self.rows if not r.get("_gone")]}
+
+    class _M:
+        def __init__(self, rows):
+            self.rows = rows
+            self.client = _C(rows)
+            self.deleted: list[str] = []
+
+        async def cached_pid(self, td):
+            return 7999
+
+        async def delete_file(self, fid):
+            self.deleted.append(str(fid))
+            for r in self.rows:
+                if str(r["fid"]) == str(fid):
+                    r["_gone"] = True
+            return True
+
+    def rows():
+        return [{"fid": "f-mkv", "n": "Show S01E05 [1080p].mkv", "s": 100, "pc": "pc-mkv", "te": 2000},
+                {"fid": "f-mp4", "n": "Show.S01E05.WEB-DL.mp4", "s": 200, "pc": "pc-mp4", "te": 1000},
+                {"fid": "f-other", "n": "Show S01E06.mkv", "s": 300, "pc": "pc-6", "te": 1500}]
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-75-")
+    try:
+        cfg = copy.deepcopy(cfgmod.DEFAULTS)
+        cfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        cfg["paths"]["target_root"] = "/T"
+        st = Store(cfg["state"]["db"])
+        # 本地记录：mp4 是后下载的（mtime 更大），尽管云端上传时间 mkv 更晚
+        for name, size, pc, mt in (("Show S01E05 [1080p].mkv", 100, "pc-mkv", 1000.0),
+                                   ("Show.S01E05.WEB-DL.mp4", 200, "pc-mp4", 5000.0)):
+            pth = os.path.join(tmp, "src", name)
+            st.add(pth, size, mt)
+            st.set(pth, status="已上传", target_dir="/T/Show", file_id=pc, source_deleted=1)
+
+        # a) 本地时间裁决：删 mkv、留 mp4
+        m = _M(rows())
+        res = await Uploader(cfg, st, m).sweep_cloud_episode_duplicates()
+        assert m.deleted == ["f-mkv"] and res["removed"] == 1, (m.deleted, res)
+        ev = upmod._SHARED["replaced"][0]
+        assert ev["kept"] == "Show.S01E05.WEB-DL.mp4" and ev["basis"] == "本地下载时间", ev
+
+        # b) 仅记录
+        cfg["upload"]["cleanup_dry_run"] = True
+        m = _M(rows())
+        await Uploader(cfg, st, m).sweep_cloud_episode_duplicates()
+        assert m.deleted == [], m.deleted
+        cfg["upload"]["cleanup_dry_run"] = False
+
+        # c) 本地对不上（记录里没有 mp4）→ 云端上传时间：mkv 更晚 → 删 mp4
+        st2 = Store(os.path.join(tmp, "s2.db"))
+        m = _M(rows())
+        await Uploader(cfg, st2, m).sweep_cloud_episode_duplicates()
+        assert m.deleted == ["f-mp4"], m.deleted
+
+        # d) 超过 cleanup_max_delete → 不动手
+        cfg["upload"]["cleanup_max_delete"] = 1
+        many = rows() + [{"fid": "f-ts", "n": "Show S01E05 old.ts", "s": 1, "pc": "pc-ts", "te": 10}]
+        m = _M(many)
+        await Uploader(cfg, st2, m).sweep_cloud_episode_duplicates()
+        assert m.deleted == [], m.deleted
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    PASS.append("[75] 同集巡检：按本地下载时间判新旧（云端时间 mkv 更晚也留后下载的 mp4）、对不上退回云端时间、"
+                "不同扩展名算同集、仅记录不删、超上限不动手、其它集不碰")
 
 
 async def main():
@@ -5049,6 +5350,8 @@ async def main():
     await case_auth_failure_breaker()
     await case_state_backup()
     await case_core_rapid_only_contract()
+    await case_replace_newest_episode()
+    await case_sweep_local_order()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
