@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -41,6 +42,17 @@ CREATE INDEX IF NOT EXISTS idx_updated ON files(updated_at);
 -- 覆盖索引让这几条聚合只扫索引不回表：2 万条记录 5.1 → 3.0 ms/次（面板每 5 秒一次）。
 CREATE INDEX IF NOT EXISTS idx_stats ON files(status, size, upload_mode, retry_count);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+-- 洗板替换历史（面板「各季度情况」；进程一重启内存记录就没了，所以要落库）
+CREATE TABLE IF NOT EXISTS replacements(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at REAL NOT NULL,
+  dir TEXT NOT NULL DEFAULT '',
+  kept TEXT NOT NULL DEFAULT '',
+  removed TEXT NOT NULL DEFAULT '[]',
+  basis TEXT NOT NULL DEFAULT '',
+  dry INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_repl_at ON replacements(at DESC);
 """
 
 
@@ -315,6 +327,75 @@ class Store:
             )
             self.db.commit()
             return cur.rowcount
+
+    # ---------- 洗板记录 / 待重试分组 ----------
+
+    REPLACEMENT_KEEP = 200
+
+    def add_replacement(self, cloud_dir: str, kept: str, removed,
+                        basis: str, dry: bool, at: float | None = None) -> None:
+        """记一条洗板替换（旧的超出 REPLACEMENT_KEEP 条就删掉）。"""
+        now = time.time() if at is None else float(at)
+        payload = json.dumps(list(removed or []), ensure_ascii=False)
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO replacements(at, dir, kept, removed, basis, dry) VALUES(?,?,?,?,?,?)",
+                (now, str(cloud_dir or ""), str(kept or ""), payload,
+                 str(basis or ""), 1 if dry else 0),
+            )
+            extra = self.db.execute("SELECT COUNT(*) c FROM replacements").fetchone()["c"] - self.REPLACEMENT_KEEP
+            if extra > 0:
+                self.db.execute(
+                    "DELETE FROM replacements WHERE id IN ("
+                    "SELECT id FROM replacements ORDER BY at ASC, id ASC LIMIT ?)",
+                    (extra,),
+                )
+            self.db.commit()
+
+    def recent_replacements(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT at, dir, kept, removed, basis, dry FROM replacements"
+                " ORDER BY at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["removed"] = json.loads(item.get("removed") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                text = item.get("removed") or ""
+                item["removed"] = [text] if text else []
+            item["dry"] = bool(item.get("dry"))
+            out.append(item)
+        return out
+
+    def retry_pending(self) -> dict:
+        """待重试总数、已经到点的数量，以及按云端目录分组（面板「各季度情况」）。"""
+        now = time.time()
+        with self.lock:
+            total = self.db.execute(
+                "SELECT COUNT(*) c FROM files WHERE status='待重试'"
+            ).fetchone()["c"]
+            due = self.db.execute(
+                "SELECT COUNT(*) c FROM files WHERE status='待重试'"
+                " AND (next_retry_at IS NULL OR next_retry_at<=?)",
+                (now,),
+            ).fetchone()["c"]
+            rows = self.db.execute(
+                "SELECT COALESCE(target_dir,'') dir, COUNT(*) c,"
+                " SUM(CASE WHEN next_retry_at IS NULL OR next_retry_at<=? THEN 1 ELSE 0 END) due"
+                " FROM files WHERE status='待重试' GROUP BY dir"
+                " ORDER BY c DESC, dir LIMIT 50",
+                (now,),
+            ).fetchall()
+        return {
+            "total": int(total or 0),
+            "due": int(due or 0),
+            "by_dir": [{"dir": r["dir"], "count": int(r["c"]), "due": int(r["due"] or 0)}
+                       for r in rows],
+        }
 
     # ---------- cid 缓存 ----------
 

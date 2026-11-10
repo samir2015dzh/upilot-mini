@@ -988,9 +988,18 @@ class Uploader:
 
     def _record_replacement(self, cloud_dir: str, kept: str, removed: list[str],
                             basis: str, dry: bool) -> None:
-        """记一条洗板替换事件，面板「最近洗板替换」显示（内存里最近 30 条，完整历史看日志）。"""
-        _SHARED["replaced"].appendleft({"at": time.time(), "dir": cloud_dir, "kept": kept,
-                                        "removed": list(removed), "basis": basis, "dry": bool(dry)})
+        """记一条洗板替换事件，面板「最近洗板替换 / 各季度情况」显示。
+
+        内存里留最近 30 条（当前进程立刻能看）；同时写入状态库，容器重启后还能看到。
+        """
+        ev = {"at": time.time(), "dir": cloud_dir or "", "kept": kept,
+              "removed": list(removed), "basis": basis, "dry": bool(dry)}
+        _SHARED["replaced"].appendleft(ev)
+        try:
+            self.store.add_replacement(ev["dir"], ev["kept"], ev["removed"],
+                                       ev["basis"], ev["dry"], at=ev["at"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("洗板记录没写进库（重启后面板会少这一条）：%s", exc)
 
     async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
         """上传成功后：云端同一集只留**刚上传的那条**，其余移入 115 回收站。

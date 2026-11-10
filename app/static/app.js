@@ -67,6 +67,57 @@ function ring(pct) {
   $("#ring-val").textContent = Math.round(pct * 100) + "%";
 }
 
+
+function seasonLabel(dir) {
+  const parts = String(dir || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length >= 2) return parts[parts.length - 2] + " / " + parts[parts.length - 1];
+  return parts[parts.length - 1] || "未分类";
+}
+
+function renderSeasons(d) {
+  const box = $("#season-list");
+  if (!box) return;
+  const pending = d.retry_pending || {};
+  const byDir = {};
+  (pending.by_dir || []).forEach(row => {
+    const key = row.dir || "";
+    byDir[key] = {dir: key, count: row.count || 0, due: row.due || 0, reps: []};
+  });
+  (d.replacements || []).forEach(r => {
+    const key = r.dir || "";
+    if (!byDir[key]) byDir[key] = {dir: key, count: 0, due: 0, reps: []};
+    if (byDir[key].reps.length < 3) byDir[key].reps.push(r);
+  });
+  const rows = Object.values(byDir).sort((a, b) => (b.count - a.count) || (b.reps.length - a.reps.length) || a.dir.localeCompare(b.dir));
+  if (!rows.length) {
+    const total = pending.total || 0;
+    box.innerHTML = total
+      ? `<div class="empty">有 ${total} 个文件在等秒传，但还没对上季度目录</div>`
+      : '<div class="empty">还没有待重试或洗板记录</div>';
+    return;
+  }
+  const head = (pending.total || 0)
+    ? `<div class="sub" style="margin-bottom:8px">待重试 ${pending.total} 个${pending.due ? "，其中 " + pending.due + " 个到点了" : ""}</div>`
+    : "";
+  box.innerHTML = head + rows.map(row => {
+    const wait = row.count
+      ? (row.due ? `待重试 ${row.count} 个，其中 ${row.due} 个到点了` : `待重试 ${row.count} 个`)
+      : "没有待重试";
+    const reps = row.reps.map(r => {
+      const gone = (r.removed || []).map(esc).join("、");
+      const when = fmtAgo(r.at);
+      return r.dry
+        ? `仅记录 ${when}：留 ${esc(r.kept)}，本该删 ${gone}`
+        : `洗板 ${when}：留 ${esc(r.kept)}，旧版 ${gone} 已进回收站`;
+    }).map(s => `<div class="rep">${s}</div>`).join("");
+    return `<div class="season">
+      <div class="lab" title="${esc(row.dir)}">${esc(seasonLabel(row.dir))}</div>
+      <div class="sub">${wait}</div>
+      ${reps}
+    </div>`;
+  }).join("");
+}
+
 function renderOverview(d) {
   if (!d || !d.stats) return;
   S.overview = d; S.paused = !!d.paused;
@@ -151,6 +202,7 @@ function renderOverview(d) {
       : `<div class="hint" title="判据：${esc(r.basis)}">洗板替换 ${fmtAgo(r.at)}：留 ${esc(r.kept)}，旧版 ${gone} 已进回收站</div>`);
   });
   $("#hints").innerHTML = hints.join("");
+  renderSeasons(d);
 
   const rec = d.recent || [];
   $("#recent-body").innerHTML = rec.length ? rec.map(f => {

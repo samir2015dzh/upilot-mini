@@ -341,8 +341,22 @@ def _rate_limited_status() -> dict | None:
         return None
 
 
-def _replacements() -> list[dict]:
-    """最近的洗板替换记录（uploader 里记的，最新在前）；取不到就当没有。"""
+def _retry_pending(store) -> dict:
+    try:
+        return store.retry_pending()
+    except Exception:  # noqa: BLE001
+        return {"total": 0, "due": 0, "by_dir": []}
+
+
+def _replacements(store=None) -> list[dict]:
+    """最近的洗板替换记录，最新在前。优先读状态库（重启后还在），读不到再退回内存。"""
+    if store is not None:
+        try:
+            rows = store.recent_replacements(50)
+            if rows:
+                return rows
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from uploader import _SHARED
         return list(_SHARED["replaced"])
@@ -360,7 +374,8 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "paused": bool(state.get("paused")),
         "auth_failed": _auth_failed(),
         "rate_limited": _rate_limited_status(),
-        "replacements": _replacements(),
+        "replacements": _replacements(store),
+        "retry_pending": _retry_pending(store),
         "scan_rounds": state.get("scan_rounds", 0),
         "last_scan": state.get("last_scan"),
         "server_time": time.time(),
