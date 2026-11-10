@@ -5597,6 +5597,79 @@ async def case_rate_limit_breaker():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+async def case_season_panel_history():
+    """[80] 洗板记录落库（重启后还在）、按季度分组，面板能看到每个季度的待重试数量。"""
+    import json
+    import uploader as upmod
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-80-")
+    try:
+        db = os.path.join(tmp, "s.db")
+        st = Store(db)
+        d1 = "/TVs/乙剧样例 (2026) [tmdbid=100002]/Season 01"
+        d2 = "/TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
+        st.add_replacement(d1, "E19.2160p.mkv", ["E19.1080p.mkv"], "本地下载时间", False, at=1000)
+        st.add_replacement(d1, "E18.mkv", ["E18.old.mkv"], "本地下载时间", True, at=900)
+        st.add_replacement(d2, "S01E01.mp4", ["S01E01.mkv"], "云端上传时间", False, at=800)
+        # 重启 = 重新打开同一个库，内存里什么都没有
+        st2 = Store(db)
+        rows = st2.recent_replacements(10)
+        assert len(rows) == 3 and rows[0]["kept"] == "E19.2160p.mkv", rows
+        assert rows[0]["removed"] == ["E19.1080p.mkv"] and rows[0]["dry"] is False
+        assert rows[1]["dry"] is True
+        # 只留最近 200 条
+        for i in range(210):
+            st2.add_replacement("/T/Show/Season 02", f"keep-{i}", [f"old-{i}"], "本地下载时间", False, at=2000 + i)
+        left = st2.recent_replacements(300)
+        assert len(left) == 200, len(left)
+        assert left[0]["kept"] == "keep-209" and left[-1]["kept"] == "keep-10", (left[0]["kept"], left[-1]["kept"])
+
+        # 待重试按目录分组：一个已到期，一个还在等
+        now = time.time()
+        p_due = os.path.join(tmp, "due.mkv")
+        p_wait = os.path.join(tmp, "wait.mkv")
+        p_other = os.path.join(tmp, "other.mkv")
+        st3 = Store(os.path.join(tmp, "s3.db"))
+        for path, size in ((p_due, 1), (p_wait, 2), (p_other, 3)):
+            st3.add(path, size, 1.0)
+        st3.set(p_due, status="待重试", target_dir=d1, next_retry_at=now - 10, retry_count=2)
+        st3.set(p_wait, status="待重试", target_dir=d1, next_retry_at=now + 3600, retry_count=3)
+        st3.set(p_other, status="待重试", target_dir=d2, next_retry_at=now - 1, retry_count=1)
+        pend = st3.retry_pending()
+        assert pend["total"] == 3 and pend["due"] == 2, pend
+        by = {r["dir"]: r for r in pend["by_dir"]}
+        assert by[d1]["count"] == 2 and by[d1]["due"] == 1, by
+        assert by[d2]["count"] == 1 and by[d2]["due"] == 1, by
+
+        # Uploader 写入后，模拟重启：内存清空，面板接口仍能从库里读到
+        cfg, store, mgr, up, tmp2, src = make_env(mode="rapid_only", fail_first=0)
+        try:
+            up._record_replacement(d1, "Show.S01E19.2160p.mkv",
+                                   ["Show.S01E19.1080p.mkv"], "本地下载时间", False)
+            assert store.recent_replacements(1)[0]["kept"] == "Show.S01E19.2160p.mkv"
+            upmod._SHARED["replaced"].clear()
+            payload = webui._payload(cfg, store, {})
+            ev = payload["replacements"]
+            assert ev and ev[0]["kept"] == "Show.S01E19.2160p.mkv", ev
+            assert ev[0]["basis"] == "本地下载时间" and ev[0]["dir"] == d1
+            assert "retry_pending" in payload
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        html = open(os.path.join(APP, "static", "index.html"), encoding="utf-8").read()
+        js = open(os.path.join(APP, "static", "app.js"), encoding="utf-8").read()
+        css = open(os.path.join(APP, "static", "app.css"), encoding="utf-8").read()
+        assert 'id="season-list"' in html and "各季度情况" in html
+        assert "renderSeasons" in js and "seasonLabel" in js and "retry_pending" in js
+        assert ".season{" in css
+        assert "infinite" not in css and "backdrop-filter" not in css
+        PASS.append("[80] 洗板记录落库：重启后面板仍能看到；只留最近 200 条；待重试按季度目录分组"
+                    "（到期/未到期分得清）；概览新增「各季度情况」，无动画/模糊")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -5672,6 +5745,7 @@ async def main():
     case_hint_tone()
     await case_delete_after_keeps_local_mtime()
     await case_rate_limit_breaker()
+    await case_season_panel_history()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]
