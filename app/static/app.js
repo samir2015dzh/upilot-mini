@@ -134,7 +134,7 @@ function renderOverview(d) {
   $("#queue-list").innerHTML = ["待处理", "待秒传", "待重试", "待上传", "错误"]
     .map(k => `<div class="kv"><span>${k}</span><span>${q[k] || 0} 个</span></div>`).join("");
   const hints = [];
-  if (d.auth_failed) hints.push(`<div class="hint err">115 登录失效（cookie 过期或被踢下线）：已暂停向 115 发请求，不计入重试次数。请到「设置 → 115 账号」更新 cookie，更新后自动继续</div>`);
+  if (d.auth_failed) hints.push(`<div class="hint err">115 登录失效：已暂停向 115 发请求（不算重试）。到「设置 → 115 账号」换新 cookie 就会自动继续</div>`);
   if (S.paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务（在途任务会跑完），点「恢复调度」继续</div>');
   if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
   if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「任务明细」，可点「失败项重新入队」重试</div>`);
@@ -143,8 +143,8 @@ function renderOverview(d) {
   (d.replacements || []).slice(0, 5).forEach(r => {
     const gone = (r.removed || []).map(esc).join("、");
     hints.push(r.dry
-      ? `<div class="hint warn">洗板（仅记录，未删）${fmtAgo(r.at)}：最新是 ${esc(r.kept)}；本该清掉 ${gone}（${esc(r.basis)}）</div>`
-      : `<div class="hint">洗板替换 ${fmtAgo(r.at)}：保留最新的 ${esc(r.kept)}；旧版 ${gone} 已移入 115 回收站（${esc(r.basis)}）</div>`);
+      ? `<div class="hint warn" title="判据：${esc(r.basis)}">洗板（仅记录）${fmtAgo(r.at)}：留 ${esc(r.kept)}，本该删 ${gone}</div>`
+      : `<div class="hint" title="判据：${esc(r.basis)}">洗板替换 ${fmtAgo(r.at)}：留 ${esc(r.kept)}，旧版 ${gone} 已进回收站</div>`);
   });
   $("#hints").innerHTML = hints.join("");
 
