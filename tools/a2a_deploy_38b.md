@@ -39,7 +39,7 @@ async def main():
     r2=await mgr(c2).cleanup_previous(700, A, 3*1024*1024, 9, keep_fid=\"111\", keep_names=[B])
     print(\"NAME-ONLY-KEPT\" if r2[\"deleted\"]==[] else \"NAME-ONLY-FAIL\", r2[\"deleted\"])
 
-    # 洗板核心行为不变：非本地的同集旧版仍必须被清
+    # 洗版核心行为不变：非本地的同集旧版仍必须被清
     c3=Cloud(); c3.add(\"111\", A, 3*1024*1024); c3.add(\"333\", \"Show.S01E09.1080p.mkv\", 7*1024*1024)
     r3=await mgr(c3).cleanup_previous(700, A, 3*1024*1024, 9, keep_fid=\"111\")
     left3=sorted(x[\"n\"] for x in c3.snap())

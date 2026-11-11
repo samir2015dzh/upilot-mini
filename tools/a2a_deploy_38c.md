@@ -42,7 +42,7 @@ print(\"CASE1 source_deleted=1 (被程序收尾删) -> protect-A:\", A in n1, \"
 
 st.set(pa, source_deleted=0)
 f2, n2 = up._same_episode_keeps(\"/TVs/Drama\", pb)
-print(\"CASE2 source_deleted=0 (洗板换掉)     -> protect-A:\", A in n2, \"| names=\", n2)
+print(\"CASE2 source_deleted=0 (洗版换掉)     -> protect-A:\", A in n2, \"| names=\", n2)
 
 print(\"EXPECT-NEW: CASE1=True CASE2=False\")
 import inspect

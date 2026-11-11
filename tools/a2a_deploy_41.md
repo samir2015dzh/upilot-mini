@@ -62,7 +62,7 @@ async def main():
     print("CASE4 no-id-guard    :", "KEPT-BOTH" if sorted(c4.f) == ["111", "222"] else "BAD",
           "| note-visible=", ("同名" in (r4.get("note") or "")))
 
-    # ⑤ 洗板核心行为不变：不同名同集旧版照清
+    # ⑤ 洗版核心行为不变：不同名同集旧版照清
     OTHER = "\u7532\u5267 (2026) [tmdbid=100001] S01E33 [1080p WEB-DL].mkv"
     c5 = Cloud([("111", FULL, 3*MB), ("333", OTHER, 7*MB)])
     r5 = await mgr(c5).cleanup_previous(700, FULL, 3*MB, 9, keep_fid="111", keep_fids=[], keep_names=[])
@@ -79,7 +79,7 @@ PYEOF
 6) 正常接口 + 日志 + 文件指纹：
 curl -s --noproxy '*' http://127.0.0.1:9844/health; echo
 docker logs --tail 8 upilot-mini 2>&1
-docker logs --since 10m upilot-mini 2>&1 | grep -ciE "traceback|异常|洗板清理出错" || echo 0
+docker logs --since 10m upilot-mini 2>&1 | grep -ciE "traceback|异常|洗版清理出错" || echo 0
 docker exec upilot-mini sh -c 'md5sum /config/config.yaml; cat /config/.http_port; echo; ls -l /config/state.db'
 
 补充（可选、只读）：把运行容器里 `/app/app/p115.py` 的 md5 打出来，并用旧 tag（上一步打的那个 `pre-runbook15-*`）离线起一个容器，把**第 5 步这段字节**原样跑一遍做对照。预期旧 tag：`has-explicit_names: False`、CASE1/CASE2/CASE3 全部 `STILL-DUP`（这就是用户报障时生产上的行为）。此条用于证明「跑的确实是新代码」，不做也不影响。
