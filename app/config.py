@@ -111,7 +111,7 @@ DEFAULTS: dict = {
         "conflict_strategy": "overwrite",
         # 传完就删掉监控目录里的本地源文件（破坏性，默认关）
         "delete_after_upload": False,
-        # 洗板（重下同集不同版本）后，云端同一文件夹里同一集只留最新那份（旧的进 115 回收站，
+        # 洗版（重下同集不同版本）后，云端同一文件夹里同一集只留最新那份（旧的进 115 回收站，
         # 可恢复；本地文件从不删）。默认开。判「同一集」只看季集号（S01E01 / 1x01 / 第1集 / EP01…），
         # **扩展名不参与**：S01E01.mkv 和 S01E01.mp4 是同一集；画质/字幕组标签也不参与。
         # 「最新」= 后下载的那份（本地 mtime，其次首次入库时间），对不上本地记录才用云端上传时间。
@@ -564,10 +564,10 @@ FIELD_GROUPS: list[dict] = [
         {"key": "upload.delete_after_upload", "label": "完成后删除本地文件", "type": "bool",
          "danger_note": "删除后无法恢复，请确认下载器已不再需要该文件",
          "hint": "释放监控目录空间；只删文件，保留目录结构"},
-        {"key": "upload.cleanup_previous_versions", "label": "洗板时仅保留最新版本", "type": "bool",
+        {"key": "upload.cleanup_previous_versions", "label": "洗版时仅保留最新版本", "type": "bool",
          "danger_note": "会删除 115 上的旧文件（移入回收站，可恢复）",
          "hint": "同一集重新下载后，旧版本移入 115 回收站。文件名或格式不同也视为同一集"},
-        {"key": "upload.cleanup_dry_run", "label": "洗板演练模式", "type": "bool",
+        {"key": "upload.cleanup_dry_run", "label": "洗版演练模式", "type": "bool",
          "hint": "只在日志中记录将删除的文件，不实际删除，适合先观察一段时间"},
         {"key": "upload.cleanup_title_match", "label": "同剧判定方式", "type": "select",
          "options": [{"value": "auto", "label": "季集号相同且剧名相近（默认）"},
@@ -575,7 +575,7 @@ FIELD_GROUPS: list[dict] = [
                      {"value": "same", "label": "剧名须完全一致"}],
          "advanced": True,
          "hint": "新旧版本剧名差异较大（如中英文名）时可选「仅比对季集号」，前提是每个目录只放一部剧"},
-        {"key": "upload.cleanup_max_delete", "label": "单次洗板删除上限", "type": "int",
+        {"key": "upload.cleanup_max_delete", "label": "单次洗版删除上限", "type": "int",
          "unit": "个", "min": 1, "max": 50, "advanced": True,
          "hint": "待删旧版本超过该数量时整体跳过，防止误删。默认 3"},
         {"key": "upload.partsize_mb", "label": "分块大小", "type": "int", "unit": "MB", "min": 1, "max": 512,

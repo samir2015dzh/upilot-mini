@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_updated ON files(updated_at);
 -- 覆盖索引让这几条聚合只扫索引不回表：2 万条记录 5.1 → 3.0 ms/次（面板每 5 秒一次）。
 CREATE INDEX IF NOT EXISTS idx_stats ON files(status, size, upload_mode, retry_count);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
--- 洗板替换历史（面板「各季度情况」；进程一重启内存记录就没了，所以要落库）
+-- 洗版替换历史（面板「各季度情况」；进程一重启内存记录就没了，所以要落库）
 CREATE TABLE IF NOT EXISTS replacements(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at REAL NOT NULL,
@@ -248,7 +248,7 @@ class Store:
             return [dict(r) for r in self.db.execute(sql, args).fetchall()]
 
     def uploaded_records(self) -> list[dict]:
-        """所有「已上传」记录的几列（洗板判新旧用：本地 mtime / 首次入库时间 / 云端标识）。"""
+        """所有「已上传」记录的几列（洗版判新旧用：本地 mtime / 首次入库时间 / 云端标识）。"""
         with self.lock:
             return [dict(r) for r in self.db.execute(
                 "SELECT path, size, mtime, created_at, file_id, target_dir "
@@ -328,13 +328,13 @@ class Store:
             self.db.commit()
             return cur.rowcount
 
-    # ---------- 洗板记录 / 待重试分组 ----------
+    # ---------- 洗版记录 / 待重试分组 ----------
 
     REPLACEMENT_KEEP = 200
 
     def add_replacement(self, cloud_dir: str, kept: str, removed,
                         basis: str, dry: bool, at: float | None = None) -> None:
-        """记一条洗板替换（旧的超出 REPLACEMENT_KEEP 条就删掉）。"""
+        """记一条洗版替换（旧的超出 REPLACEMENT_KEEP 条就删掉）。"""
         now = time.time() if at is None else float(at)
         payload = json.dumps(list(removed or []), ensure_ascii=False)
         with self.lock:

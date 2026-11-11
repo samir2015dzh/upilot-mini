@@ -1,4 +1,4 @@
-"""从文件名里认「第几季第几集」，给洗板（同集只留最新一份）用。
+"""从文件名里认「第几季第几集」，给洗版（同集只留最新一份）用。
 
 体量刻意很小、不加任何依赖（guessit / PTN 动辄几千行、还带一堆我们用不上的字段）。
 正则从两个现成项目里挑出和「季集号」有关的几条，按本项目的需求改写：
@@ -105,7 +105,7 @@ _VER_NUM = re.compile(r"(?<![a-z])v(\d{1,2})(?![a-z0-9])")
 def version_score(name: str) -> int:
     """文件名里的修订标记：没有=0，v2=2，v3=3；PROPER/REPACK/RERIP/REAL 至少为 2。
 
-    洗板判新旧时，本地下载时间仍然优先；只有时间并列（或退回云端时间也并列）才用它。
+    洗版判新旧时，本地下载时间仍然优先；只有时间并列（或退回云端时间也并列）才用它。
     """
     stem, _ext = os.path.splitext(name or "")
     text = _normalize(stem)
@@ -158,7 +158,7 @@ def _clean_title(text: str) -> str:
 
 
 def parse_episode(name: str) -> Episode | None:
-    """认不出季集信息、或不是视频文件就返回 None（不参与洗板清理）。
+    """认不出季集信息、或不是视频文件就返回 None（不参与洗版清理）。
 
     >>> parse_episode("Show.Name.S01E02.1080p.WEB-DL.mkv").key
     's01e002'

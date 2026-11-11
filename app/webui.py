@@ -349,7 +349,7 @@ def _retry_pending(store) -> dict:
 
 
 def _replacements(store=None) -> list[dict]:
-    """最近的洗板替换记录，最新在前。优先读状态库（重启后还在），读不到再退回内存。"""
+    """最近的洗版替换记录，最新在前。优先读状态库（重启后还在），读不到再退回内存。"""
     if store is not None:
         try:
             rows = store.recent_replacements(50)
@@ -642,7 +642,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             if path == "/api/task":
                 one = store.get(parse_qs(query).get("path", [""])[0])
                 if not one:
-                    return self._json({"ok": False, "error": "没找到这个文件记录"}, 404)
+                    return self._json({"ok": False, "error": "未找到该文件记录"}, 404)
                 return self._json({"ok": True, "task": one})
             if path == "/api/logs":
                 try:
@@ -775,19 +775,19 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 target = str(body.get("path") or "")
                 action = str(body.get("action") or "")
                 if not target or not store.get(target):
-                    return self._json({"ok": False, "error": "没找到这个文件记录"}, 404)
+                    return self._json({"ok": False, "error": "未找到该文件记录"}, 404)
                 if action == "retry":
                     n = store.reset_one(target)
                     _wake(state)
-                    msg = "已重新排队，马上再试"
+                    msg = "已重新排队，即将处理"
                 elif action == "retry-now":
                     store.set(target, next_retry_at=0)
-                    n, msg = 1, "已提前到期，马上重试秒传"
+                    n, msg = 1, "已提前到期，即将重试秒传"
                     _wake(state)
                 elif action == "upload-now":
                     if (cfg["upload"].get("mode") or "") == "rapid_only":
                         store.set(target, next_retry_at=0)
-                        n, msg = 1, "纯秒传模式：立即重试秒传（不会普通上传）"
+                        n, msg = 1, "仅秒传模式：立即重试秒传，不会普通上传"
                     else:
                         n = store.mark_ready(target)
                         msg = "已跳过等待，立即处理"
@@ -797,27 +797,27 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                     _wake(state)
                 elif action == "delete":
                     n = store.forget(target)
-                    msg = "记录已删除（文件本体没动，下次扫描会重新入队）"
+                    msg = "记录已删除，文件未受影响，下次扫描时会重新入队"
                 else:
-                    return self._json({"ok": False, "error": f"不认识的动作：{action}"}, 400)
+                    return self._json({"ok": False, "error": f"不支持的操作：{action}"}, 400)
                 logger.info("界面操作 %s → %s", action, target)
                 return self._json({"ok": True, "affected": n, "message": msg})
             if path == "/api/scan":
                 _wake(state)
                 state["sweep_now"] = True       # 顺手核一遍云端同集重复（用户诉求：传完去校验）
-                return self._json({"ok": True, "action": "scan", "message": "已触发扫描 + 同集核对"})
+                return self._json({"ok": True, "action": "scan", "message": "已开始扫描和同集核对"})
             if path == "/api/sweep":
                 # 用户诉求（原话）：「上传到 115 以后校验 115 的那个文件夹里面有没有相同集数的视频」。
                 # 只读不改库的入口：立刻去云端核对同集重复，把旧版移入 115 回收站。
                 state["sweep_now"] = True
                 _wake(state)
                 return self._json({"ok": True, "action": "sweep",
-                                   "message": "已触发同集核对：云端同集只留最新那版"})
+                                   "message": "已开始同集核对，云端每集仅保留最新版"})
             if path == "/api/retry-now":
                 n = store.retry_now()
                 _wake(state)
                 return self._json({"ok": True, "action": "retry-now", "affected": n,
-                                   "message": f"{n} 个待重试文件已提前到期"})
+                                   "message": f"已提前 {n} 个待重试文件"})
             if path == "/api/requeue":
                 n = store.requeue()
                 # 只改 store 不动 state：主循环要睡满整个 interval 才会重新派发，
@@ -833,7 +833,7 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 _wake(state)
                 return self._json({
                     "ok": True, "action": path.rsplit("/", 1)[-1], "paused": state["paused"],
-                    "message": "已暂停调度（在途任务继续跑完）" if state["paused"] else "已恢复调度",
+                    "message": "已暂停调度，进行中的任务会继续完成" if state["paused"] else "已恢复调度",
                 })
             if path == "/logout":
                 return self._redirect("/login", extra={"Set-Cookie": self._cookie_header("", 0)})
