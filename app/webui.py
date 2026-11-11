@@ -764,14 +764,12 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
                 # 二是 scan.interval_seconds 变小之后，等待期还在按旧的长间隔睡。
                 _wake(state)
                 logger.info("界面保存配置：%s", ", ".join(result["changed"]) or "无变化")
-                tips = []
-                if result["reload"]:
-                    tips.append("115 客户端会立即重建")
-                if result["restart"]:
-                    tips.append("监听地址/端口或日志级别要重建容器才生效")
+                # 除 RESTART_KEYS 外都是写回内存即生效（reload 项顺带重建 115 客户端）
+                message = ("已保存；启用面板、监听地址、端口和日志级别需重启容器后生效"
+                           if result["restart"] else "已保存并生效")
                 return self._json({"ok": True, "changed": result["changed"],
                                    "reload": result["reload"], "restart": result["restart"],
-                                   "message": "已保存" + ("；" + "；".join(tips) if tips else "")})
+                                   "message": message})
             if path == "/api/task":
                 body = self._body_fields()
                 target = str(body.get("path") or "")

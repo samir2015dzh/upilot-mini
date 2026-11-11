@@ -547,7 +547,7 @@ class Uploader:
     def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
         """秒传命中 / 上传完成后，把通知丢到后台去发（不等它）。
 
-        对方收到通知后会先干活再回执，慢的时候十几秒；在这里等会把「同时处理几个文件」
+        对方收到通知后会先干活再回执，慢的时候十几秒；在这里等会把「并发数」
         的名额占住，后面的文件只能干等。通知失败不影响上传结果，所以后台跑就好。
         """
         if not self.notifier.ready or not self.notifier.should_fire(mode):

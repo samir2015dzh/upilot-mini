@@ -49,7 +49,7 @@ const S = {
   tab: "overview",
   auto: true, refreshMs: 5000, lastFetch: 0, paused: false, overview: null,
   tasks: { status: "全部", q: "", page: 1, limit: 50, total: 0, rows: [], current: null },
-  cfg: null,
+  cfg: null, cfgSnap: null, cfgDirty: 0,
   STATUSES: ["全部", "进行中", "待上传", "待重试", "已完成", "错误"],
 };
 const INTERVALS = [3000, 5000, 10000, 30000];
@@ -175,7 +175,8 @@ function switchTab(name) {
   }
   syncDock(name);
   if (name === "tasks") loadTasks();
-  if (name === "settings") loadConfig();
+  // 有未保存的修改时切回来不重新拉配置，免得把刚填的内容冲掉
+  if (name === "settings" && !S.cfgDirty) loadConfig();
 }
 
 /* ---------------- 概览 ---------------- */
@@ -587,13 +588,84 @@ function renderSettings(payload) {
     <div class="fg">
       <h3>${esc(g.title)}</h3>
       ${main.map(f => fieldHtml(f)).join("")}
-      ${adv.length ? `<details class="adv"><summary>高级设置（一般不用改）</summary>
+      ${adv.length ? `<details class="adv"><summary>高级选项</summary>
         ${adv.map(f => fieldHtml(f)).join("")}
       </details>` : ""}
     </div>`;
   }).join("");
   $("#cfg-path").textContent = payload.path || "/config/config.yaml";
   $("#settings-msg").innerHTML = "";
+  document.querySelectorAll("#settings-groups textarea[data-type=map]").forEach(checkMap);
+  S.cfgSnap = collectValues();
+  updateDirty();
+}
+
+/* ---- 未保存修改：和渲染时的快照逐项比对，改回原值就不算 ---- */
+function collectValues() {
+  const values = {}, clear = [];
+  const root = $("#settings-groups");
+  if (!root) return { values, clear };
+  root.querySelectorAll("[data-key]").forEach(el => {
+    const key = el.dataset.key, type = el.dataset.type;
+    if (type === "bool") values[key] = el.checked;
+    else if (el.classList.contains("dd")) values[key] = el.dataset.value;
+    else values[key] = el.value;
+  });
+  root.querySelectorAll("[data-clear]").forEach(el => { if (el.checked) clear.push(el.dataset.clear); });
+  return { values, clear };
+}
+
+function dirtyKeys() {
+  if (!S.cfgSnap) return [];
+  const now = collectValues(), was = S.cfgSnap.values;
+  const keys = Object.keys(now.values).filter(k => String(now.values[k]) !== String(was[k]));
+  return keys.concat(now.clear.filter(k => !keys.includes(k)));
+}
+
+function updateDirty() {
+  const keys = dirtyKeys();
+  S.cfgDirty = keys.length;
+  const root = $("#settings-groups");
+  if (root) root.querySelectorAll(".f").forEach(f => {
+    const el = f.querySelector("[data-key]");
+    f.classList.toggle("dirty", !!el && keys.includes(el.dataset.key));
+  });
+  [$("#btn-save-settings"), $("#btn-save-settings-bottom")].forEach(b => {
+    if (!b) return;
+    b.classList.toggle("dirty", keys.length > 0);
+    const n = b.querySelector(".n");
+    if (n) n.textContent = keys.length ? String(keys.length) : "";
+  });
+  const st = $("#save-state");
+  if (st) st.textContent = keys.length ? `${keys.length} 项修改未保存` : "所有修改已保存";
+}
+
+function fieldLabel(key) {
+  for (const g of (S.cfg && S.cfg.groups) || []) {
+    for (const f of g.fields || []) if (f.key === key) return f.label || key;
+  }
+  return key;
+}
+
+/* ---- 目录映射：按后端同样的规则即时检查，保存前就能看到哪一行有问题 ---- */
+function checkMap(ta) {
+  const out = ta.closest(".f").querySelector(".map-check");
+  if (!out) return;
+  const lines = ta.value.split(/\r?\n/);
+  let n = 0, err = "";
+  for (let i = 0; i < lines.length && !err; i++) {
+    const t = lines[i].trim();
+    if (!t || t.startsWith("#")) continue;
+    const sep = t.includes("=>") ? "=>" : (t.includes("->") ? "->" : "");
+    if (!sep) { err = `第 ${i + 1} 行缺少「=>」`; break; }
+    const at = t.indexOf(sep);
+    const src = t.slice(0, at).trim(), dst = t.slice(at + sep.length).trim();
+    if (!dst) { err = `第 ${i + 1} 行缺少 115 目录`; break; }
+    if (`${src}/${dst}`.split(/[\/\\]/).includes("..")) { err = `第 ${i + 1} 行不能包含 ..`; break; }
+    n++;
+  }
+  out.classList.toggle("err", !!err);
+  out.textContent = err || (n ? `${n} 条规则` : "暂无规则，全部按原目录结构上传");
 }
 
 /* 自定义下拉：原生 <select> 的弹层由系统绘制（Windows 上是白底），配上深色主题的浅色文字就看不清，
@@ -646,14 +718,16 @@ function ddInner(options, value) {
 
 function fieldHtml(f) {
   const key = esc(f.key), label = esc(f.label || f.key);
+  // 危险提示只在开关打开时出现：关着的时候它只是噪音
   const hint = (f.hint ? `<div class="hintline">${esc(f.hint)}</div>` : "")
     + (f.note ? `<div class="hintline note">${esc(f.note)}</div>` : "")
-    + (f.danger_note ? `<div class="hintline danger">⚠ ${esc(f.danger_note)}</div>` : "");
-  const tag = f.restart ? ' <span class="tag">需重建容器</span>' : "";
+    + (f.danger_note ? `<div class="hintline danger"${f.value ? "" : " hidden"}>${esc(f.danger_note)}</div>` : "");
+  const tag = f.restart ? ' <span class="tag" title="保存后需重启容器才生效">重启生效</span>' : "";
+  const ph = f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : "";
   if (f.type === "bool") {
-    return `<div class="f">
+    return `<div class="f f-bool">
       <label data-switch><span class="switch ${f.value ? "on" : ""}"><i></i></span>
-        ${label}${tag}<input type="checkbox" data-key="${key}" data-type="bool" ${f.value ? "checked" : ""} hidden></label>${hint}
+        <span>${label}${tag}</span><input type="checkbox" data-key="${key}" data-type="bool" ${f.value ? "checked" : ""} hidden></label>${hint}
     </div>`;
   }
   if (f.type === "select") {
@@ -663,7 +737,8 @@ function fieldHtml(f) {
   if (f.type === "map") {
     const rows = f.rows || 5;
     return `<div class="f wide"><label>${label}${tag}</label>
-      <textarea rows="${rows}" spellcheck="false" data-key="${key}" data-type="map" placeholder="TVs => /TVs&#10;Movies/Others => /Movies/Others&#10;Anime => /OtherAnime">${esc(f.value ?? "")}</textarea>${hint}</div>`;
+      <textarea rows="${rows}" spellcheck="false" data-key="${key}" data-type="map" placeholder="TVs => /TVs&#10;Movies/Anime => /Movies/Anime">${esc(f.value ?? "")}</textarea>
+      <div class="map-check" aria-live="polite"></div>${hint}</div>`;
   }
   if (f.type === "secret") {
     const state = f.set
@@ -671,34 +746,31 @@ function fieldHtml(f) {
       : '<span class="secret-state none">未设置</span>';
     return `<div class="f"><label>${label} ${state}</label>
       <div class="rowline">
-        <input type="password" data-key="${key}" data-type="secret" value="" placeholder="留空 = 不修改" autocomplete="new-password" />
-        <label class="clear"><input type="checkbox" data-clear="${key}" />清除</label>
+        <input type="password" data-key="${key}" data-type="secret" value="" placeholder="${f.set ? "留空则保持不变" : "未设置"}" autocomplete="new-password" />
+        ${f.set ? `<label class="clear"><input type="checkbox" data-clear="${key}" />清除</label>` : ""}
       </div>${hint}</div>`;
   }
   const type = f.type === "int" || f.type === "float" ? "number" : "text";
-  const extra = f.type === "float" ? ' step="0.1"' : "";
-  return `<div class="f"><label>${label}${tag}</label>
-    <input type="${type}"${extra} data-key="${key}" data-type="${esc(f.type)}" title="${esc(f.value ?? "")}" value="${esc(f.value ?? "")}" />${hint}</div>`;
+  let extra = f.type === "float" ? ' step="any"' : "";
+  if (f.min != null) extra += ` min="${esc(f.min)}"`;
+  if (f.max != null) extra += ` max="${esc(f.max)}"`;
+  if (type === "number") extra += ' inputmode="decimal"';
+  const input = `<input type="${type}"${extra}${ph} data-key="${key}" data-type="${esc(f.type)}" title="${esc(f.value ?? "")}" value="${esc(f.value ?? "")}" />`;
+  const ctl = f.unit ? `<div class="with-unit">${input}<span class="unit">${esc(f.unit)}</span></div>` : input;
+  return `<div class="f${f.inactive ? " inactive" : ""}"><label>${label}${tag}</label>${ctl}${hint}</div>`;
 }
 
 async function saveSettings() {
-  const values = {}, clear = [];
-  $("#settings-groups").querySelectorAll("[data-key]").forEach(el => {
-    const key = el.dataset.key, type = el.dataset.type;
-    if (type === "bool") values[key] = el.checked;
-    else if (el.classList.contains("dd")) values[key] = el.dataset.value;
-    else values[key] = el.value;
-  });
-  $("#settings-groups").querySelectorAll("[data-clear]").forEach(el => {
-    if (el.checked) clear.push(el.dataset.clear);
-  });
+  const { values, clear } = collectValues();
   const btns = [$("#btn-save-settings"), $("#btn-save-settings-bottom")];
   btns.forEach(b => setBusy(b, true));
   try {
     const j = await post("/api/config", { values, clear });
     const msg = j.message || "已保存";
-    $("#settings-msg").innerHTML = `<div class="hint ok">${esc(msg)}${j.changed?.length ? " · 变更：" + esc(j.changed.join(", ")) : " · 没有字段变化"}</div>`;
+    const names = (j.changed || []).map(fieldLabel);
+    $("#settings-msg").innerHTML = `<div class="hint ok">${esc(msg)}${names.length ? "：" + esc(names.join("、")) : "（没有修改）"}</div>`;
     toast(msg);
+    S.cfgDirty = 0;
     loadConfig();
     refreshOverview();
   } catch (e) {
@@ -782,10 +854,30 @@ function bind() {
   // 设置页
   $("#btn-save-settings").onclick = saveSettings;
   $("#btn-save-settings-bottom").onclick = saveSettings;
-  const reloadCfg = () => { loadConfig(); toast("已重新读取配置"); };
+  const reloadCfg = async () => {
+    if (S.cfgDirty && !(await askConfirm({
+      title: "放弃未保存的修改？",
+      body: `有 ${S.cfgDirty} 项修改还没保存，重新读取会以配置文件为准。`,
+      ok: "放弃并重新读取",
+    }))) return;
+    S.cfgDirty = 0;
+    loadConfig();
+    toast("已重新读取配置");
+  };
   $("#btn-reload-config").onclick = reloadCfg;
   $("#btn-reload-config-bottom").onclick = reloadCfg;
   $("#btn-refresh-logs").onclick = refreshLogs;
+  const groupsEl = $("#settings-groups");
+  groupsEl.addEventListener("input", (e) => {
+    if (e.target.matches("textarea[data-type=map]")) checkMap(e.target);
+    updateDirty();
+  });
+  groupsEl.addEventListener("change", updateDirty);
+  window.addEventListener("beforeunload", (e) => {
+    if (!S.cfgDirty) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
   document.addEventListener("click", (e) => {
     const opt = e.target.closest(".dd-opt");            // 选一项
     if (opt) {
@@ -796,6 +888,7 @@ function bind() {
       if (lb) lb.textContent = opt.dataset.label || "";
       dd.classList.remove("on");
       if (dd.id === "t-limit") { S.tasks.limit = Number(opt.dataset.value); S.tasks.page = 1; loadTasks(); }
+      if (dd.dataset.key) updateDirty();
       return;
     }
     const ddBtn = e.target.closest(".dd-btn");          // 开/关面板
@@ -818,6 +911,9 @@ function bind() {
       const on = !(box && box.checked);
       if (box) box.checked = on;
       if (sw) sw.classList.toggle("on", on);
+      const warn = swLabel.closest(".f").querySelector(".hintline.danger");
+      if (warn) warn.hidden = !on;
+      updateDirty();
     }
     const op = e.target.closest("button.primary");
     if (op) op.disabled = false;

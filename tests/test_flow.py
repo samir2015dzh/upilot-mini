@@ -5817,7 +5817,7 @@ def case_config_startup_validation():
         base = (f"paths:\n  source: {src_ok}\n"
                 f"p115:\n  cookie: UID=1; CID=2\n")
         msg = load_err(base + "scan:\n  interval_seconds: 不是数字\n")
-        assert "多久看一眼文件夹" in msg and "应该是数字" in msg, msg
+        assert "扫描间隔" in msg and "应该是数字" in msg, msg
         msg = load_err(base + "scan:\n  interval_seconds: 0\n")
         assert "至少是 1 秒" in msg, msg
         # 设置页下限是 2，但写 1 仍能启动（只警告）
