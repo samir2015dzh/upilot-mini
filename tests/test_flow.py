@@ -1165,7 +1165,7 @@ def case_episode_key():
 
 
 async def case_cleanup_previous_versions():
-    """[18] 洗板清理：新版传成功后云端同集旧版本进回收站；开关关着/不同集/超上限都不动。"""
+    """[18] 洗版清理：新版传成功后云端同集旧版本进回收站；开关关着/不同集/超上限都不动。"""
     dv_name = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL DV TX DemoWeb].mkv"
     nov_name = "甲剧 (2026) [tmdbid=100001] S01E31 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv"
     rel_dir = "TVs/甲剧 (2026) [tmdbid=100001]/Season 01"
@@ -1326,7 +1326,7 @@ async def case_cleanup_previous_versions():
         await asyncio.gather(shell.delete_file("1"), shell.delete_file("2"), shell.delete_file("3"))
         assert shell.client.peak == 1, f"fs_delete 被并发调用了（峰值 {shell.client.peak}）"
 
-        PASS.append("[18] 洗板清理：带 DV 的旧版进回收站并留痕；开关关着/不同集/非视频/"
+        PASS.append("[18] 洗版清理：带 DV 的旧版进回收站并留痕；开关关着/不同集/非视频/"
                     "别的剧都不动；同集旧版超过上限整体跳过；新版认不出季集也不猜；"
                     "list_dir 只收文件（文件夹条目滤掉）+ 走缓存；新版被改名时按 fid 或 "
                     "pickcode 排除；fs_delete 不并发（实例锁串行化）")
@@ -1369,7 +1369,7 @@ def case_config_roundtrip():
 
     # 2) 打开开关 → 内存命中 → form_payload 回 true（面板重新渲染不回弹）
     cfg = copy.deepcopy(cfgmod.DEFAULTS)
-    # 洗板默认开（核心需求），开关保留；仅记录模式默认关；剧名判断默认 auto
+    # 洗版默认开（核心需求），开关保留；仅记录模式默认关；剧名判断默认 auto
     assert cfg["upload"]["cleanup_previous_versions"] is True
     assert cfg["upload"]["cleanup_dry_run"] is False and cfg["upload"]["cleanup_title_match"] == "auto"
     cfgmod.apply_values(cfg, {"upload.cleanup_previous_versions": False})
@@ -1611,9 +1611,9 @@ async def case_all_states_recoverable():
 
 
 async def case_changed_file_not_lost():
-    """[24] 上传期间文件被替换（洗板重下）→ 按新内容重新入队，绝不丢。
+    """[24] 上传期间文件被替换（洗版重下）→ 按新内容重新入队，绝不丢。
 
-    MoviePilot 洗板重下会往**同一个路径**写新内容，而上传（尤其分块几 GB）要跑很久，
+    MoviePilot 洗版重下会往**同一个路径**写新内容，而上传（尤其分块几 GB）要跑很久，
     中间完全可能被换掉。这时 _process 手里还是旧 rec：
       - 照常写「已上传」→ 盖掉 scanner 刚做的重置 → 库里终态、云端旧、本地新，
         而终态让 scanner 与 dispatch 都不再碰它 → **新内容永远不会上传**；
@@ -1721,7 +1721,7 @@ async def case_changed_file_not_lost():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    PASS.append("[24] 上传期间文件被替换（洗板重下）不丢内容：forget_pid 连 SQLite 一起清"
+    PASS.append("[24] 上传期间文件被替换（洗版重下）不丢内容：forget_pid 连 SQLite 一起清"
                 "（10014 兜底不再空转）；秒传/分块两条路径都按新内容重新入队并不盖掉 scanner 的重置；"
                 "文件未变时不误判；_delete_source 要求 size 与 mtime 双匹配（拒绝误删同 size 的新文件）")
 
@@ -2525,7 +2525,7 @@ async def case_dir_paging_cursor():
     原实现是 `offset += page`（固定加**请求的** limit）。服务端有自己的单页上限时
     （很常见），这会把中间整段数据整段跳过：实测 2500 个文件、服务端每页只给 500 条时，
     请求序列 `(0,1150)(1150,1150)(2300,1150)` 只拿回 **1200** 条，**漏 1300 条**。
-    而 `list_dir` 正是洗板清理「找同集旧版」的唯一依据 —— 漏掉的旧版**永远清不掉**，
+    而 `list_dir` 正是洗版清理「找同集旧版」的唯一依据 —— 漏掉的旧版**永远清不掉**，
     且没有任何报错（判据：代码没抛错、日志干净、界面看不出）。
 
     本用例覆盖三层：
@@ -2671,7 +2671,7 @@ async def case_same_episode_no_mutual_delete():
 
     修复：`cleanup_previous()` 增加 `keep_fids` / `keep_names`，调用方
     （`Uploader._same_episode_keeps`）把「同集、仍在本地、且已上传成功」的其它版本传进来。
-    判据是「本地文件是否还在」：洗板时旧版本地已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理。
+    判据是「本地文件是否还在」：洗版时旧版本地已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理。
     """
     from p115 import P115 as _P115
 
@@ -2723,7 +2723,7 @@ async def case_same_episode_no_mutual_delete():
     assert r2["deleted"] == [], r2
     assert len(c2.snap()) == 2, c2.snap()
 
-    # ③ 洗板核心行为不变：非本地的同集旧版仍必须被清
+    # ③ 洗版核心行为不变：非本地的同集旧版仍必须被清
     c3 = _Cloud(); c3.add("111", dv); c3.add("333", "Show.S01E01.1080p.mkv")
     r3 = await mgr_of(c3).cleanup_previous(700, dv, 0, 9, keep_fid="111")
     assert r3["deleted"] == ["Show.S01E01.1080p.mkv"], r3
@@ -2759,7 +2759,7 @@ async def case_same_episode_no_mutual_delete():
         rec2 = await drive(up, store, p2)
         assert rec1["status"] == "已上传" and rec2["status"] == "已上传", \
             (rec1["status"], rec2["status"])
-        # 洗板「只留最新」：两个都在本地时按本地下载时间裁决 —— 旧的 DV 版被清、新的留下；
+        # 洗版「只留最新」：两个都在本地时按本地下载时间裁决 —— 旧的 DV 版被清、新的留下；
         # 裁决是确定性的（永远不删最新那条），所以两个版本不可能互删到云端一个不剩
         assert gone == [f"stub-{p1}"], f"应只清掉先下载的那个版本：{gone}"
         combined = (rec1.get("message") or "") + (rec2.get("message") or "")
@@ -2769,12 +2769,12 @@ async def case_same_episode_no_mutual_delete():
         _fids, names = up._same_episode_keeps(cloud_dir, p2)
         assert dv in names, f"另一版本仍在本地却没被保护：{names}"
 
-        # 本地删掉（模拟洗板旧版已被替换）→ 不再保护 ⇒ 照旧会被清理
+        # 本地删掉（模拟洗版旧版已被替换）→ 不再保护 ⇒ 照旧会被清理
         os.remove(p1)
         _fids2, names2 = up._same_episode_keeps(cloud_dir, p2)
-        assert dv not in names2, f"本地已删的旧版仍被保护（洗板会漏清）：{names2}"
+        assert dv not in names2, f"本地已删的旧版仍被保护（洗版会漏清）：{names2}"
 
-        # 洗板端到端：旧的同集记录（本地已不在）仍应被清
+        # 洗版端到端：旧的同集记录（本地已不在）仍应被清
         gone.clear()
         old_path = os.path.join(tmp, "Show.S01E01.1080p.mkv")      # 刻意不建文件
         store.add(old_path, 5 * 1024 * 1024, 1.0)
@@ -2789,14 +2789,14 @@ async def case_same_episode_no_mutual_delete():
 
     PASS.append("[37] 同集两版本不互删：cleanup_previous 支持额外保护集合（keep_fids/keep_names）；"
                 "端到端两个同集文件都「已上传」且谁都没被误删；"
-                "只按名字也能挡住；洗板场景（旧版本地已不在）不再保护、非本地同集旧版仍被清")
+                "只按名字也能挡住；洗版场景（旧版本地已不在）不再保护、非本地同集旧版仍被清")
 
 
 async def case_delete_after_upload_no_mutual_delete():
     """[38] `upload.delete_after_upload` 开着时，同集两版本仍**不能互删**。
 
     第 37 处的判据是「本地文件是否还在」，但它分不开两种情况：
-      ① 洗板把旧版换掉了（本地文件没了）；
+      ① 洗版把旧版换掉了（本地文件没了）；
       ② `delete_after_upload` 开关把**刚传完的正当版本**收尾删了（本地文件也没了）。
     于是 ② 会退化成互删：A 传完 → 本地被程序删掉 → B 的清理看不到 A → 把 A 当旧版删掉。
     本地已复现（同对照把开关关掉则 delete 目标为空）。
@@ -2833,7 +2833,7 @@ async def case_delete_after_upload_no_mutual_delete():
         cols = {r["name"] for r in st_old.db.execute("PRAGMA table_info(files)").fetchall()}
         assert "source_deleted" in cols, f"老库没补上该列：{sorted(cols)}"
         assert int(st_old.get("/old/a.mkv").get("source_deleted") or 0) == 0, \
-            "旧记录必须默认 0（否则老库里的旧版会被误保护、洗板漏清）"
+            "旧记录必须默认 0（否则老库里的旧版会被误保护、洗版漏清）"
     finally:
         shutil.rmtree(tmp0, ignore_errors=True)
 
@@ -2868,7 +2868,7 @@ async def case_delete_after_upload_no_mutual_delete():
         assert rec1["status"] == "已上传", rec1["status"]
         assert not os.path.exists(p1), "delete_after_upload 应删掉本地源文件"
         assert int(store.get(p1).get("source_deleted") or 0) == 1, \
-            "删除本地源文件后必须落 source_deleted=1（否则判据分不开洗板与收尾删除）"
+            "删除本地源文件后必须落 source_deleted=1（否则判据分不开洗版与收尾删除）"
 
         # 关键：另一版本的本地文件已不在，但它仍是正当版本 → 必须被保护
         _fids, names = up._same_episode_keeps(cloud_dir, p2)
@@ -2877,34 +2877,34 @@ async def case_delete_after_upload_no_mutual_delete():
         gone.clear()
         rec2 = await drive(up, store, p2)
         assert rec2["status"] == "已上传", rec2["status"]
-        # 洗板只留最新：库里记录在本地文件被收尾删除后仍在，按本地下载时间判新旧 ——
+        # 洗版只留最新：库里记录在本地文件被收尾删除后仍在，按本地下载时间判新旧 ——
         # 先下载的 DV 版被替换、后下载的留下；裁决确定，不会互删到云端一个不剩
         assert gone == [f"stub-{p1}"], f"应只清掉先下载的旧版：{gone}"
 
-        # ---- C) 洗板场景：本地文件不在、且不是本程序删的 → 仍要清 ----
+        # ---- C) 洗版场景：本地文件不在、且不是本程序删的 → 仍要清 ----
         # 把 p1（dv 那条）降回「非程序删」—— 此时它本地文件已不在、source_deleted=0，
-        # 正是洗板把旧版换掉后的等价态。
+        # 正是洗版把旧版换掉后的等价态。
         store.set(p1, source_deleted=0)
-        assert not os.path.exists(p1), "构造前提：本地文件必须不在（模拟洗板换掉）"
+        assert not os.path.exists(p1), "构造前提：本地文件必须不在（模拟洗版换掉）"
         assert int(store.get(p1).get("source_deleted") or 0) == 0
         _fids2, names2 = up._same_episode_keeps(cloud_dir, p2)
-        assert dv not in names2, f"洗板场景仍保护旧版（会漏清）：{names2}"
+        assert dv not in names2, f"洗版场景仍保护旧版（会漏清）：{names2}"
 
-        # ---- D) 洗板重下：scanner 整条替换 → 事实作废 ----
+        # ---- D) 洗版重下：scanner 整条替换 → 事实作废 ----
         p1b = write_file(src, f"TVs/Drama/{dv}", 9 * 1024 * 1024)   # 新内容、同路径
         scanner.scan_once(store, cfg)
         scanner.scan_once(store, cfg)
         rec = store.get(p1b)
         assert int(rec.get("source_deleted") or 0) == 0, \
-            f"洗板重下后旧事实必须作废：{rec.get('source_deleted')}"
+            f"洗版重下后旧事实必须作废：{rec.get('source_deleted')}"
         assert rec["status"] == "待处理", rec["status"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     PASS.append("[38] delete_after_upload 开着时同集两版本不互删：source_deleted 落库；"
                 "被程序收尾删掉的正当版本仍受保护、delete 目标为空；"
-                "洗板场景（本地被换掉且非程序删）不再保护、照旧清理；"
-                "洗板重下经 scanner 整条替换使事实作废；老库自动补列且默认 0")
+                "洗版场景（本地被换掉且非程序删）不再保护、照旧清理；"
+                "洗版重下经 scanner 整条替换使事实作废；老库自动补列且默认 0")
 
 
 async def case_secure_compare_all_channels():
@@ -3019,7 +3019,7 @@ async def case_same_name_duplicate_cleaned():
 
     真机取证：115 同一目录下出现两条完全同名的
     `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv`，
-    面板开关开着、日志里连一行都没有 —— 洗板清理**静默失效**。
+    面板开关开着、日志里连一行都没有 —— 洗版清理**静默失效**。
 
     根因：`cleanup_previous` 把 `keep_name` 自动塞进了「名字保护集」，
     于是 `if name in keep_names_set: continue` 把**所有与 keep_name 同名的条目**
@@ -3109,8 +3109,8 @@ async def case_same_name_duplicate_cleaned():
                    "111", [], [REN], 3 * MB, ["111", "222"])
     assert r5["deleted"] == [], r5
 
-    # ⑥ 洗板核心行为不变：不同名的同集旧版照旧被清
-    r6 = await run("⑥ 洗板核心行为不变", [("111", FULL, 3 * MB), ("333", OTHER, 7 * MB)],
+    # ⑥ 洗版核心行为不变：不同名的同集旧版照旧被清
+    r6 = await run("⑥ 洗版核心行为不变", [("111", FULL, 3 * MB), ("333", OTHER, 7 * MB)],
                    "111", [], [], 3 * MB, ["111"])
     assert r6["deleted"] == [OTHER], r6
 
@@ -3127,20 +3127,20 @@ async def case_same_name_duplicate_cleaned():
 
 
 async def case_same_episode_time_judgment():
-    """[42] 洗板重下后**两个版本本地文件都在**时，旧版仍必须被清（真机报障第二次）。
+    """[42] 洗版重下后**两个版本本地文件都在**时，旧版仍必须被清（真机报障第二次）。
 
     真机现象（用户截图）：云端同集两条都在
       `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL HDR TX DemoWeb].mkv`（新下）
       `甲剧 (2026) [tmdbid=100001] S01E33 [2160p H265 DDP 5.1 WEB-DL TX DemoWeb].mkv`（旧的）
     用户「重新下了一遍」后点重新排队，**还是一样没删**。
 
-    根因：第 37 处引入的保护判据是「本地文件还在 ⇒ 正当版本」，而洗板重下后旧版的本地
+    根因：第 37 处引入的保护判据是「本地文件还在 ⇒ 正当版本」，而洗版重下后旧版的本地
     文件**也还在**（用户只是重新下了一份新的）⇒ 旧版被当成正当版本保护住 ⇒
     `cleanup_previous` 返回「没有旧版本」⇒ 一条都不删。
     本地已复现：NEW(刚传)/OLD(3 天前) 两条本地都在 → 保护集合含 OLD → deleted=[]。
 
     修法：判据加**时间维度** —— 只有「内容入队时间与当前文件同批」
-    （差 ≤ `SAME_BATCH_SECONDS`）的才保护；明显更早的是上一轮洗板遗留的老版本，照旧清理。
+    （差 ≤ `SAME_BATCH_SECONDS`）的才保护；明显更早的是上一轮洗版遗留的老版本，照旧清理。
     必须用 `created_at` 而不是 `updated_at`：后者被每次状态写入刷新（scanner 推进
     `stable_count`、秒传命中改 message、用户点「重新排队」都会刷新），用它会让老版本
     看起来和新的差不多，判据失效。
@@ -3162,7 +3162,7 @@ async def case_same_episode_time_judgment():
         assert p115.episode_key(NEW) == p115.episode_key(OLD), "构造前提：两条必须同集"
 
         def stage(p_old: str, p_new: str, old_age_days: float):
-            """造「两条本地都在」的状态；old_age_days>0 ⇒ 旧版是上一轮洗板遗留。"""
+            """造「两条本地都在」的状态；old_age_days>0 ⇒ 旧版是上一轮洗版遗留。"""
             store.set(p_old, status="已上传", target_dir=cloud_dir, file_id="fid-OLD")
             store.db.execute("UPDATE files SET created_at=? WHERE path=?",
                              (time.time() - old_age_days * 86400, p_old))
@@ -3170,7 +3170,7 @@ async def case_same_episode_time_judgment():
             store.set(p_new, status="已上传", target_dir=cloud_dir, file_id="fid-NEW")
             return p_old, p_new
 
-        # ═══ A) 洗板场景：OLD 明显更早 ⇒ 不保护，必须能被清 ═══
+        # ═══ A) 洗版场景：OLD 明显更早 ⇒ 不保护，必须能被清 ═══
         p_new = write_file(src, f"TVs/Drama/{NEW}", 9 * 1024 * 1024)
         p_old = write_file(src, f"TVs/Drama/{OLD}", 7 * 1024 * 1024)
         store.add(p_new, 9 * 1024 * 1024, os.path.getmtime(p_new))
@@ -3178,7 +3178,7 @@ async def case_same_episode_time_judgment():
         stage(p_old, p_new, old_age_days=3)
         assert os.path.exists(p_old) and os.path.exists(p_new), "构造前提：两条本地都要在"
         _fids, names = up._same_episode_keeps(cloud_dir, p_new)
-        assert OLD not in names, f"洗板遗留的旧版仍被保护（永远清不掉）：{names}"
+        assert OLD not in names, f"洗版遗留的旧版仍被保护（永远清不掉）：{names}"
         assert NEW not in names, f"自己不该出现在保护集合里：{names}"
 
         # ═══ B) 同批场景（第 37 处回归）：两条同一轮入队 ⇒ 必须互相保护 ═══
@@ -3238,7 +3238,7 @@ async def case_same_episode_time_judgment():
         assert "同集" in r["note"] and "没有旧版本" != r["note"], \
             f"同集多条却没动手时必须给出可见说明：{r['note']!r}"
 
-        PASS.append("[42] 洗板重下后两个版本本地文件都在时旧版仍被清：判据加时间维度"
+        PASS.append("[42] 洗版重下后两个版本本地文件都在时旧版仍被清：判据加时间维度"
                     "（created_at 同批才保护，用 updated_at 会被状态写入刷新而失效）；"
                     "护栏 _newer_episode_sibling 使「点在老版本上」让位给更新的版本而不是删掉它；"
                     "「同集多条但一条未删」由静默改为可见 note；"
@@ -3259,7 +3259,7 @@ async def case_cloud_only_episode_cleanup():
       HDR 版: fid=1000000000000000011 te=1789989329 (19:15) pc=abcd0demo0pick002 size=5187057457
       普通版: fid=1000000000000000012 te=1789985493 (18:11) pc=abcd0demo0pick003 size=1286794717
       配置: cleanup_previous_versions=True / delete_after_upload=True / mode=rapid_only
-      日志: 2 小时内 `清理|洗板|旧版` **零行** —— 清理一次都没进过删除分支
+      日志: 2 小时内 `清理|洗版|旧版` **零行** —— 清理一次都没进过删除分支
 
     根因：`delete_after_upload=True` ⇒ 每个上传成功的版本本地文件都被 `_delete_source()`
     收尾删掉、库里 `source_deleted=1`。而第 37/38 处为防「同集互删」加的保护判据是
@@ -3830,7 +3830,7 @@ async def case_sha1_off_event_loop():
         scanner.scan_once(store, cfg)
         assert await sha1_of(empty, store.get(empty), store) == real_hashlib.sha1(b"").hexdigest()
 
-        # 算到一半文件被换掉（洗板重下）：结果不能落库，_process 要按新内容重新入队
+        # 算到一半文件被换掉（洗版重下）：结果不能落库，_process 要按新内容重新入队
         path2 = write_file(src, "剧集/S01/E10.mkv", 4 * 64 * 1024)
         scanner.scan_once(store, cfg)
         store.set(path2, status="待处理", stable_count=5)
@@ -5116,7 +5116,7 @@ async def case_core_rapid_only_contract():
 
 
 async def case_replace_newest_episode():
-    """[74] 洗板：同集（不论扩展名/名字）只留最新下载的那份 —— 端到端（mock 115：建目录/秒传/删除）。
+    """[74] 洗版：同集（不论扩展名/名字）只留最新下载的那份 —— 端到端（mock 115：建目录/秒传/删除）。
 
     S01E01.mkv 先下载、S01E01.mp4 后下载 → mp4 秒传成功后 mkv 被移进 115 回收站（本地文件不动）。
     旧代码：扩展名在键里，mkv 与 mp4 不算同一集，什么都不会发生。"""
@@ -5157,7 +5157,7 @@ async def case_replace_newest_episode():
     D = "剧/Season 1"
     OLD, NEW = "Show.S01E01.1080p.BluRay.mkv", "Show.S01E01.2160p.WEB-DL.mp4"
 
-    # ---- 默认配置：洗板开着（核心需求默认生效）----
+    # ---- 默认配置：洗版开着（核心需求默认生效）----
     assert cfgmod.DEFAULTS["upload"]["cleanup_previous_versions"] is True
 
     # ---- S1：mkv 先、mp4 后 → mp4 就位后 mkv 进回收站；本地文件不动；面板有记录 ----
@@ -5181,8 +5181,8 @@ async def case_replace_newest_episode():
         assert len(ev) == 1 and ev[0]["kept"] == NEW and ev[0]["removed"] == [OLD] \
             and ev[0]["basis"] == "本地下载时间" and ev[0]["dry"] is False, ev
         import webui
-        assert webui._replacements()[0]["kept"] == NEW, "面板接口要带上洗板记录"
-        assert "洗板替换" in open(os.path.join(os.path.dirname(webui.__file__), "static", "app.js"),
+        assert webui._replacements()[0]["kept"] == NEW, "面板接口要带上洗版记录"
+        assert "洗版替换" in open(os.path.join(os.path.dirname(webui.__file__), "static", "app.js"),
                                   encoding="utf-8").read()
 
         # ---- S1b：关掉开关 → 什么都不删 ----
@@ -5288,7 +5288,7 @@ async def case_replace_newest_episode():
             assert len(mgr.gone) == expect_gone, (mode, mgr.gone)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-    PASS.append("[74] 洗板只留最新：S01E01.mkv 先下载、S01E01.mp4 后下载 → mp4 秒传成功后 mkv 进回收站（本地文件不动、面板有记录）；"
+    PASS.append("[74] 洗版只留最新：S01E01.mkv 先下载、S01E01.mp4 后下载 → mp4 秒传成功后 mkv 进回收站（本地文件不动、面板有记录）；"
                 "老版本秒传更晚命中也按本地下载时间留 mp4；库里对不上才退回云端上传时间；新版未传成功云端不会被清空；"
                 "仅记录模式不删；同文件夹两部剧同集号 auto/same 不动、ignore 才替换；默认开启、开关关了不删")
 
@@ -5684,7 +5684,7 @@ async def case_rate_limit_breaker():
 
 
 async def case_season_panel_history():
-    """[80] 洗板记录落库（重启后还在）、按季度分组，面板能看到每个季度的待重试数量。"""
+    """[80] 洗版记录落库（重启后还在）、按季度分组，面板能看到每个季度的待重试数量。"""
     import json
     import uploader as upmod
 
@@ -5749,7 +5749,7 @@ async def case_season_panel_history():
         assert "renderSeasons" in js and "seasonLabel" in js and "retry_pending" in js
         assert ".season{" in css
         assert "infinite" not in css and "backdrop-filter" not in css
-        PASS.append("[80] 洗板记录落库：重启后面板仍能看到；只留最近 200 条；待重试按季度目录分组"
+        PASS.append("[80] 洗版记录落库：重启后面板仍能看到；只留最近 200 条；待重试按季度目录分组"
                     "（到期/未到期分得清）；概览新增「各季度情况」，无动画/模糊")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -5757,7 +5757,7 @@ async def case_season_panel_history():
 
 
 def case_version_tiebreak():
-    """[81] 洗板时间并列时，PROPER/REPACK/v2 算更新的那份；后下载的仍然优先。"""
+    """[81] 洗版时间并列时，PROPER/REPACK/v2 算更新的那份；后下载的仍然优先。"""
     from p115 import P115 as _P115
 
     def rows(*names_and_te):
@@ -5799,7 +5799,7 @@ def case_version_tiebreak():
     r = _P115.rank_same_episode(rows((plain, 1), (proper, 1)), lookup2)
     assert r["basis"] == "版本标记（PROPER/REPACK/v2）", r
     assert r["ranks"].index(max(r["ranks"])) == 1
-    PASS.append("[81] 洗板时间并列时 PROPER/REPACK/v2 算更新；后下载的无标记版仍然优先；"
+    PASS.append("[81] 洗版时间并列时 PROPER/REPACK/v2 算更新；后下载的无标记版仍然优先；"
                 "两个都没修订标记且时间并列则不动手")
 
 
@@ -5887,7 +5887,7 @@ def case_config_startup_validation():
         base = (f"paths:\n  source: {src_ok}\n"
                 f"p115:\n  cookie: UID=1; CID=2\n")
         msg = load_err(base + "scan:\n  interval_seconds: 不是数字\n")
-        assert "多久看一眼文件夹" in msg and "应该是数字" in msg, msg
+        assert "扫描间隔" in msg and "应该是数字" in msg, msg
         msg = load_err(base + "scan:\n  interval_seconds: 0\n")
         assert "至少是 1 秒" in msg, msg
         # 设置页下限是 2，但写 1 仍能启动（只警告）
@@ -5987,9 +5987,9 @@ def case_retry_status_copy():
     from pathlib import Path
     js = Path(__file__).resolve().parents[1].joinpath("app", "static", "app.js").read_text(encoding="utf-8")
     assert "队列为空" not in js
-    assert "没有待处理文件，也没有报错" in js
-    assert "有 ${nRetry} 个文件在等秒传：云端还没有相同文件，会自动再问，不会真上传" in js
-    assert "约 ${fmtWait(left)} 后再问" in js
+    assert "暂无待处理文件和错误" in js
+    assert "${nRetry} 个文件等待秒传：云端暂无相同文件，将定期重新校验，不会普通上传" in js
+    assert "约 ${fmtWait(left)} 后再次校验" in js
     assert "倒计时 ${left}s" not in js
     PASS.append("[85] 纯秒传等待文案说人话（5 分钟/1 小时，不写 300s）；"
                 "面板在有待重试时不再写「队列为空」，idle 时才说没有待处理文件")
@@ -6025,11 +6025,11 @@ def case_mobile_panel_buttons():
     # 环境指示：标题旁小圆点，可见文字改到 title / aria-label；面板 dry-run 提示仍保留
     assert 'id="env-pill"' in html and "class=\"pill\" id=\"env-pill\"" not in html
     assert ".env-dot{" in css and ".env-dot.amber{" in css
-    assert 'd.dry_run ? "dry-run 离线自检 · 数字为模拟" : "在线运行"' in js
+    assert 'd.dry_run ? "离线自检 · 数据为模拟" : "在线运行"' in js
     assert 'env.title = envLabel' in js and 'setAttribute("aria-label", envLabel)' in js
     assert '<span class="dot amber"></span>dry-run 离线自检' not in js
     assert '<span class="dot"></span>在线运行' not in js
-    assert "dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射" in js
+    assert "离线自检模式：不连接 115，仅验证扫描与目录映射，数据为模拟" in js
     # 不引入重型依赖（注释里可以提到参考项目，但不能真的引用它们的脚本）
     joined = html + css + js
     assert "<script" in html  # 只有本地 app.js

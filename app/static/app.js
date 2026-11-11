@@ -49,7 +49,7 @@ const S = {
   tab: "overview",
   auto: true, refreshMs: 5000, lastFetch: 0, paused: false, overview: null,
   tasks: { status: "全部", q: "", page: 1, limit: 50, total: 0, rows: [], current: null },
-  cfg: null,
+  cfg: null, cfgSnap: null, cfgDirty: 0,
   STATUSES: ["全部", "进行中", "待上传", "待重试", "已完成", "错误"],
 };
 const INTERVALS = [3000, 5000, 10000, 30000];
@@ -175,7 +175,8 @@ function switchTab(name) {
   }
   syncDock(name);
   if (name === "tasks") loadTasks();
-  if (name === "settings") loadConfig();
+  // 有未保存的修改时切回来不重新拉配置，免得把刚填的内容冲掉
+  if (name === "settings" && !S.cfgDirty) loadConfig();
 }
 
 /* ---------------- 概览 ---------------- */
@@ -210,23 +211,23 @@ function renderSeasons(d) {
   if (!rows.length) {
     const total = pending.total || 0;
     box.innerHTML = total
-      ? `<div class="empty">有 ${total} 个文件在等秒传，但还没对上季度目录</div>`
-      : '<div class="empty">还没有待重试或洗板记录</div>';
+      ? `<div class="empty">${total} 个文件等待秒传，暂未归入季度目录</div>`
+      : '<div class="empty">暂无待重试或洗版记录</div>';
     return;
   }
   const head = (pending.total || 0)
-    ? `<div class="sub" style="margin-bottom:8px">待重试 ${pending.total} 个${pending.due ? "，其中 " + pending.due + " 个到点了" : ""}</div>`
+    ? `<div class="sub" style="margin-bottom:8px">待重试 ${pending.total} 个${pending.due ? "，" + pending.due + " 个已到期" : ""}</div>`
     : "";
   box.innerHTML = head + rows.map(row => {
     const wait = row.count
-      ? (row.due ? `待重试 ${row.count} 个，其中 ${row.due} 个到点了` : `待重试 ${row.count} 个`)
-      : "没有待重试";
+      ? (row.due ? `待重试 ${row.count} 个，${row.due} 个已到期` : `待重试 ${row.count} 个`)
+      : "无待重试";
     const reps = row.reps.map(r => {
       const gone = (r.removed || []).map(esc).join("、");
       const when = fmtAgo(r.at);
       return r.dry
-        ? `仅记录 ${when}：留 ${esc(r.kept)}，本该删 ${gone}`
-        : `洗板 ${when}：留 ${esc(r.kept)}，旧版 ${gone} 已进回收站`;
+        ? `演练 ${when}：保留 ${esc(r.kept)}，将删除 ${gone}`
+        : `洗版 ${when}：保留 ${esc(r.kept)}，${gone} 已移入回收站`;
     }).map(s => `<div class="rep">${s}</div>`).join("");
     return `<div class="season">
       <div class="lab" title="${esc(row.dir)}">${esc(seasonLabel(row.dir))}</div>
@@ -245,7 +246,7 @@ function renderOverview(d) {
     + (by["上传中"]?.count || 0) + (by["待重试"]?.count || 0);
 
   const env = $("#env-pill");
-  const envLabel = d.dry_run ? "dry-run 离线自检 · 数字为模拟" : "在线运行";
+  const envLabel = d.dry_run ? "离线自检 · 数据为模拟" : "在线运行";
   env.className = d.dry_run ? "env-dot amber" : "env-dot";
   env.title = envLabel;
   env.setAttribute("aria-label", envLabel);
@@ -257,11 +258,11 @@ function renderOverview(d) {
   $("#s-total").textContent = st.total?.count ?? 0;
   $("#s-total-size").textContent = "合计 " + fmtBytes(st.total?.bytes);
   $("#s-done").textContent = done;
-  $("#s-done-size").textContent = "分块 " + fmtBytes(st.normal?.bytes) + " 走了流量 · 其中秒传 " + (st.rapid?.count ?? 0) + " 个";
+  $("#s-done-size").textContent = "秒传 " + (st.rapid?.count ?? 0) + " 个 · 普通上传 " + fmtBytes(st.normal?.bytes);
   $("#s-rapid").textContent = st.rapid?.count ?? 0;
-  $("#s-rapid-size").textContent = "省下上行 " + fmtBytes(st.rapid?.bytes);
+  $("#s-rapid-size").textContent = "节省上行 " + fmtBytes(st.rapid?.bytes);
   $("#s-active").textContent = activeCount;
-  $("#s-retry").textContent = "秒传重试累计 " + (st.retry_total ?? 0) + " 次";
+  $("#s-retry").textContent = "累计重试 " + (st.retry_total ?? 0) + " 次";
 
   const finished = (st.rapid?.count || 0) + (st.normal?.count || 0);
   ring(finished ? (st.rapid?.count || 0) / finished : 0);
@@ -282,14 +283,14 @@ function renderOverview(d) {
       width = Math.max(4, Math.min(1, left / Math.max(interval, left, 1)) * 100);
       const asked = Number(f.retry_count || 0);
       note = asked
-        ? `约 ${fmtWait(left)} 后再问 · 已问 ${asked} 次（不会真上传）`
-        : `约 ${fmtWait(left)} 后再问`;
+        ? `约 ${fmtWait(left)} 后再次校验 · 已校验 ${asked} 次`
+        : `约 ${fmtWait(left)} 后再次校验`;
     } else if (f.status === "秒传中") {
-      barCls = "rapid"; width = 100; note = "只发校验请求，不重传数据";
+      barCls = "rapid"; width = 100; note = "正在校验，不传输文件数据";
     } else if (f.status === "上传中") {
       barCls = "upload"; width = Math.max(pct, 4); note = `分块上传 ${pct.toFixed(1)}%`;
     } else if (f.status === "处理中") {
-      width = Math.max(pct, 4); note = `计算 SHA1 ${pct.toFixed(0)}%`;
+      width = Math.max(pct, 4); note = `计算校验值 ${pct.toFixed(0)}%`;
     }
     return `<div class="row">
       <div class="name">
@@ -300,7 +301,7 @@ function renderOverview(d) {
       <div class="meta">${esc(note)}</div>
       <div class="badge ${cls(f.status)}">${esc(f.status)}</div>
     </div>`;
-  }).join("") : '<div class="empty">当前没有在处理的任务 · 静静等着新文件出现</div>';
+  }).join("") : '<div class="empty">暂无进行中的任务，新文件出现后会自动处理</div>';
 
   $("#pause-label").textContent = S.paused ? "恢复调度" : "暂停调度";
   $("#btn-pause").style.color = S.paused ? "var(--amber)" : "";
@@ -308,30 +309,30 @@ function renderOverview(d) {
   $("#queue-list").innerHTML = ["待处理", "待秒传", "待重试", "待上传", "错误"]
     .map(k => `<div class="kv"><span>${k}</span><span>${q[k] || 0} 个</span></div>`).join("");
   const hints = [];
-  if (d.auth_failed) hints.push(`<div class="hint err">115 登录失效：已暂停向 115 发请求（不算重试）。到「设置 → 115 账号」换新 cookie 就会自动继续</div>`);
+  if (d.auth_failed) hints.push(`<div class="hint err">115 登录已失效，请求已暂停。在「设置 → 115 账号」更新 Cookie 后自动恢复</div>`);
   if (d.rate_limited) {
     const m = Math.max(1, Math.ceil(Number(d.rate_limited.retry_in || 0) / 60));
-    hints.push(`<div class="hint warn">115 暂时限制访问：已暂停请求（不算重试），约 ${m} 分钟后自动再试</div>`);
+    hints.push(`<div class="hint warn">115 暂时限制访问，请求已暂停，约 ${m} 分钟后自动恢复</div>`);
   }
-  if (S.paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务（在途任务会跑完），点「恢复调度」继续</div>');
-  if (d.dry_run) hints.push('<div class="hint">dry-run 模式：不联网、不消耗流量，只验证扫描与目录映射</div>');
-  if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">有 ${q["错误"]} 个文件上传失败，原因见「任务明细」，可点「失败项重新入队」重试</div>`);
+  if (S.paused) hints.push('<div class="hint warn">调度已暂停：不再派发新任务，进行中的任务会继续完成</div>');
+  if (d.dry_run) hints.push('<div class="hint">离线自检模式：不连接 115，仅验证扫描与目录映射，数据为模拟</div>');
+  if ((q["错误"] || 0) > 0) hints.push(`<div class="hint err">${q["错误"]} 个文件处理失败，可在「任务明细」查看原因并重新入队</div>`);
   const nRetry = q["待重试"] || 0;
   const nPrep = (q["待处理"] || 0) + (q["待秒传"] || 0) + (q["处理中"] || 0);
   if (nRetry > 0) {
     const rapidOnly = (d.config || {}).upload_mode === "rapid_only";
     hints.push(rapidOnly
-      ? `<div class="hint">有 ${nRetry} 个文件在等秒传：云端还没有相同文件，会自动再问，不会真上传</div>`
-      : `<div class="hint">有 ${nRetry} 个文件在等下一次秒传</div>`);
+      ? `<div class="hint">${nRetry} 个文件等待秒传：云端暂无相同文件，将定期重新校验，不会普通上传</div>`
+      : `<div class="hint">${nRetry} 个文件等待下一次秒传</div>`);
   }
-  if (nPrep > 0) hints.push(`<div class="hint">有 ${nPrep} 个文件正在准备或计算校验</div>`);
-  if (!hints.length) hints.push('<div class="hint">一切正常：没有待处理文件，也没有报错</div>');
-  // 最近的洗板替换（同一集只留最新那份）：保留了谁、把谁移进了回收站、凭什么判新旧
+  if (nPrep > 0) hints.push(`<div class="hint">${nPrep} 个文件准备中或正在计算校验值</div>`);
+  if (!hints.length) hints.push('<div class="hint ok">运行正常，暂无待处理文件和错误</div>');
+  // 最近的洗版替换（同一集只留最新那份）：保留了谁、把谁移进了回收站、凭什么判新旧
   (d.replacements || []).slice(0, 5).forEach(r => {
     const gone = (r.removed || []).map(esc).join("、");
     hints.push(r.dry
-      ? `<div class="hint warn" title="判据：${esc(r.basis)}">洗板（仅记录）${fmtAgo(r.at)}：留 ${esc(r.kept)}，本该删 ${gone}</div>`
-      : `<div class="hint" title="判据：${esc(r.basis)}">洗板替换 ${fmtAgo(r.at)}：留 ${esc(r.kept)}，旧版 ${gone} 已进回收站</div>`);
+      ? `<div class="hint warn" title="判定依据：${esc(r.basis)}">洗版演练 ${fmtAgo(r.at)}：保留 ${esc(r.kept)}，将删除 ${gone}</div>`
+      : `<div class="hint" title="判定依据：${esc(r.basis)}">洗版 ${fmtAgo(r.at)}：保留 ${esc(r.kept)}，${gone} 已移入回收站</div>`);
   });
   $("#hints").innerHTML = hints.join("");
   renderSeasons(d);
@@ -349,7 +350,7 @@ function renderOverview(d) {
       <td class="mono" title="${esc(dir)}">${esc(dir)}</td>
       <td style="color:var(--muted)" title="${esc(msg)}">${esc(note)}</td>
     </tr>`;
-  }).join("") : '<tr><td colspan="5" class="empty">还没有记录</td></tr>';
+  }).join("") : '<tr><td colspan="5" class="empty">暂无记录</td></tr>';
 
   const order = ["待处理", "待秒传", "秒传中", "待重试", "待上传", "上传中", "已上传", "错误"];
   const colors = { "待处理": "#94a3b8", "待秒传": "#94a3b8", "秒传中": "#60a5fa", "待重试": "#fbbf24",
@@ -369,18 +370,18 @@ function renderOverview(d) {
   const c = d.config || {};
   const kv = [
     ["监控目录", c.source],
-    ["115 目标根", c.target_root],
+    ["115 默认目录", c.target_root],
     ["扫描间隔", c.scan_interval + " 秒"],
-    ["稳定判定", c.stable_rounds + " 轮"],
-    ["并发", c.concurrency + " 个文件"],
+    ["稳定判定", c.stable_rounds + " 次"],
+    ["并发数", c.concurrency],
     ["上传模式", c.upload_mode_label || c.upload_mode],
-    ["小文件阈值", c.small_file_mb + " MB"],
+    ["小文件直传阈值", c.small_file_mb + " MB"],
     ["分块大小", c.partsize_mb + " MB"],
-    ["完成后通知", c.notify_enabled ? "已开启 · " + (c.notify_url || "还没填地址") : "关闭"],
+    ["入库通知", c.notify_enabled ? "已启用 · " + (c.notify_url || "未填写地址") : "未启用"],
     ["秒传重试", c.upload_mode === "rapid_only"
-      ? `${c.retry_interval} 秒 ×${c.retry_max_count} 次 → 之后每 ${c.retry_long_interval} 秒，一直等`
+      ? `${c.retry_interval} 秒 ×${c.retry_max_count} 次，之后每 ${c.retry_long_interval} 秒，持续等待`
       : `${c.retry_interval} 秒 / ${c.retry_max_count} 次 / ${c.retry_max_hours} 小时`],
-    ["初始化节流", c.init_min_interval + " 秒"],
+    ["请求最小间隔", c.init_min_interval + " 秒"],
   ];
   $("#cfg-list").innerHTML = kv.map(([k, v]) =>
     `<div class="kv"><span>${k}</span><span title="${esc(v)}">${esc(v)}</span></div>`).join("");
@@ -398,7 +399,7 @@ async function refreshOverview() {
     $("#live-text").textContent = (S.auto ? `每 ${S.refreshMs / 1000} 秒自动刷新` : "自动刷新已关闭") + " · 刚刚同步";
   } catch (e) {
     $("#live-dot").classList.add("off");
-    $("#live-text").textContent = "连接断开，重试中…";
+    $("#live-text").textContent = "连接中断，正在重连…";
   }
 }
 
@@ -462,7 +463,7 @@ function renderTasks() {
     </tr>`;
   }).join("");
 
-  $("#tasks-body").innerHTML = rows || '<tr><td colspan="9" class="empty">这个筛选下没有文件</td></tr>';
+  $("#tasks-body").innerHTML = rows || '<tr><td colspan="9" class="empty">没有符合条件的文件</td></tr>';
   $("#tasks-body").querySelectorAll("button").forEach(b => {
     b.onclick = () => {
       const p = b.dataset.path, a = b.dataset.act;
@@ -483,7 +484,7 @@ function renderTaskCards(rows) {
   const box = $("#tasks-cards");
   if (!box) return;
   if (!rows || !rows.length) {
-    box.innerHTML = '<div class="empty">这个筛选下没有文件</div>';
+    box.innerHTML = '<div class="empty">没有符合条件的文件</div>';
     return;
   }
   box.innerHTML = rows.map(f => {
@@ -549,9 +550,9 @@ async function openTask(path) {
       ["大小", fmtBytes(f.size) + "（" + (f.size || 0) + " 字节）"],
       ["115 目标目录", f.target_dir || "–"],
       ["上传方式", f.upload_mode === "rapid" ? "秒传命中" : (f.upload_mode === "normal" ? "分块上传" : "–")],
-      ["SHA1", f.sha1 || "还没算"],
+      ["SHA1", f.sha1 || "未计算"],
       ["进度", (Number(f.progress || 0)).toFixed(1) + "%"],
-      ["秒传重试次数", f.retry_count ?? 0],
+      ["重试次数", f.retry_count ?? 0],
       ["下次重试", f.next_retry_at ? fmtAbs(f.next_retry_at) + "（" + secsLeft(f.next_retry_at) + "s 后）" : "–"],
       ["稳定判定", f.stable_count ?? 0],
       ["本地大小/修改时间", (f.size || 0) + " 字节 · " + fmtAbs(f.mtime)],
@@ -587,13 +588,84 @@ function renderSettings(payload) {
     <div class="fg">
       <h3>${esc(g.title)}</h3>
       ${main.map(f => fieldHtml(f)).join("")}
-      ${adv.length ? `<details class="adv"><summary>高级设置（一般不用改）</summary>
+      ${adv.length ? `<details class="adv"><summary>高级选项</summary>
         ${adv.map(f => fieldHtml(f)).join("")}
       </details>` : ""}
     </div>`;
   }).join("");
   $("#cfg-path").textContent = payload.path || "/config/config.yaml";
   $("#settings-msg").innerHTML = "";
+  document.querySelectorAll("#settings-groups textarea[data-type=map]").forEach(checkMap);
+  S.cfgSnap = collectValues();
+  updateDirty();
+}
+
+/* ---- 未保存修改：和渲染时的快照逐项比对，改回原值就不算 ---- */
+function collectValues() {
+  const values = {}, clear = [];
+  const root = $("#settings-groups");
+  if (!root) return { values, clear };
+  root.querySelectorAll("[data-key]").forEach(el => {
+    const key = el.dataset.key, type = el.dataset.type;
+    if (type === "bool") values[key] = el.checked;
+    else if (el.classList.contains("dd")) values[key] = el.dataset.value;
+    else values[key] = el.value;
+  });
+  root.querySelectorAll("[data-clear]").forEach(el => { if (el.checked) clear.push(el.dataset.clear); });
+  return { values, clear };
+}
+
+function dirtyKeys() {
+  if (!S.cfgSnap) return [];
+  const now = collectValues(), was = S.cfgSnap.values;
+  const keys = Object.keys(now.values).filter(k => String(now.values[k]) !== String(was[k]));
+  return keys.concat(now.clear.filter(k => !keys.includes(k)));
+}
+
+function updateDirty() {
+  const keys = dirtyKeys();
+  S.cfgDirty = keys.length;
+  const root = $("#settings-groups");
+  if (root) root.querySelectorAll(".f").forEach(f => {
+    const el = f.querySelector("[data-key]");
+    f.classList.toggle("dirty", !!el && keys.includes(el.dataset.key));
+  });
+  [$("#btn-save-settings"), $("#btn-save-settings-bottom")].forEach(b => {
+    if (!b) return;
+    b.classList.toggle("dirty", keys.length > 0);
+    const n = b.querySelector(".n");
+    if (n) n.textContent = keys.length ? String(keys.length) : "";
+  });
+  const st = $("#save-state");
+  if (st) st.textContent = keys.length ? `${keys.length} 项修改未保存` : "所有修改已保存";
+}
+
+function fieldLabel(key) {
+  for (const g of (S.cfg && S.cfg.groups) || []) {
+    for (const f of g.fields || []) if (f.key === key) return f.label || key;
+  }
+  return key;
+}
+
+/* ---- 目录映射：按后端同样的规则即时检查，保存前就能看到哪一行有问题 ---- */
+function checkMap(ta) {
+  const out = ta.closest(".f").querySelector(".map-check");
+  if (!out) return;
+  const lines = ta.value.split(/\r?\n/);
+  let n = 0, err = "";
+  for (let i = 0; i < lines.length && !err; i++) {
+    const t = lines[i].trim();
+    if (!t || t.startsWith("#")) continue;
+    const sep = t.includes("=>") ? "=>" : (t.includes("->") ? "->" : "");
+    if (!sep) { err = `第 ${i + 1} 行缺少「=>」`; break; }
+    const at = t.indexOf(sep);
+    const src = t.slice(0, at).trim(), dst = t.slice(at + sep.length).trim();
+    if (!dst) { err = `第 ${i + 1} 行缺少 115 目录`; break; }
+    if (`${src}/${dst}`.split(/[\/\\]/).includes("..")) { err = `第 ${i + 1} 行不能包含 ..`; break; }
+    n++;
+  }
+  out.classList.toggle("err", !!err);
+  out.textContent = err || (n ? `${n} 条规则` : "暂无规则，全部按原目录结构上传");
 }
 
 /* 自定义下拉：原生 <select> 的弹层由系统绘制（Windows 上是白底），配上深色主题的浅色文字就看不清，
@@ -646,14 +718,16 @@ function ddInner(options, value) {
 
 function fieldHtml(f) {
   const key = esc(f.key), label = esc(f.label || f.key);
+  // 危险提示只在开关打开时出现：关着的时候它只是噪音
   const hint = (f.hint ? `<div class="hintline">${esc(f.hint)}</div>` : "")
     + (f.note ? `<div class="hintline note">${esc(f.note)}</div>` : "")
-    + (f.danger_note ? `<div class="hintline danger">⚠ ${esc(f.danger_note)}</div>` : "");
-  const tag = f.restart ? ' <span class="tag">需重建容器</span>' : "";
+    + (f.danger_note ? `<div class="hintline danger"${f.value ? "" : " hidden"}>${esc(f.danger_note)}</div>` : "");
+  const tag = f.restart ? ' <span class="tag" title="保存后需重启容器才生效">重启生效</span>' : "";
+  const ph = f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : "";
   if (f.type === "bool") {
-    return `<div class="f">
+    return `<div class="f f-bool">
       <label data-switch><span class="switch ${f.value ? "on" : ""}"><i></i></span>
-        ${label}${tag}<input type="checkbox" data-key="${key}" data-type="bool" ${f.value ? "checked" : ""} hidden></label>${hint}
+        <span>${label}${tag}</span><input type="checkbox" data-key="${key}" data-type="bool" ${f.value ? "checked" : ""} hidden></label>${hint}
     </div>`;
   }
   if (f.type === "select") {
@@ -663,7 +737,8 @@ function fieldHtml(f) {
   if (f.type === "map") {
     const rows = f.rows || 5;
     return `<div class="f wide"><label>${label}${tag}</label>
-      <textarea rows="${rows}" spellcheck="false" data-key="${key}" data-type="map" placeholder="TVs => /TVs&#10;Movies/Others => /Movies/Others&#10;Anime => /OtherAnime">${esc(f.value ?? "")}</textarea>${hint}</div>`;
+      <textarea rows="${rows}" spellcheck="false" data-key="${key}" data-type="map" placeholder="TVs => /TVs&#10;Movies/Anime => /Movies/Anime">${esc(f.value ?? "")}</textarea>
+      <div class="map-check" aria-live="polite"></div>${hint}</div>`;
   }
   if (f.type === "secret") {
     const state = f.set
@@ -671,34 +746,31 @@ function fieldHtml(f) {
       : '<span class="secret-state none">未设置</span>';
     return `<div class="f"><label>${label} ${state}</label>
       <div class="rowline">
-        <input type="password" data-key="${key}" data-type="secret" value="" placeholder="留空 = 不修改" autocomplete="new-password" />
-        <label class="clear"><input type="checkbox" data-clear="${key}" />清除</label>
+        <input type="password" data-key="${key}" data-type="secret" value="" placeholder="${f.set ? "留空则保持不变" : "未设置"}" autocomplete="new-password" />
+        ${f.set ? `<label class="clear"><input type="checkbox" data-clear="${key}" />清除</label>` : ""}
       </div>${hint}</div>`;
   }
   const type = f.type === "int" || f.type === "float" ? "number" : "text";
-  const extra = f.type === "float" ? ' step="0.1"' : "";
-  return `<div class="f"><label>${label}${tag}</label>
-    <input type="${type}"${extra} data-key="${key}" data-type="${esc(f.type)}" title="${esc(f.value ?? "")}" value="${esc(f.value ?? "")}" />${hint}</div>`;
+  let extra = f.type === "float" ? ' step="any"' : "";
+  if (f.min != null) extra += ` min="${esc(f.min)}"`;
+  if (f.max != null) extra += ` max="${esc(f.max)}"`;
+  if (type === "number") extra += ' inputmode="decimal"';
+  const input = `<input type="${type}"${extra}${ph} data-key="${key}" data-type="${esc(f.type)}" title="${esc(f.value ?? "")}" value="${esc(f.value ?? "")}" />`;
+  const ctl = f.unit ? `<div class="with-unit">${input}<span class="unit">${esc(f.unit)}</span></div>` : input;
+  return `<div class="f${f.inactive ? " inactive" : ""}"><label>${label}${tag}</label>${ctl}${hint}</div>`;
 }
 
 async function saveSettings() {
-  const values = {}, clear = [];
-  $("#settings-groups").querySelectorAll("[data-key]").forEach(el => {
-    const key = el.dataset.key, type = el.dataset.type;
-    if (type === "bool") values[key] = el.checked;
-    else if (el.classList.contains("dd")) values[key] = el.dataset.value;
-    else values[key] = el.value;
-  });
-  $("#settings-groups").querySelectorAll("[data-clear]").forEach(el => {
-    if (el.checked) clear.push(el.dataset.clear);
-  });
+  const { values, clear } = collectValues();
   const btns = [$("#btn-save-settings"), $("#btn-save-settings-bottom")];
   btns.forEach(b => setBusy(b, true));
   try {
     const j = await post("/api/config", { values, clear });
     const msg = j.message || "已保存";
-    $("#settings-msg").innerHTML = `<div class="hint ok">${esc(msg)}${j.changed?.length ? " · 变更：" + esc(j.changed.join(", ")) : " · 没有字段变化"}</div>`;
+    const names = (j.changed || []).map(fieldLabel);
+    $("#settings-msg").innerHTML = `<div class="hint ok">${esc(msg)}${names.length ? "：" + esc(names.join("、")) : "（没有修改）"}</div>`;
     toast(msg);
+    S.cfgDirty = 0;
     loadConfig();
     refreshOverview();
   } catch (e) {
@@ -716,7 +788,7 @@ async function refreshLogs() {
     $("#logbox").innerHTML = logs.length ? logs.map(l => {
       const time = new Date(l.t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
       return `<span class="lv-${esc(l.level)}">${time} ${esc(l.level.padEnd(7))} ${esc(l.name)} | ${esc(l.msg)}</span>`;
-    }).join("\n") : "（还没有日志）";
+    }).join("\n") : "暂无日志";
   } catch (e) { $("#logbox").textContent = "读取日志失败：" + e.message; }
 }
 
@@ -729,12 +801,12 @@ function bind() {
   const showTheme = () => { const lab = $("#theme-label"); if (lab) lab.textContent = THEME_LABEL[curTheme()]; };
   showTheme();
   $("#btn-scan").onclick = (e) => act("/api/scan", "已触发扫描", e.currentTarget);
-  $("#btn-retry").onclick = (e) => act("/api/retry-now", "已提前重试", e.currentTarget);
+  $("#btn-retry").onclick = (e) => act("/api/retry-now", "已提前重试秒传", e.currentTarget);
   $("#btn-requeue").onclick = (e) => act("/api/requeue", "已重新入队", e.currentTarget);
   $("#btn-sweep").onclick = async (e) => {
     const ok = await askConfirm({
       title: "核对同集？",
-      body: "会在 115 里查找同一集的重复文件，只留最新的，旧的进回收站。",
+      body: "在 115 中查找同一集的多个版本，仅保留最新版，其余移入回收站。",
       ok: "开始核对",
     });
     if (ok) act("/api/sweep", "已触发同集核对", e.currentTarget);
@@ -773,7 +845,7 @@ function bind() {
     if (!S.tasks.current) return;
     const ok = await askConfirm({
       title: "删除这条记录？",
-      body: "只删记录，文件还在。下次扫描会重新入队。",
+      body: "仅删除处理记录，不影响文件本身；下次扫描时会重新入队。",
       ok: "删除记录",
     });
     if (ok) taskAction("delete", S.tasks.current, e.currentTarget);
@@ -782,10 +854,30 @@ function bind() {
   // 设置页
   $("#btn-save-settings").onclick = saveSettings;
   $("#btn-save-settings-bottom").onclick = saveSettings;
-  const reloadCfg = () => { loadConfig(); toast("已重新读取配置"); };
+  const reloadCfg = async () => {
+    if (S.cfgDirty && !(await askConfirm({
+      title: "放弃未保存的修改？",
+      body: `${S.cfgDirty} 项修改尚未保存，重新读取将以配置文件为准。`,
+      ok: "放弃并重新读取",
+    }))) return;
+    S.cfgDirty = 0;
+    loadConfig();
+    toast("已重新读取配置");
+  };
   $("#btn-reload-config").onclick = reloadCfg;
   $("#btn-reload-config-bottom").onclick = reloadCfg;
   $("#btn-refresh-logs").onclick = refreshLogs;
+  const groupsEl = $("#settings-groups");
+  groupsEl.addEventListener("input", (e) => {
+    if (e.target.matches("textarea[data-type=map]")) checkMap(e.target);
+    updateDirty();
+  });
+  groupsEl.addEventListener("change", updateDirty);
+  window.addEventListener("beforeunload", (e) => {
+    if (!S.cfgDirty) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
   document.addEventListener("click", (e) => {
     const opt = e.target.closest(".dd-opt");            // 选一项
     if (opt) {
@@ -796,6 +888,7 @@ function bind() {
       if (lb) lb.textContent = opt.dataset.label || "";
       dd.classList.remove("on");
       if (dd.id === "t-limit") { S.tasks.limit = Number(opt.dataset.value); S.tasks.page = 1; loadTasks(); }
+      if (dd.dataset.key) updateDirty();
       return;
     }
     const ddBtn = e.target.closest(".dd-btn");          // 开/关面板
@@ -818,6 +911,9 @@ function bind() {
       const on = !(box && box.checked);
       if (box) box.checked = on;
       if (sw) sw.classList.toggle("on", on);
+      const warn = swLabel.closest(".f").querySelector(".hintline.danger");
+      if (warn) warn.hidden = !on;
+      updateDirty();
     }
     const op = e.target.closest("button.primary");
     if (op) op.disabled = false;
@@ -832,14 +928,14 @@ function openMore() {
     { id: "pause", label: S.paused ? "恢复调度" : "暂停调度" },
     { id: "refresh", label: "刷新数据" },
     { id: "retry", label: "立即重试秒传" },
-    { id: "requeue", label: "重试失败项" },
+    { id: "requeue", label: "失败项重新入队" },
     { id: "auto", label: S.auto ? ("自动刷新：" + (S.refreshMs / 1000) + " 秒") : "自动刷新：关" },
     { id: "theme", label: "主题：" + THEME_LABEL[curTheme()] },
   ];
   if ($("#btn-logout") && $("#btn-logout").style.display !== "none") {
     items.push({ id: "logout", label: ($("#logout-label") && $("#logout-label").textContent) || "退出登录" });
   }
-  items.push({ id: "sweep", label: "核对同集（旧版进回收站）", kind: "danger" });
+  items.push({ id: "sweep", label: "核对同集（旧版移入回收站）", kind: "danger" });
   openSheet(items, (id) => {
     const mapBtn = { scan: "#btn-scan", pause: "#btn-pause", retry: "#btn-retry", requeue: "#btn-requeue", sweep: "#btn-sweep" };
     if (id === "refresh") { $("#btn-refresh").click(); return; }

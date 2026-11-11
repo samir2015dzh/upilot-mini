@@ -10,7 +10,7 @@ docker compose -f /home/<user>/upilot-mini.yml pull
 
 4) docker exec upilot-mini sh -c 'grep -c "keep_fids" /app/app/p115.py; grep -c "_same_episode_keeps" /app/app/uploader.py; grep -c "keep_names_set" /app/app/p115.py; grep -c "episode_key" /app/app/uploader.py'
 
-5) 运行态自检（第 37 处的核心：同集两版本互认、洗板旧版仍被清）：
+5) 运行态自检（第 37 处的核心：同集两版本互认、洗版旧版仍被清）：
 docker exec upilot-mini sh -c 'cd /app && python -c "
 import sys, asyncio; sys.path.insert(0,\"/app/app\")
 import p115

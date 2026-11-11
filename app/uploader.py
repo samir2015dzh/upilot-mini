@@ -33,10 +33,10 @@ CHUNK = 1024 * 1024
 # 「同一批」容差（秒）：另一个版本与当前版本的**内容入队时间**（`created_at`）
 # 相差在范围内，才认为两者是「同一批新下的正当版本」，需要互相保护。
 #
-# 它是把「洗板重下」与「同批两个版本」分开的那把尺：
+# 它是把「洗版重下」与「同批两个版本」分开的那把尺：
 #   - 同批（第 37 处的场景）：A、B 在同一轮扫描里稳定、并发传完，`created_at` 只差
 #     几十秒 ⇒ 两个都是正当版本 ⇒ 都保护（否则互删，云端同集一个不剩）；
-#   - 洗板重下：旧版的本地文件**可能还在**（用户「重新下了一遍」时常见），但它是几天前
+#   - 洗版重下：旧版的本地文件**可能还在**（用户「重新下了一遍」时常见），但它是几天前
 #     入队的 ⇒ 老版本 ⇒ **不保护**，照旧清理。
 #
 # 【坑】必须用 `created_at`，**不能**用 `updated_at`：后者在每次状态写入（scanner 推进
@@ -72,7 +72,7 @@ _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  # {"since","message","next_probe","streak"}。冷却期间 dispatch 只放行
                  # 不联网的状态，到期只放 1 个文件去试探（与 auth_fail 同一套节奏）。
                  "rate_limit": None,
-                 # 最近的洗板替换记录（面板「最近洗板替换」；重启即清空，完整历史在日志里）
+                 # 最近的洗版替换记录（面板「最近洗版替换」；重启即清空，完整历史在日志里）
                  "replaced": collections.deque(maxlen=30)}
 
 # 登录失效后多久再试探一次 115（同时也是该文件下次重试的间隔）
@@ -261,7 +261,7 @@ async def sha1_of(path: str, record: dict, store) -> str | None:
     读盘 + 哈希放到线程池里跑：原来是 async 函数里的同步循环，算一个 20GB 原盘时
     整个事件循环停住（秒传、巡检、主循环扫描全部停摆，机械盘上约 3 分钟）。
 
-    返回 None 表示**算的过程中文件被换掉了**（洗板重下 / 还在写）：算出来的值
+    返回 None 表示**算的过程中文件被换掉了**（洗版重下 / 还在写）：算出来的值
     不属于库里那条记录，绝不能落库；调用方应把记录按新内容重新入队。
     """
     if record.get("sha1"):
@@ -332,7 +332,7 @@ class Uploader:
         self.long_backoff = rt.get("long_backoff", [])
         # 传完就删本地源文件（破坏性操作，默认关）
         self.delete_after = bool(up.get("delete_after_upload"))
-        # 洗板：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
+        # 洗版：云端同一集只留这次传上去的，旧版本移进 115 回收站（破坏性，默认关）
         self.cleanup_prev = bool(up.get("cleanup_previous_versions"))
         self.cleanup_dry = bool(up.get("cleanup_dry_run"))
         episode.set_title_match(up.get("cleanup_title_match"))
@@ -464,7 +464,7 @@ class Uploader:
     def _on_rate_limited(self, path: str, exc) -> None:
         """记下硬限流断路器：全体暂停，冷却按次数加倍，封顶 1 小时。
 
-        已经是「已上传」的文件状态不动（洗板清理碰到限流时不能把成功记录打回去）。
+        已经是「已上传」的文件状态不动（洗版清理碰到限流时不能把成功记录打回去）。
         """
         now = time.time()
         prev = _SHARED["rate_limit"] or {}
@@ -515,7 +515,7 @@ class Uploader:
     def _file_changed_on_disk(self, path: str, rec: dict) -> bool:
         """上传结束前确认磁盘上还是当初那个文件。
 
-        MoviePilot 洗板重下会在**同一个路径**写入新内容；而上传（尤其分块传几 GB）
+        MoviePilot 洗版重下会在**同一个路径**写入新内容；而上传（尤其分块传几 GB）
         要跑很久，中间完全可能被换掉。这时 _process 手里还是旧 rec，跑完若照常写
         「已上传」，就会盖掉 scanner 刚做的重置 —— 库里成终态，云端是旧内容、本地是
         新内容，而终态让 scanner 与 dispatch 都不再碰它：**新内容永远不会上传**。
@@ -539,7 +539,7 @@ class Uploader:
                            sha1=None, stable_count=0, file_id=None, progress=0.0,
                            # 事实作废：文件是被换掉的，不是本程序收尾删的
                            source_deleted=0,
-                           message="上传期间文件被替换（洗板重下），已按新内容重新入队")
+                           message="上传期间文件被替换（洗版重下），已按新内容重新入队")
             logger.info("上传期间文件被替换，已重新入队：%s", os.path.basename(path))
         except OSError:
             self.store.set(path, status="错误", message="上传期间文件消失")
@@ -547,7 +547,7 @@ class Uploader:
     def _notify(self, cloud_dir: str, mode: str, local_path: str) -> None:
         """秒传命中 / 上传完成后，把通知丢到后台去发（不等它）。
 
-        对方收到通知后会先干活再回执，慢的时候十几秒；在这里等会把「同时处理几个文件」
+        对方收到通知后会先干活再回执，慢的时候十几秒；在这里等会把「并发数」
         的名额占住，后面的文件只能干等。通知失败不影响上传结果，所以后台跑就好。
         """
         if not self.notifier.ready or not self.notifier.should_fire(mode):
@@ -589,7 +589,7 @@ class Uploader:
             if size and os.path.getsize(real) != size:
                 logger.warning("不删（大小已变，可能被换过）：%s", path)
                 return
-            # 光比大小不够：洗板重下可能恰好同 size（同一集的不同版本往往只差几 MB，
+            # 光比大小不够：洗版重下可能恰好同 size（同一集的不同版本往往只差几 MB，
             # 也存在大小完全相同的编码）。删是破坏性的，必须连 mtime 一起对上才动手。
             try:
                 same_mtime = abs(float(rec.get("mtime") or 0) - os.path.getmtime(real)) <= 1e-6
@@ -602,7 +602,7 @@ class Uploader:
             os.remove(real)
             logger.info("已删除本地源文件：%s", path)
             # 落一条「本地文件是本程序上传成功后删的」的持久事实（一次 set 同时更新 message）。
-            # 洗板清理要靠它区分「正当版本的本地文件被收尾删掉」与「旧版本地被换掉」——
+            # 洗版清理要靠它区分「正当版本的本地文件被收尾删掉」与「旧版本地被换掉」——
             # 只看 os.path.exists() 分不开这两者，会导致互删（见 _same_episode_keeps）。
             cur = self.store.get(path) or {}
             self.store.set(path, source_deleted=1,
@@ -623,17 +623,17 @@ class Uploader:
           - 本地文件已被**本程序**在上传成功后收尾删掉（`source_deleted=1`）
             ⇒ 同样是正当版本 ⇒ 保护；
           - 本地文件不在、且不是本程序删的 ⇒ 旧版本地被换掉了 ⇒ **不保护**；
-          - **上传完成时间明显更早**（差 > SAME_BATCH_SECONDS）⇒ 上一轮洗板遗留的老版本，
+          - **上传完成时间明显更早**（差 > SAME_BATCH_SECONDS）⇒ 上一轮洗版遗留的老版本，
             即使本地文件还在也**不保护** ⇒ 照旧清理。
 
-        为什么必须加时间这一条（第 42 处，用户真机报障）：用户洗板重下后**两个版本的本地
+        为什么必须加时间这一条（第 42 处，用户真机报障）：用户洗版重下后**两个版本的本地
         文件都在**（`HDR` 与无 `HDR` 的两条 S01E33），只按「本地在不在」判定会把旧版当正当
         版本保护住 ⇒ `cleanup_previous` 返回「没有旧版本」⇒ 云端两条都留着，
         表现就是「开关开着、点了重新排队、还是一样，没删」。
         本地已复现：NEW(刚传)/OLD(3 天前) 两条本地都在 → 保护集合含 OLD → deleted=[]。
 
         为什么必须保留 `source_deleted` 那一条：只看 `os.path.exists()` 分不开
-        「洗板把旧版换掉了」与「`upload.delete_after_upload` 开关把刚传完的版本收尾删了」
+        「洗版把旧版换掉了」与「`upload.delete_after_upload` 开关把刚传完的版本收尾删了」
         —— 后者开着时先传完那条本地是程序自己删的，后传那条就把它当旧版删掉（互删重现）。
         """
         key = episode_key(os.path.basename(local_path))
@@ -662,7 +662,7 @@ class Uploader:
                 continue
             if not os.path.exists(path) and not int(rec.get("source_deleted") or 0):
                 continue                    # 旧版本地被换掉了（不是程序收尾删的）→ 不保护
-            # 时间判据：明显不是同一批 ⇒ 洗板遗留的老版本，本地还在也不保护。
+            # 时间判据：明显不是同一批 ⇒ 洗版遗留的老版本，本地还在也不保护。
             # cur_at 为 0（拿不到当前记录时间）时退化为「全保护」，保守不出错。
             if cur_at:
                 try:
@@ -937,7 +937,7 @@ class Uploader:
                             if await self.mgr.delete_file(fid):
                                 removed += 1
                                 gone.append(name)
-                                logger.info("洗板替换（巡检）：保留 %s，已把旧版 %s 移入 115 回收站（判据：%s）",
+                                logger.info("洗版替换（巡检）：保留 %s，已把旧版 %s 移入 115 回收站（判据：%s）",
                                             keeper_name, name, basis)
                             else:
                                 logger.warning("同集巡检：删除失败 %s", name)
@@ -968,7 +968,7 @@ class Uploader:
             try:
                 recs = records if records is not None else self.store.uploaded_records()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("读取本地记录失败（洗板改用云端时间判新旧）：%s", exc)
+                logger.warning("读取本地记录失败（洗版改用云端时间判新旧）：%s", exc)
                 recs = []
             by_mark: dict[str, tuple | None] = {}
             by_name: dict[tuple, tuple | None] = {}
@@ -1009,7 +1009,7 @@ class Uploader:
 
     def _record_replacement(self, cloud_dir: str, kept: str, removed: list[str],
                             basis: str, dry: bool) -> None:
-        """记一条洗板替换事件，面板「最近洗板替换 / 各季度情况」显示。
+        """记一条洗版替换事件，面板「最近洗版替换 / 各季度情况」显示。
 
         内存里留最近 30 条（当前进程立刻能看）；同时写入状态库，容器重启后还能看到。
         """
@@ -1020,7 +1020,7 @@ class Uploader:
             self.store.add_replacement(ev["dir"], ev["kept"], ev["removed"],
                                        ev["basis"], ev["dry"], at=ev["at"])
         except Exception as exc:  # noqa: BLE001
-            logger.warning("洗板记录没写进库（重启后面板会少这一条）：%s", exc)
+            logger.warning("洗版记录没写进库（重启后面板会少这一条）：%s", exc)
 
     async def _cleanup_prev_versions(self, cloud_dir: str, pid: int, local_path: str) -> None:
         """上传成功后：云端同一集只留**刚上传的那条**，其余移入 115 回收站。
@@ -1034,7 +1034,7 @@ class Uploader:
           「本地文件还在 **或** 是本程序收尾删的（source_deleted=1）⇒ 正当版本 ⇒ 保护」
           —— 在这个配置下**每个版本都命中**，于是 keep_names 收进了同集所有条目、
           `cleanup_previous` 返回「没有旧版本」、清理永久空转。
-          真机实测：2 小时内 `清理|洗板|旧版` 日志**零行**，云端 E33 一直是
+          真机实测：2 小时内 `清理|洗版|旧版` 日志**零行**，云端 E33 一直是
           18:11（普通版）与 19:15（HDR 版）两条。
         新判据与本地完全无关，所以「本地已被删掉」「本地文件还在」「库里记录丢了」
         这些情况一律不影响判定。
@@ -1064,7 +1064,7 @@ class Uploader:
                 res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
                                                       keep_fid=keep_fid)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("洗板清理出错（不影响上传）：%s", exc)
+            logger.warning("洗版清理出错（不影响上传）：%s", exc)
             return
         deleted = list((res or {}).get("deleted") or [])
         would = list((res or {}).get("would_delete") or [])
@@ -1073,16 +1073,16 @@ class Uploader:
             self._record_replacement(cloud_dir, str(res["kept"]), deleted or would,
                                      str(res.get("basis") or ""), dry=not deleted)
         if deleted:
-            logger.info("洗板清理：%s 就位，云端同集旧版本已清 %s", name, "、".join(deleted))
+            logger.info("洗版清理：%s 就位，云端同集旧版本已清 %s", name, "、".join(deleted))
         elif note and note != "没有旧版本":
-            logger.info("洗板清理：%s —— %s", name, note)
+            logger.info("洗版清理：%s —— %s", name, note)
         tail = ""
         if deleted:
             tail = f"｜云端同集旧版本已清 {len(deleted)} 个：" + "、".join(deleted)
         elif would:
-            tail = "｜洗板（仅记录）本该清：" + "、".join(would)
+            tail = "｜洗版（仅记录）本该清：" + "、".join(would)
         elif note and note != "没有旧版本":
-            tail = f"｜洗板清理：{note}"
+            tail = f"｜洗版清理：{note}"
         if tail:
             cur = self.store.get(local_path) or {}
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
@@ -1269,7 +1269,7 @@ class Uploader:
             if hit:
                 if self._file_changed_on_disk(path, rec):
                     # 命中的是旧内容；本地已是新内容。绝不能写「已上传」——
-                    # 终态会让新内容再也上不去（洗板重下的典型后果）。
+                    # 终态会让新内容再也上不去（洗版重下的典型后果）。
                     self._requeue_changed_file(path)
                     return
                 store.set(path, status="已上传", progress=100.0,
@@ -1349,7 +1349,7 @@ class Uploader:
         try:
             result = await self.mgr.multipart(path, pid, rec["sha1"] or "", store.get(path))
             if self._file_changed_on_disk(path, rec):
-                # 上传期间文件被替换（洗板重下）：云端那半截旧内容没有意义，
+                # 上传期间文件被替换（洗版重下）：云端那半截旧内容没有意义，
                 # 按「新内容」重新入队；绝不能写「已上传」把 scanner 的重置盖掉。
                 self._requeue_changed_file(path)
                 return

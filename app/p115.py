@@ -478,7 +478,7 @@ class P115:
         self._makedirs_lock = asyncio.Lock()
         self._cid_mem: dict[str, int] = {}
         # 目录内容缓存：{pid: (条目, 取回时间)}。上游实测「同一目录被反复列会触发 115 限流（405）」，
-        # 洗板清理是「一个文件列一次目录」，整季下载会连打，所以加 TTL 复用。
+        # 洗版清理是「一个文件列一次目录」，整季下载会连打，所以加 TTL 复用。
         # 注意：TTL 只在读取时判断，过期条目不会自己消失 —— 每个条目是那个目录的
         # **完整文件列表**（几百个 dict）。媒体库有几百个目录时，长跑会把这些已过期的
         # 列表一直持在内存里，所以必须自己淘汰（见 list_dir 写入前）。
@@ -582,7 +582,7 @@ class P115:
         except AttributeError:          # 兼容没有 cid_del 的旧 store / 测试替身
             pass
 
-    # ---------- 目录内容 / 删除（洗板清理用） ----------
+    # ---------- 目录内容 / 删除（洗版清理用） ----------
 
     async def list_dir(self, pid: int, use_cache: bool = True) -> list[dict]:
         """列出目录里的**文件**条目（分页，跳过子目录）。
@@ -646,7 +646,7 @@ class P115:
             # 游标必须用**实际返回条数**推进，不能固定加 page：服务端有自己的单页上限时
             # （很常见），固定加 page 会把中间整段数据跳过。实测：2500 个文件、服务端每页
             # 只给 500 条时，请求序列 (0,1150)(1150,1150)(2300,1150) 只拿回 1200 条，**漏
-            # 1300 条** —— 而 list_dir 正是洗板清理「找同集旧版」的依据，漏掉的旧版永远
+            # 1300 条** —— 而 list_dir 正是洗版清理「找同集旧版」的依据，漏掉的旧版永远
             # 清不掉，且没有任何报错。
             offset += len(rows)
             if len(out) >= MAX_DIR_ITEMS:
@@ -695,7 +695,7 @@ class P115:
     async def cleanup_previous(self, pid: int, keep_name: str, keep_size: int,
                                max_delete: int, keep_fid: str = "",
                                keep_fids=None, keep_names=None) -> dict:
-        """洗板清理：同一集只留最新版，其余同集**旧版本**移进回收站。
+        """洗版清理：同一集只留最新版，其余同集**旧版本**移进回收站。
 
         三道「别动它」：标识命中（最可靠，见下）、文件名完全相同、大小完全相同。
         标识那道要注意：秒传落库的 file_id 实测是 **pickcode**（形如 abcd0demo0pick001），
@@ -705,7 +705,7 @@ class P115:
         且已上传成功」的版本）。没有它就会这样：同一集两个版本几乎同时传完，
         A 的清理把 B 当成旧版删掉、B 的清理把 A 删掉 ⇒ **云端同集一个不剩**，
         而本地两条都是「已上传」终态、strm 指向不存在的文件。本地已复现（串行与并发都会）。
-        判据是「本地文件是否还在」：洗板时旧版的本地文件已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理；
+        判据是「本地文件是否还在」：洗版时旧版的本地文件已被换掉/删除 ⇒ 不保护 ⇒ 照旧清理；
         同集两个都还在本地 ⇒ 都是正当新版本 ⇒ 都保护。
 
         返回 {"deleted": [文件名…], "note": 说明}；认不出季集 / 没有旧版本 / 多于上限都只回说明。
@@ -734,7 +734,7 @@ class P115:
         # 会把**所有与 keep_name 同名的条目**一并保护住。而
         #   ① 云端同集同名重复（用户实际遇到：两条逐字同名的 S01E33）
         #   ② 115 同名自动改名（新版成 "xxx (1).mkv"，**旧的那条名字正好等于 keep_name**）
-        # 这两种情形下旧条目名恰好就是 keep_name ⇒ 永远跳过 ⇒ 洗板清理静默失效：
+        # 这两种情形下旧条目名恰好就是 keep_name ⇒ 永远跳过 ⇒ 洗版清理静默失效：
         # 面板开关是开着的、日志里连一行都没有。
         #
         # 注意区分两类保护：
@@ -801,11 +801,11 @@ class P115:
             try:
                 if await self.delete_file(fid):
                     done.append(name)
-                    logger.info("洗板清理：已移入回收站 %s", name)
+                    logger.info("洗版清理：已移入回收站 %s", name)
                 else:
-                    logger.warning("洗板清理：删除失败 %s", name)
+                    logger.warning("洗版清理：删除失败 %s", name)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("洗板清理：删除出错 %s：%s", name, exc)
+                logger.warning("洗版清理：删除出错 %s：%s", name, exc)
         if done:
             cache = getattr(self, "_dir_cache", None)    # 目录内容变了，缓存作废
             if isinstance(cache, dict):
@@ -816,7 +816,7 @@ class P115:
     # 用户明确的要求（原话）：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件
     # 在秒传完已经被删掉了」。实测生产正是 `delete_after_upload=True`：每个上传成功的版本
     # 本地文件都被收尾删掉、库里 `source_deleted=1` ⇒ 任何「本地文件在不在」的判据都会把
-    # 同集**所有**版本当成正当版本保护起来，清理永久空转（实测 2 小时内 `清理|洗板|旧版`
+    # 同集**所有**版本当成正当版本保护起来，清理永久空转（实测 2 小时内 `清理|洗版|旧版`
     # 零行，云端 E33 一直是 18:11 与 19:15 两条）。
     # 所以判据只用 115 条目自身的时间字段。
     _CLOUD_TS_KEYS = ("te", "tp", "tu", "pt", "uppt", "user_ptime", "ptime",
@@ -971,7 +971,7 @@ class P115:
                     "note": f"同集旧版本 {len(victims)} 个，超过上限 {max_delete}，本次不动手"}
         if dry_run:
             names = [n for n, _ in victims]
-            logger.info("洗板【仅记录，未删除】：%s 是最新（%s），本该移入回收站：%s",
+            logger.info("洗版【仅记录，未删除】：%s 是最新（%s），本该移入回收站：%s",
                         keeper_name, basis, "、".join(names))
             return {"deleted": [], "would_delete": names, "kept": keeper_name, "basis": basis,
                     "note": f"仅记录模式：本该清掉 {len(names)} 个同集旧版本"}
@@ -982,7 +982,7 @@ class P115:
             try:
                 if await self.delete_file(fid):
                     done.append(name)
-                    logger.info("洗板替换：保留 %s，已把旧版 %s 移入 115 回收站（判据：%s）",
+                    logger.info("洗版替换：保留 %s，已把旧版 %s 移入 115 回收站（判据：%s）",
                                 keeper_name, name, basis)
                 else:
                     logger.warning("同集清理：删除失败 %s", name)
@@ -1162,7 +1162,7 @@ class StubP115:
     async def forget_pid(self, cloud_dir: str) -> None:
         return None
 
-    # ---------- 洗板清理（dry-run 只打日志，不真删任何东西） ----------
+    # ---------- 洗版清理（dry-run 只打日志，不真删任何东西） ----------
 
     async def list_dir(self, pid: int, use_cache: bool = True) -> list[dict]:
         """dry-run 的「云端内容」：把已上传、且目标目录是本 pid 的记录还原成条目。

@@ -156,7 +156,7 @@ docker exec upilot-mini sh -c 'grep -c "核对同集" /app/app/static/index.html
 docker exec upilot-mini sh -c 'cat /config/.http_port; echo; md5sum /config/config.yaml'
 
 8) 日志 + 回收站确认：
-docker logs --since 30m upilot-mini 2>&1 | grep -iE "同集|回收站|清理|洗板" | tail -25
+docker logs --since 30m upilot-mini 2>&1 | grep -iE "同集|回收站|清理|洗版" | tail -25
 docker logs --since 30m upilot-mini 2>&1 | grep -ciE "traceback|异常|NameError" || echo 0
 curl -s --noproxy '*' http://127.0.0.1:9844/health; echo
 
