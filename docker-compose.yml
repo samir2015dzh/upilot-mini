@@ -4,7 +4,7 @@ services:
     # 当前已验证版本（v0.2.0）。生产环境建议钉死这个 sha；也可改成 :latest。
     # 直接拉镜像请用：docker compose pull && docker compose up -d --no-build
     # （加 --build 会在本地构建，并套用下面这个名字，只适合改源码时。）
-    image: samir2013dzh/upilot-mini:sha-13edcf1
+    image: samir2013dzh/upilot-mini:sha-b5e5622
     container_name: upilot-mini
     restart: unless-stopped
     environment:

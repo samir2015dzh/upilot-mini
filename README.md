@@ -7,20 +7,20 @@
 
 > 与 UPilot 官方镜像无关，是按公开行为复刻的「只保留秒传这一条链路」的精简实现。
 
-当前版本 **v0.2.0**（2026-11-10）。推荐镜像：`samir2013dzh/upilot-mini:sha-13edcf1`。这一版的变化（只秒传加固、洗板、限流冷却、特别篇/多集/`PROPER`、跳过未下完文件、启动配置校验、等秒传文案等）见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **v0.2.0**（2026-11-10）。推荐镜像：`samir2013dzh/upilot-mini:sha-b5e5622`。这一版的变化（只秒传加固、洗板、限流冷却、特别篇/多集/`PROPER`、跳过未下完文件、启动配置校验、等秒传文案等）见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 0. 直接拉镜像（不用自己构建）
 
 ```bash
-docker pull samir2013dzh/upilot-mini:sha-13edcf1      # 推荐：v0.2.0 已验证的构建，amd64 + arm64
+docker pull samir2013dzh/upilot-mini:sha-b5e5622      # 推荐：v0.2.0 已验证的构建，amd64 + arm64
 docker pull samir2013dzh/upilot-mini:latest           # 目前与上面相同；以后 main 有新构建才会变
-docker pull ghcr.io/samir2015dzh/upilot-mini:sha-13edcf1   # 备用：GHCR
+docker pull ghcr.io/samir2015dzh/upilot-mini:sha-b5e5622   # 备用：GHCR（私有包，需先 ghcr 登录）
 ```
 
 镜像由本仓库的 GitHub Actions 在每次推送到 `main` 时自动构建（多架构）：**先跑 lint 和离线测试，
 全部通过才构建、推送**。每次推送除了 `:latest` 还有 `:<运行编号>` 和 `:sha-<提交前 7 位>` 两个固定标签。
-生产环境建议把 compose 里的镜像钉成 `:sha-13edcf1`（见下面的示例）；出问题再换成另一个 `sha-` 标签回滚。
-只改文档不会构建新镜像。源代码在 `https://github.com/samir2015dzh/upilot-mini`（私有仓库）。
+生产环境建议把 compose 里的镜像钉成 `:sha-b5e5622`（见下面的示例）；出问题再换成另一个 `sha-` 标签回滚。
+只改文档不会构建新镜像。源代码在 `https://github.com/samir2015dzh/upilot-mini`（公开仓库）。
 
 用镜像跑（不本地构建）：
 
