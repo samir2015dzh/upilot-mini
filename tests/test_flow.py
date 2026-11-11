@@ -791,6 +791,9 @@ def case_cli_qr_login():
         assert rc == 1 and not saved and "第 3 步" in out and "40101017" in out and "老乡验证失败" in out
         rc, out = run([-1] * mainmod.QR_MAX_ROUNDS, ok)
         assert rc == 1 and not saved and Fake.tokens == mainmod.QR_MAX_ROUNDS
+        # 状态接口连续连不上：不能无限重试，要停下来并说明是网络问题
+        rc, out = run([ConnectionError("boom")] * 10, ok)
+        assert rc == 1 and not saved and Fake.tokens == 1 and "连不上" in out and "ConnectionError" in out
     finally:
         cfgmod.save_cookie, mainmod.time.sleep = old_save, old_sleep
         if old_mod is None:
@@ -798,7 +801,7 @@ def case_cli_qr_login():
         else:
             sys.modules["p115client"] = old_mod
     PASS.append("[11b] 命令行扫码：过期自动换码、网络抖动不中断、成功写 cookie、"
-                "取消 / 115 拒绝时报出卡在哪一步和错误码")
+                "取消 / 115 拒绝 / 持续断网时报出卡在哪一步和错误码")
 
 
 def case_cookie_sync_from_file():
