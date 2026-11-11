@@ -731,6 +731,76 @@ def case_qr_removed():
 
 
 
+def case_cli_qr_login():
+    """命令行扫码：过期自动换码、成功写 cookie、115 拒绝时说清卡在哪一步（不联网，假客户端）。"""
+    import contextlib
+    import io
+
+    import main as mainmod
+
+    class Fake:
+        tokens = 0
+        script: list = []
+        result: dict = {}
+
+        @classmethod
+        def login_qrcode_token(cls, **_):
+            cls.tokens += 1
+            return {"state": 1, "data": {"uid": f"u{cls.tokens}", "time": 1, "sign": "s",
+                                         "qrcode": f"https://115.com/scan/dg-u{cls.tokens}"}}
+
+        @classmethod
+        def login_qrcode_scan_status(cls, payload, **_):
+            assert set(payload) == {"uid", "time", "sign"}, "状态接口只该带 uid/time/sign"
+            st = cls.script.pop(0)
+            if isinstance(st, Exception):
+                raise st
+            return {"state": 1, "data": {"status": st}}
+
+        @classmethod
+        def login_qrcode_scan_result(cls, uid, app="", **_):
+            cls.got = (uid, app)
+            return cls.result
+
+    saved: list = []
+    fake_mod = types.ModuleType("p115client")
+    fake_mod.P115Client = Fake
+    old_mod, old_save, old_sleep = sys.modules.get("p115client"), cfgmod.save_cookie, mainmod.time.sleep
+    sys.modules["p115client"] = fake_mod
+    cfgmod.save_cookie = saved.append
+    mainmod.time.sleep = lambda *_: None
+
+    def run(script, result):
+        Fake.tokens, Fake.script, Fake.result = 0, list(script), result
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mainmod.do_login({"p115": {"app": "115ipad"}})
+        return rc, buf.getvalue()
+
+    try:
+        ok = {"state": 1, "data": {"cookie": {"UID": "1", "CID": "2", "SEID": "3"}}}
+        # 第一张过期 → 自动换第二张；中途一次网络异常不算失败；扫码、确认后拿到 cookie
+        rc, out = run([0, -1, TimeoutError("x"), 0, 1, 2], ok)
+        assert rc == 0 and saved == ["UID=1; CID=2; SEID=3"], (rc, saved, out)
+        assert Fake.tokens == 2 and Fake.got == ("u2", "115ipad"), "应换过一次码并用新码换 cookie"
+        assert "qrcode?uid=u2" in out and "已扫码" in out, "应给出官方二维码图片链接与扫码提示"
+        saved.clear()
+        rc, out = run([1, -2], ok)
+        assert rc == 1 and not saved and "取消" in out
+        rc, out = run([2], {"state": 0, "code": 40101017, "message": "老乡验证失败！"})
+        assert rc == 1 and not saved and "第 3 步" in out and "40101017" in out and "老乡验证失败" in out
+        rc, out = run([-1] * mainmod.QR_MAX_ROUNDS, ok)
+        assert rc == 1 and not saved and Fake.tokens == mainmod.QR_MAX_ROUNDS
+    finally:
+        cfgmod.save_cookie, mainmod.time.sleep = old_save, old_sleep
+        if old_mod is None:
+            sys.modules.pop("p115client", None)
+        else:
+            sys.modules["p115client"] = old_mod
+    PASS.append("[11b] 命令行扫码：过期自动换码、网络抖动不中断、成功写 cookie、"
+                "取消 / 115 拒绝时报出卡在哪一步和错误码")
+
+
 def case_cookie_sync_from_file():
     """从外部程序配置同步 cookie：嵌套 yaml / 字典形式 / JSON 都能抠出来，无关文件返回空。"""
     tmp = tempfile.mkdtemp(prefix="upilot-ck-")
@@ -5987,6 +6057,7 @@ async def main():
     await case_http_auth()
     await case_form_auth()
     case_qr_removed()
+    case_cli_qr_login()
     await case_dir_mapping()
     case_settings_map_and_slots()
     case_cookie_sync_from_file()

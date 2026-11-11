@@ -291,21 +291,106 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
     return 0
 
 
+QR_IMAGE_URL = "https://qrcodeapi.115.com/api/1.0/web/1.0/qrcode?uid={uid}"
+QR_MAX_ROUNDS = 3          # 二维码过期后自动换新的次数上限
+QR_ROUND_SECONDS = 300     # 单张二维码最多等这么久（115 一般更早就判过期）
+
+
+def _qr_show(token: dict) -> None:
+    """把二维码打到终端，同时给出官方图片链接（终端里的字符码扫不上时用）。"""
+    content = token.get("qrcode") or ("https://115.com/scan/dg-" + token["uid"])
+    try:
+        from qrcode import QRCode
+
+        qr = QRCode(border=2)
+        qr.add_data(content)
+        # tty 下用 ANSI 强制「白底黑码」；深色终端里不带颜色的字符码是反色的，手机常识别不了
+        qr.print_ascii(tty=sys.stdout.isatty())
+    except Exception as exc:  # noqa: BLE001
+        print(f"（终端画不出二维码：{exc}）")
+    print("终端里的码扫不上（发虚 / 反色 / 被折行）就用浏览器打开这张官方图片再扫：")
+    print("  " + QR_IMAGE_URL.format(uid=token["uid"]))
+    sys.stdout.flush()
+
+
+def _qr_wait(client_cls, token: dict) -> str:
+    """轮询到有结论为止，返回 signed / expired / canceled / timeout / error:<说明>。"""
+    deadline = time.monotonic() + QR_ROUND_SECONDS
+    seen = None
+    fails = 0
+    while time.monotonic() < deadline:
+        try:
+            resp = client_cls.login_qrcode_scan_status(
+                {k: token[k] for k in ("uid", "time", "sign")}, timeout=60)
+            fails = 0
+        except Exception as exc:  # noqa: BLE001  长轮询超时是常态，连续失败才算网络有问题
+            fails += 1
+            if fails >= 10:
+                return f"error:连不上 115 的扫码状态接口（{type(exc).__name__}: {str(exc)[:120]}）"
+            time.sleep(1)
+            continue
+        status = (resp.get("data") or {}).get("status", 0)
+        if status != seen:
+            seen = status
+            if status == 1:
+                print("已扫码 → 请在手机上点「确认登录」…", flush=True)
+        if status == 2:
+            return "signed"
+        if status == -1:
+            return "expired"
+        if status == -2:
+            return "canceled"
+        if status not in (0, 1):
+            return f"error:115 返回了没见过的扫码状态：{str(resp)[:200]}"
+    return "timeout"
+
+
 def do_login(cfg: dict) -> int:
     from p115client import P115Client
 
-    app = cfg["p115"].get("app") or "qandroid"
-    print(f"请用 115 App 扫描终端里的二维码（登录槽位 app={app}）…")
-    resp = P115Client.login_with_qrcode(app=app, console_qrcode=True)
+    app = cfg["p115"].get("app") or "115ipad"
+    label = cfgmod.app_label(app)
+    print(f"登录身份：{label}（p115.app={app}）。登录成功会把这个端上原有的登录挤下线。")
+    for rnd in range(1, QR_MAX_ROUNDS + 1):
+        try:
+            resp = P115Client.login_qrcode_token(timeout=30)
+            token = resp["data"]
+            token["uid"], token["time"], token["sign"]  # noqa: B018  缺字段就当取码失败
+        except Exception as exc:  # noqa: BLE001
+            print(f"[第 1 步·取二维码] 失败：{type(exc).__name__}: {str(exc)[:200]}")
+            print("容器连不上 qrcodeapi.115.com，先检查容器的网络 / 代理 / DNS。")
+            return 1
+        print(f"\n请用 115 App 扫码（第 {rnd}/{QR_MAX_ROUNDS} 张，约几分钟内有效）：")
+        _qr_show(token)
+        result = _qr_wait(P115Client, token)
+        if result == "signed":
+            break
+        if result == "canceled":
+            print("[第 2 步·手机确认] 手机上点了取消，登录中止。")
+            return 1
+        if result.startswith("error:"):
+            print("[第 2 步·等待扫码] " + result[6:])
+            return 1
+        print("二维码已过期，换一张新的…" if rnd < QR_MAX_ROUNDS else "二维码多次过期，登录中止。")
+    else:
+        return 1
+
+    try:
+        resp = P115Client.login_qrcode_scan_result(token["uid"], app=app, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[第 3 步·换取 cookie] 请求失败：{type(exc).__name__}: {str(exc)[:200]}")
+        return 1
     data = resp.get("data") or {}
     cookie = data.get("cookie")
     if isinstance(cookie, dict):
         cookie = "; ".join(f"{k}={v}" for k, v in cookie.items())
     if not cookie:
-        print("登录失败，响应：", str(resp)[:300])
+        print(f"[第 3 步·换取 cookie] 115 拒绝了：code={resp.get('code') or resp.get('errno')} "
+              f"{resp.get('message') or resp.get('error') or ''}")
+        print(f"手机已确认但身份「{label}」换不到 cookie，可在设置页换一个客户端身份再试。")
         return 1
     cfgmod.save_cookie(str(cookie))
-    print("cookie 已写入", cfgmod.CONFIG_PATH, "，重启容器生效：docker compose restart")
+    print("登录成功，cookie 已写入", cfgmod.CONFIG_PATH, "，重启容器生效：docker compose restart")
     return 0
 
 
