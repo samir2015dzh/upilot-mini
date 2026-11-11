@@ -70,6 +70,8 @@ docker compose exec upilot-mini python /app/app/main.py login  # 在运行中的
 ```
 
 终端里出二维码，用 115 App 扫；成功后 cookie 写入 `/config/config.yaml`，然后 `docker compose restart`。
+终端里的字符码扫不上（深色终端反色、被折行）时，用浏览器打开它同时打印的官方二维码图片链接再扫。
+二维码过期会自动换新的；失败时会说明卡在哪一步，并打印 115 返回的错误码。
 
 **`p115.app` 是什么？** 它是 115 客户端身份 —— 所有 115 请求（建目录 / 秒传 / 上传）都用它。
 挑一个自己平时不用的端即可，可选值（面板里是中文下拉，13 个）：
