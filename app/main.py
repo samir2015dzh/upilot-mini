@@ -148,18 +148,31 @@ async def _drain_background(grace: float) -> tuple[int, int]:
 async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = None) -> int:
     store = Store(cfg["state"]["db"])
 
-    def build_manager():
-        """按当前配置新建 115 客户端；界面改了 cookie 后重建它即可生效。"""
-        if dry_run:
-            return StubP115(cfg, store)
-        return P115(cfg, store)
+    state = {"dry_run": dry_run, "scan_rounds": 0}
 
-    manager = build_manager()
+    def build_uploader():
+        """按当前配置新建 115 客户端 + 调度器；界面改了 cookie 后重建即可生效。
+
+        还没有 cookie 时返回 None，而**不是**让 P115() 抛异常把进程带走：
+        README 与启动警告都让用户「在面板里粘贴 cookie」，可原来面板还没起来进程就退了，
+        容器随 restart 策略反复重启，`docker compose exec … login` 也进不去。
+        没有客户端时只扫描、不派发（派发会走到 ensure_pid，连续异常后把文件全标成「错误」），
+        cookie 一到（面板保存 / cookie_from 同步都会置 reload）下一轮就建起来。
+        """
+        if dry_run:
+            return Uploader(cfg, store, StubP115(cfg, store))
+        if not cfgmod.has_cookie(cfg):
+            state["need_cookie"] = True
+            logger.warning("还没有 115 cookie：先只扫描、不上传。在面板「设置 → 115 账号」粘贴 cookie，"
+                           "或配置 p115.cookie_from / 环境变量 P115_COOKIE，保存后自动开始")
+            return None
+        state.pop("need_cookie", None)
+        return Uploader(cfg, store, P115(cfg, store))
+
     if dry_run:
         logger.warning("dry-run 模式：不联网、不消耗流量，只验证扫描/去重/SHA1/目录映射/状态机")
-    uploader = Uploader(cfg, store, manager)
+    uploader = build_uploader()
 
-    state = {"dry_run": dry_run, "scan_rounds": 0}
     beat(state)
     http_srv = start_http(cfg, store, state)
 
@@ -218,16 +231,15 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
                     logger.info("收到界面指令：立即扫描")
                 if state.pop("reload", False):
                     logger.info("配置已更新：重建 115 客户端与调度器")
-                    manager = build_manager()
-                    uploader = Uploader(cfg, store, manager)
+                    uploader = build_uploader()
                 # 扫描放到线程里：os.walk + 逐个 stat 在几万个文件 / 网络挂载上要几秒到
                 # 几十秒，原来同步跑在事件循环里，期间在途的秒传、SHA1、巡检全被按住。
                 # 仍然 await 它跑完再 dispatch，所以「先扫后派发」的顺序不变。
                 await asyncio.to_thread(scanner.scan_once, store, cfg)
                 state["scan_rounds"] += 1
                 state["last_scan"] = time.time()
-                if state.get("paused"):
-                    pass          # 暂停调度：不再派发新任务，在途任务自然跑完
+                if state.get("paused") or uploader is None:
+                    pass          # 暂停调度 / 还没有 cookie：不再派发新任务，在途任务自然跑完
                 else:
                     one = state.pop("process_one", None)
                     if one:
@@ -255,13 +267,13 @@ async def run_service(cfg: dict, dry_run: bool, stop: asyncio.Event | None = Non
                 # 放在 paused 分支外面：巡检是「把云端已有的重复收敛掉」，不是派发上传任务。
                 # ★ 必须 spawn 到后台：原来这里是 `await`，巡检一跑就把主循环按住
                 # （实测 202 个目录时扫描间隔从 2s 变成 105s），其间不扫新文件、不派发任务。
-                if time.monotonic() - last_sweep >= SWEEP_INTERVAL:
+                if uploader is not None and time.monotonic() - last_sweep >= SWEEP_INTERVAL:
                     last_sweep = time.monotonic()
                     uploader.spawn_sweep()
                 # 「界面动作立刻巡检」：点「立即扫描 / 核对同集」也顺手核一遍，
-                # 免得用户刚传完还要等满 5 分钟才看到旧版被清掉。
-                if state.pop("sweep_now", False):
-                    if uploader.spawn_sweep():
+                # 免得用户刚传完还要等满 5 分钟才看到旧版被清掉。界面触发的一律全量核对。
+                if state.pop("sweep_now", False) and uploader is not None:
+                    if uploader.spawn_sweep(full=True):
                         logger.info("同集巡检（界面触发）：已开始核对云端同集")
                     else:
                         logger.info("同集巡检（界面触发）：上一轮还在跑，本次跳过")

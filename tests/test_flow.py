@@ -3147,8 +3147,6 @@ async def case_same_episode_time_judgment():
     必须用 `created_at` 而不是 `updated_at`：后者被每次状态写入刷新（scanner 推进
     `stable_count`、秒传命中改 message、用户点「重新排队」都会刷新），用它会让老版本
     看起来和新的差不多，判据失效。
-    另加护栏 `_newer_episode_sibling()`：同集已有**更新**的版本时本次不动手 ——
-    否则用户点在老版本上触发清理，会把真正的最新版删掉（结果与预期相反）。
     另把「同集多条但一条都没删」的静默改成可见 note。
     """
     cfg, store, mgr, _up0, tmp, src = make_env(stable_rounds=1)
@@ -3196,24 +3194,8 @@ async def case_same_episode_time_judgment():
         _fids3, names3 = up._same_episode_keeps(cloud_dir, p_new)
         assert OLD in names3, f"delete_after_upload 收尾删掉的正当版本没被保护：{names3}"
 
-        # ═══ D) 护栏：点在**老版本**上 → 必须识别出更新的版本、让位 ═══
-        # 注意方向：当前文件（p_old）要**更早**、另一条（p_new）要**更新**，
-        # 这样才对应「用户点了老版本那条的重新排队」。C 段把两条都改过时间，这里重设回去。
-        os.remove(p_new)
-        write_file(src, f"TVs/Drama/{NEW}", 9 * 1024 * 1024)
-        store.set(p_new, status="已上传", target_dir=cloud_dir, file_id="fid-NEW")
-        store.set(p_old, source_deleted=0, status="已上传", target_dir=cloud_dir, file_id="fid-OLD")
-        if not os.path.exists(p_old):
-            open(p_old, "wb").write(b"o" * (7 * 1024 * 1024))
-        store.db.execute("UPDATE files SET created_at=? WHERE path=?",
-                         (time.time() - 3 * 86400, p_old))    # 当前 = 老版本
-        store.db.execute("UPDATE files SET created_at=? WHERE path=?",
-                         (time.time(), p_new))                # 另一条 = 更新的版本
-        store.db.commit()
-        newer = up._newer_episode_sibling(cloud_dir, p_old)   # 当前=旧版
-        assert newer == NEW, f"点在老版本上时没识别出更新的版本（会把最新版删掉）：{newer!r}（p_old/created_at={store.get(p_old)['created_at']}, p_new/created_at={store.get(p_new)['created_at']}）"
-        newer2 = up._newer_episode_sibling(cloud_dir, p_new)  # 当前=最新版
-        assert newer2 == "", f"自己是最新时不该有更新的版本：{newer2!r}"
+        # （原 D 段测的是 Uploader._newer_episode_sibling：它从没接进生产路径，已删除。
+        #   「点在老版本上要让位」由 P115.cleanup_episode_newest 自己判，见用例 [87]。）
 
         # ═══ E) 「同集多条但一条都不删」必须可见（不能静默「没有旧版本」）═══
         class _Cloud:
@@ -3243,7 +3225,6 @@ async def case_same_episode_time_judgment():
 
         PASS.append("[42] 洗版重下后两个版本本地文件都在时旧版仍被清：判据加时间维度"
                     "（created_at 同批才保护，用 updated_at 会被状态写入刷新而失效）；"
-                    "护栏 _newer_episode_sibling 使「点在老版本上」让位给更新的版本而不是删掉它；"
                     "「同集多条但一条未删」由静默改为可见 note；"
                     "第 37 处（同批互不删）与第 38 处（收尾删除仍保护）回归通过")
     finally:
@@ -6050,6 +6031,249 @@ def case_mobile_panel_buttons():
                 f"输入框 16px 防缩放；桌面顶栏/表格保持原样；css+js gzip {gz} B")
 
 
+async def case_review_fixes():
+    """[87] 一组稳定性修复：
+    a) 没有 cookie 也能启动：只扫描不派发，面板有提示；cookie 到位后自动开始；
+    b) ?token= / Bearer / Basic 递交错误密码与登录页共用失败计数（原来可以无限次试）；
+    c) 同集巡检：跨入口同一目录只列一次；目录直接查库不受 2000 条限制；平时增量只列有新上传的那一层；
+    d) 洗版清理按 hasattr 选判据，新判据内部出错时不再悄悄退回旧判据；
+    e) 云端时间裁决时「本次上传那条不是最新」会让位（取代已删除的 _newer_episode_sibling）。
+    """
+    import main as mainmod
+    import uploader as upmod
+
+    # ---------- a) 无 cookie 启动 ----------
+    cfg, store, _mgr, _up, tmp, src = make_env(stable_rounds=1)
+    real_http, real_p115 = mainmod.start_http, mainmod.P115
+    try:
+        cfg["p115"]["cookie"] = ""
+        seen_state: dict = {}
+
+        def fake_http(c, st, state):
+            seen_state["s"] = state
+            return None
+
+        class FakeP115(StubP115):
+            def __init__(self, c, st):
+                assert (c["p115"]["cookie"] or "").strip(), "没有 cookie 时不该去建 115 客户端"
+                super().__init__(c, st)
+
+        mainmod.start_http, mainmod.P115 = fake_http, FakeP115
+        path = write_file(src, "TVs/Show/Show.S01E01.mkv", 64 * 1024)
+        stop = asyncio.Event()
+        svc = asyncio.create_task(mainmod.run_service(cfg, dry_run=False, stop=stop))
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if seen_state.get("s", {}).get("scan_rounds"):
+                break
+        assert not svc.done(), f"没有 cookie 时服务退出了：{svc.exception() if svc.done() else ''}"
+        state = seen_state["s"]
+        assert state.get("need_cookie") is True, state
+        assert webui._payload(cfg, store, state)["need_cookie"] is True
+        assert store.get(path)["status"] == "待处理", "没有 115 客户端时不该派发"
+        cfg["p115"]["cookie"] = "UID=1; CID=2; SEID=3"
+        state["reload"] = True
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if store.get(path)["status"] != "待处理":
+                break
+        assert "need_cookie" not in state, state
+        assert store.get(path)["status"] != "待处理", store.get(path)
+        stop.set()
+        await asyncio.wait_for(svc, timeout=15)
+    finally:
+        mainmod.start_http, mainmod.P115 = real_http, real_p115
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- b) 脚本通道计入登录限速 ----------
+    tmp = tempfile.mkdtemp(prefix="upilot-test-87b-")
+    srv = None
+    try:
+        wcfg = copy.deepcopy(cfgmod.DEFAULTS)
+        wcfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        wcfg["http"] = {"enabled": True, "host": "127.0.0.1", "port": 0,
+                        "auth": {"enabled": True, "mode": "form", "username": "admin",
+                                 "password": "pw-87"}}
+        srv = webui.serve(wcfg, Store(wcfg["state"]["db"]), {})
+        base = f"http://127.0.0.1:{srv.server_address[1]}/api/status"
+
+        def get(url, headers=None):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}),
+                                            timeout=5) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        def basic(pw):
+            return {"Authorization": "Basic " + base64.b64encode(f"admin:{pw}".encode()).decode()}
+
+        good_cookie = {"Cookie": f"{webui.COOKIE_NAME}={webui.make_session('admin', 'pw-87')}"}
+        webui._FAILURES.clear()
+        assert get(base, {"Authorization": "Bearer pw-87"}) == 200, "Bearer 头应能通过"
+        codes = [get(f"{base}?token=bad{i}") for i in range(webui.MAX_LOGIN_FAILURES)]
+        assert set(codes) == {401}, codes
+        assert get(f"{base}?token=pw-87") == 429, "锁定期间连对的 token 也不该收"
+        assert get(base, good_cookie) == 200, "已登录的会话不受锁定影响"
+        webui._FAILURES.clear()
+        codes = [get(base, basic(f"bad{i}")) for i in range(webui.MAX_LOGIN_FAILURES)]
+        assert set(codes) == {401} and get(base, basic("pw-87")) == 429, "Basic 也要计数"
+        webui._FAILURES.clear()
+        codes = [get(base, {"Authorization": f"Bearer bad{i}"}) for i in range(webui.MAX_LOGIN_FAILURES)]
+        assert get(base, {"Authorization": "Bearer pw-87"}) == 429, "Bearer 也要计数"
+        webui._FAILURES.clear()
+        assert get(f"{base}?token=pw-87") == 200
+        assert get(base) == 401 and not webui._FAILURES, "没递交密码的请求不计失败"
+    finally:
+        webui._FAILURES.clear()
+        if srv:
+            srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- c) 同集巡检请求数 ----------
+    class _Client:
+        def __init__(self, tree):
+            self.tree, self.calls = tree, []
+
+        async def fs_files(self, payload, async_=True):
+            self.calls.append(int(payload["cid"]))
+            return {"state": True, "data": [dict(r) for r in self.tree.get(int(payload["cid"]), [])]}
+
+    class _Mgr:
+        def __init__(self, tree, cids):
+            self.client, self.cids, self.deleted = _Client(tree), cids, []
+
+        async def cached_pid(self, d):
+            return self.cids.get(d)
+
+        async def delete_file(self, fid):
+            self.deleted.append(fid)
+            return True
+
+    tmp = tempfile.mkdtemp(prefix="upilot-test-87c-")
+    saved = {k: upmod._SHARED[k] for k in ("sweep_last_full", "sweep_since", "sweep_running")}
+    try:
+        scfg = copy.deepcopy(cfgmod.DEFAULTS)
+        scfg["state"] = {"db": os.path.join(tmp, "s.db")}
+        scfg["paths"]["target_root"] = "/R"
+        st = Store(scfg["state"]["db"])
+        tree: dict = {}
+        cids: dict = {}
+
+        def mk(path):
+            cid = 1000 + len(cids)
+            cids[path] = cid
+            tree[cid] = []
+            return cid
+
+        root = mk("/R")
+        n = 30
+        for i in range(n):
+            show = mk(f"/R/S{i}")
+            tree[root].append({"cid": show, "n": f"S{i}"})
+            tree[show].append({"fid": f"f{i}", "n": f"S{i}.S01E01.mkv", "s": 1, "te": 1})
+            pth = os.path.join(tmp, f"S{i}.S01E01.mkv")
+            st.add(pth, 1, 1.0)
+            st.set(pth, status="已上传", target_dir=f"/R/S{i}")
+        m = _Mgr(tree, cids)
+        r = await Uploader(scfg, st, m).sweep_cloud_episode_duplicates()
+        assert len(m.client.calls) == len(set(m.client.calls)) == n + 1, \
+            f"同一目录被重复列了：{len(m.client.calls)} 次请求 / {len(set(m.client.calls))} 个目录"
+        assert r["dirs"] == n + 1, r
+
+        # 增量：上次巡检之后没有新上传 → 一个请求都不发
+        mark = time.time() + 1
+        m = _Mgr(tree, cids)
+        r = await Uploader(scfg, st, m).sweep_cloud_episode_duplicates(full=False, since=mark)
+        assert m.client.calls == [] and r["dirs"] == 0, (m.client.calls, r)
+        # 只有一个目录有新上传 → 只列那一层
+        st.db.execute("UPDATE files SET updated_at=? WHERE target_dir='/R/S7'", (mark + 5,))
+        st.db.commit()
+        m = _Mgr(tree, cids)
+        await Uploader(scfg, st, m).sweep_cloud_episode_duplicates(full=False, since=mark)
+        assert m.client.calls == [cids["/R/S7"]], m.client.calls
+
+        # 主循环节奏：第一次全量，之后增量（记录改旧，避开增量窗口往前留的那 60 秒）
+        st.db.execute("UPDATE files SET updated_at=?", (time.time() - 3600,))
+        st.db.commit()
+        upmod._SHARED.update({"sweep_last_full": None, "sweep_since": None, "sweep_running": False})
+        m = _Mgr(tree, cids)
+        up = Uploader(scfg, st, m)
+        assert up.spawn_sweep()
+        await asyncio.gather(*list(upmod._SHARED["bg"]))
+        assert len(m.client.calls) == n + 1, len(m.client.calls)
+        assert upmod._SHARED["sweep_last_full"] is not None
+        m.client.calls.clear()
+        assert up.spawn_sweep()
+        await asyncio.gather(*list(upmod._SHARED["bg"]))
+        assert m.client.calls == [], f"刚全量过，增量不该再列：{m.client.calls}"
+        assert up.spawn_sweep(full=True)
+        await asyncio.gather(*list(upmod._SHARED["bg"]))
+        assert len(m.client.calls) == n + 1, "界面触发的要全量"
+
+        # 目标目录不再受 2000 条限制
+        st.apply_scan([(f"/x/{i}.mkv", 1, 1.0, None) for i in range(2500)], [])
+        st.db.execute("UPDATE files SET target_dir='/many/'||rowid WHERE path LIKE '/x/%'")
+        st.db.commit()
+        assert len(st.target_dirs()) == 2500 + n, len(st.target_dirs())
+    finally:
+        upmod._SHARED.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- d) 新判据内部出错不退回旧判据 ----------
+    cfg, store, _mgr, _up, tmp, src = make_env(stable_rounds=1)
+    try:
+        cfg["upload"]["cleanup_previous_versions"] = True
+        calls = {"legacy": 0}
+
+        class _Broken:
+            async def cleanup_episode_newest(self, *a, **k):
+                raise AttributeError("内部 bug")
+
+            async def cleanup_previous(self, *a, **k):
+                calls["legacy"] += 1
+                return {"deleted": ["不该删"]}
+
+        class _Legacy:
+            async def cleanup_previous(self, *a, **k):
+                calls["legacy"] += 1
+                return {"deleted": []}
+
+        path = write_file(src, "TVs/Show/Show.S01E02.mkv", 1024)
+        store.add(path, 1024, os.path.getmtime(path))
+        await Uploader(cfg, store, _Broken())._cleanup_prev_versions("/TVs/Show", 1, path)
+        assert calls["legacy"] == 0, "新判据出错时悄悄换成了旧判据"
+        await Uploader(cfg, store, _Legacy())._cleanup_prev_versions("/TVs/Show", 1, path)
+        assert calls["legacy"] == 1, "没有新方法的替身仍走老路径"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- e) 云端时间裁决：本次上传那条不是最新 → 让位 ----------
+    m = P115.__new__(P115)
+    m._dir_cache, m._dir_cache_ttl, m._dir_cache_max = {}, 30.0, 64
+    m._delete_lock = asyncio.Lock()
+    deleted: list = []
+
+    async def list_dir(pid, use_cache=True):
+        return [{"fid": "f-old", "pc": "pc-old", "n": "Show.S01E03.720p.mkv", "s": 1, "te": 1000},
+                {"fid": "f-new", "pc": "pc-new", "n": "Show.S01E03.2160p.mkv", "s": 2, "te": 2000}]
+
+    async def delete_file(fid):
+        deleted.append(fid)
+        return True
+
+    m.list_dir, m.delete_file = list_dir, delete_file
+    r = await m.cleanup_episode_newest(1, "Show.S01E03.720p.mkv", 3, keep_fid="pc-old")
+    assert deleted == [] and "不是最新" in r["note"], (deleted, r)
+    r = await m.cleanup_episode_newest(1, "Show.S01E03.2160p.mkv", 3, keep_fid="pc-new")
+    assert deleted == ["f-old"], (deleted, r)
+
+    PASS.append("[87] 没 cookie 也能启动（只扫描、面板提示，cookie 到位自动开始）；"
+                "?token=/Bearer/Basic 错误密码计入登录限速、已登录会话不受影响；"
+                "巡检同一目录只列一次、目录查库不限 2000 条、平时增量只列有新上传的那层；"
+                "洗版新判据出错不再退回旧判据；云端时间裁决时老版本让位")
+
+
 async def main():
     await case_folder_and_rapid_hit()
     await case_sha1_cached_no_reread()
@@ -6133,6 +6357,7 @@ async def main():
     case_scan_large_library_sidecars()
     case_retry_status_copy()
     case_mobile_panel_buttons()
+    await case_review_fixes()
     # 兜底：清掉遗留的测试临时目录（SQLite 句柄在 GC 后才释放，所以要重试几次）
     for _ in range(3):
         left = [d for d in glob.glob(os.path.join(tempfile.gettempdir(), "upilot-test-*")) if os.path.isdir(d)]

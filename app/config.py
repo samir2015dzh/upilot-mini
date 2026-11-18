@@ -76,6 +76,11 @@ def normalize_upload_mode(raw) -> str:
     return "rapid_then_upload" if v == "rapid_then_upload" else "rapid_only"
 
 
+def has_cookie(cfg: dict) -> bool:
+    """有没有可用的 115 cookie（只看非空，不校验是否过期）。"""
+    return bool(str(((cfg or {}).get("p115") or {}).get("cookie") or "").strip())
+
+
 def app_label(value: str) -> str:
     for item in APP_OPTIONS:
         if item["value"] == value:

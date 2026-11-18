@@ -1,9 +1,11 @@
 """Web 界面：单页仪表盘 + JSON API + 可选鉴权（纯标准库，无外部依赖）。
 
 鉴权（http.auth）两种模式，由 http.auth.mode 决定：
-  basic  默认。浏览器弹原生 Basic 框；脚本用 -u user:pass 或 ?token=pass
-  form   站内登录页 /login，登录后下发签名 Cookie 会话；Basic 与 ?token= 仍
+  basic  默认。浏览器弹原生 Basic 框；脚本用 -u user:pass、
+         -H "Authorization: Bearer <密码>" 或 ?token=pass
+  form   站内登录页 /login，登录后下发签名 Cookie 会话；Basic / Bearer / ?token= 仍
          保留为脚本通道（curl / 监控 / 反代探活不受影响）
+  脚本通道与登录页共用失败计数：同一来源连错 5 次锁 60 秒
 
 GET  /               单页界面（app/static/index.html）
 GET  /login          登录页（form 模式）
@@ -213,31 +215,47 @@ def check_credentials(a: dict, user: str, pwd: str) -> bool:
 
 
 def check_auth(cfg: dict, headers, query: str) -> bool:
-    """三条通道任一通过即放行：签名 Cookie / ?token=密码 / HTTP Basic。
+    """任一通道通过即放行：签名 Cookie / Bearer 头 / ?token=密码 / HTTP Basic。
 
     未开启鉴权（或没设密码）时恒真；/health 不走这里。
     """
+    return auth_attempt(cfg, headers, query)[0]
+
+
+def auth_attempt(cfg: dict, headers, query: str) -> tuple[bool, bool]:
+    """(是否通过, 这次请求有没有**递交密码**)。
+
+    第二项用来给登录限速计数：带了 `?token=` / `Authorization: Bearer` / Basic 却不对，
+    就是一次猜密码。原来只有 POST /login 记失败次数，这几条通道可以无限次试
+    （实测连发 30 次错 token、30 次错 Basic 都只回 401、从不锁定），
+    「连错 5 次锁 60 秒」形同虚设。签名 Cookie 不算递交密码（伪造不了 HMAC）。
+    """
     a = auth_cfg(cfg)
     if not _enabled(a):
-        return True
+        return True, False
     pwd = _password(a)
-    if _secure_eq(parse_qs(query).get("token", [""])[0], pwd):
-        return True
+    token = parse_qs(query).get("token", [""])[0]
+    raw = headers.get("Authorization", "") or ""
+    presented = bool(token) or raw.startswith(("Basic ", "Bearer "))
+    if token and _secure_eq(token, pwd):
+        return True, True
+    # 脚本优先用这个头：密码放在 URL 里会进反代访问日志和浏览器历史
+    if raw.startswith("Bearer ") and _secure_eq(raw[7:].strip(), pwd):
+        return True, True
     # 必须用 `is not None` 判断：parse_session 用「返回用户名」表示通过，
     # 而用户名可以是**空串**（面板把「用户名」清空，或用户登录时不填）。
     # 写成 `if parse_session(...):` 时 bool('') 为 False → 签名完全正确的会话
     # 被判成「没登录」，浏览器带着刚发的 cookie 又被弹回 /login，无限循环
     # （POST /login 返回 302 + Set-Cookie，日志还打「登录成功」）。
     if parse_session(parse_cookie(headers.get("Cookie", "")).get(COOKIE_NAME, ""), pwd) is not None:
-        return True
-    raw = headers.get("Authorization", "")
+        return True, False
     if raw.startswith("Basic "):
         try:
             user, _, given = base64.b64decode(raw[6:]).decode("utf-8", "replace").partition(":")
         except Exception:  # noqa: BLE001
-            return False
-        return check_credentials(a, user, given)
-    return False
+            return False, True
+        return check_credentials(a, user, given), True
+    return False, presented
 
 
 def _safe_next(raw: str) -> str:
@@ -259,8 +277,18 @@ def _rate_limited(ip: str) -> int:
         return 0
 
 
+# 失败计数表最多记这么多个来源：脚本通道也计数之后，换着来源猜密码会让表无限长大
+MAX_FAILURE_SOURCES = 4096
+
+
 def _note_failure(ip: str) -> None:
     with _FAIL_LOCK:
+        if ip not in _FAILURES and len(_FAILURES) >= MAX_FAILURE_SOURCES:
+            now = time.time()
+            for k in [k for k, (_, until) in _FAILURES.items() if until <= now]:
+                _FAILURES.pop(k, None)              # 先清没在锁定期的
+            while len(_FAILURES) >= MAX_FAILURE_SOURCES:
+                _FAILURES.pop(next(iter(_FAILURES)))  # 还满就丢最早的
         rec = _FAILURES.setdefault(ip, [0, 0.0])
         rec[0] += 1
         if rec[0] >= MAX_LOGIN_FAILURES:
@@ -372,6 +400,7 @@ def _payload(cfg: dict, store, state: dict) -> dict:
         "ok": True,
         "dry_run": bool(state.get("dry_run")),
         "paused": bool(state.get("paused")),
+        "need_cookie": bool(state.get("need_cookie")),
         "auth_failed": _auth_failed(),
         "rate_limited": _rate_limited_status(),
         "replacements": _replacements(store),
@@ -558,11 +587,32 @@ def serve(cfg: dict, store, state: dict) -> ThreadingHTTPServer | None:
             return self.client_address[0] if self.client_address else "?"
 
         def _guard(self) -> bool:
-            """放行返回 True；否则自行应答并返回 False。"""
+            """放行返回 True；否则自行应答并返回 False。
+
+            递交了密码（?token= / Bearer / Basic）的请求与 POST /login 共用一套失败计数：
+            连错 MAX_LOGIN_FAILURES 次锁 LOGIN_LOCK_SECONDS 秒，锁定期间连对的密码也不收。
+            已登录的签名 Cookie 不受锁定影响（不是猜密码的通道，也免得别人把你锁在外面）。
+            """
             a = auth_cfg(cfg)
-            if check_auth(cfg, self.headers, urlparse(self.path).query):
-                return True
+            ok, presented = auth_attempt(cfg, self.headers, urlparse(self.path).query)
             path = urlparse(self.path).path
+            if presented:
+                ip = self._client_ip()
+                left = _rate_limited(ip)
+                if left:
+                    logger.warning("鉴权尝试过多，已锁定（来源 %s，剩 %d 秒）", ip, left)
+                    if path.startswith("/api/"):
+                        return self._json({"ok": False, "error": f"尝试次数过多，请 {left} 秒后再试"},
+                                          429, extra={"Retry-After": str(left)})
+                    return self._send(429, f"too many attempts, retry in {left}s".encode(),
+                                      "text/plain", extra={"Retry-After": str(left)})
+                if ok:
+                    _note_success(ip)
+                else:
+                    _note_failure(ip)
+                    logger.warning("鉴权失败（来源 %s，%s）", ip, path)
+            if ok:
+                return True
             if _mode(a) == "form":
                 if path.startswith("/api/"):
                     return self._json({"ok": False, "error": "unauthorized",

@@ -309,6 +309,7 @@ function renderOverview(d) {
   $("#queue-list").innerHTML = ["待处理", "待秒传", "待重试", "待上传", "错误"]
     .map(k => `<div class="kv"><span>${k}</span><span>${q[k] || 0} 个</span></div>`).join("");
   const hints = [];
+  if (d.need_cookie) hints.push(`<div class="hint err">还没有 115 Cookie，目前只扫描、不上传。在「设置 → 115 账号」粘贴 Cookie 并保存后自动开始</div>`);
   if (d.auth_failed) hints.push(`<div class="hint err">115 登录已失效，请求已暂停。在「设置 → 115 账号」更新 Cookie 后自动恢复</div>`);
   if (d.rate_limited) {
     const m = Math.max(1, Math.ceil(Number(d.rate_limited.retry_in || 0) / 60));

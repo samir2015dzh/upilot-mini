@@ -52,6 +52,14 @@ SAME_BATCH_SECONDS = 1800.0
 # py_compile 查不出这类错误（运行时才炸），改完这类代码必须真跑一次。
 MAX_SWEEP_PAGES = 200
 
+# 同集巡检的节奏：主循环每 SWEEP_INTERVAL（5 分钟）起一次，但平时只核对「上次巡检之后
+# 有新上传的目录」，且只列那一层（刚传的文件就在 target_dir 里，同集重复也只会在那里）；
+# 每隔 SWEEP_FULL_INTERVAL 才全量走一遍（库里所有目标目录 + target_root，往下 3 层）。
+# 原来每 5 分钟全量：200 个季目录 ≈ 每天 5.8 万次列目录请求，且随片库线性增长。
+SWEEP_FULL_INTERVAL = 86400.0
+# 增量窗口往前多留一点：上传在巡检开始前一刻完成、updated_at 落在边界上也不会漏
+SWEEP_SINCE_SLACK = 60.0
+
 # 跨实例共享的调度状态。
 #
 # main.py 在改配置时（upload./retry./notify. 任意一项、或 115 cookie 同步）会重建
@@ -63,6 +71,8 @@ MAX_SWEEP_PAGES = 200
 # 所以统一放模块级共享。sem 只在并发数真的变了时重建（容量要跟着配置走）。
 _SHARED: dict = {"active": set(), "bg": set(), "err_streak": {}, "sem": None,
                  "sem_n": -1, "sweep_running": False,
+                 # 上次全量巡检时间 / 上次巡检开始时间（time.time()；None = 本进程还没跑过）
+                 "sweep_last_full": None, "sweep_since": None,
                  # 本轮秒传校验计数（主循环每轮取走一次、打一条汇总；见 take_rapid_summary）
                  "rapid_round": {"checked": 0, "hit": 0, "miss": 0},
                  # 115 登录失效断路器：None = 正常；否则 {"since","message","next_probe"}。
@@ -267,7 +277,8 @@ async def sha1_of(path: str, record: dict, store) -> str | None:
     if record.get("sha1"):
         return record["sha1"]
     # 下载还没写完：绝不能开始哈希，否则会把半成品的 SHA1 落库并拿去秒传。
-    if scanner.still_writing(path) or scanner.size_mtime_changed(path):
+    # size_mtime_changed 里有 0.15 秒 sleep：放线程里跑，别让每个要算 SHA1 的文件都卡住事件循环
+    if scanner.still_writing(path) or await asyncio.to_thread(scanner.size_mtime_changed, path):
         logger.info("文件还在写，暂不算 SHA1：%s", os.path.basename(path))
         return None
     reused = _reuse_sha1(path, record, store)
@@ -679,51 +690,6 @@ class Uploader:
                 fids.append(fid)
         return fids, names
 
-    def _newer_episode_sibling(self, cloud_dir: str, local_path: str) -> str:
-        """同集里是否存在**比当前文件更新**的已上传版本（且本地还在）—— 返回其文件名。
-
-        为什么要这道护栏（第 42 处的另一半）：清理的语义是「同集只留最新版」，由**谁**来
-        裁决「留谁」很关键。如果用户点的是**老版本**那条的「重新排队」，它会重新上传成功
-        （秒传命中），然后以「刚上传那条」的身份去清理 —— 于是**真正的最新版被当旧版删掉**，
-        结果与用户想要的相反（他差点就删错了）。
-
-        有这个更新的版本在时，本次交给它，自己不动手（日志写明原因）。
-        """
-        key = episode_key(os.path.basename(local_path))
-        if key is None:
-            return ""
-        cur = self.store.get(local_path) or {}
-        try:
-            cur_at = float(cur.get("created_at") or 0.0)
-        except (TypeError, ValueError):
-            return ""
-        if not cur_at:
-            return ""
-        newest_at, newest_name = cur_at, ""
-        try:
-            rows = self.store.by_status("已上传", limit=1000)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取同集已上传记录失败（不影响清理）：%s", exc)
-            return ""
-        for rec in rows or []:
-            path = str(rec.get("path") or "")
-            if not path or path == local_path:
-                continue
-            if rec.get("target_dir") != cloud_dir:
-                continue
-            base = os.path.basename(path)
-            if episode_key(base) != key:
-                continue
-            if not os.path.exists(path) and not int(rec.get("source_deleted") or 0):
-                continue                    # 本地已不在（且非程序删）→ 它自己就是被换掉的旧版
-            try:
-                at = float(rec.get("created_at") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if at - newest_at > SAME_BATCH_SECONDS:
-                newest_at, newest_name = at, base
-        return newest_name
-
     # ---------- 同集巡检（**纯云端**视角） ----------
     # 用户明确的话（原话）：「你只能在 115 云端去核对，本地肯定是没有的，因为本地的文件
     # 在秒传完已经被删掉了」。所以判据必须**全部**落在 115 返回的条目上 ——
@@ -839,7 +805,8 @@ class Uploader:
                 continue
         return out
 
-    async def sweep_cloud_episode_duplicates(self, max_delete: int = 0) -> dict:
+    async def sweep_cloud_episode_duplicates(self, max_delete: int = 0, full: bool = True,
+                                             since: float | None = None) -> dict:
         """同集巡检：**只看 115 云端**，同集多条时只留最近上传的那条。
 
         用户诉求（原话）：「上传到115以后校验115的那个文件夹里面有没有相同集数的视频，
@@ -854,31 +821,39 @@ class Uploader:
           2) 谁是「最新的那条」—— 115 条目自身的时间字段（见 `_CLOUD_TS_KEYS`）。
         拿不到时间字段时**保守不动手**，但日志必须可见（不再静默）。
 
+        `full=True`（默认 / 界面触发 / 每天一次）：库里所有目标目录 + target_root，各往下 3 层；
+        `full=False`（主循环平时）：只看 `since` 之后有更新的目标目录，且只列那一层。
+        所有入口共用一个「已列过」集合：入口目录互相包含时（target_root 与其下的季目录）
+        原来会重复列，实测 402 个目录发了 602 次请求。
+
         返回 {"removed": n, "dirs": 扫过的目录数, "note": 说明}；幂等（清完只剩一条）。
         """
         if not self.cleanup_prev:
             return {"removed": 0, "dirs": 0, "note": "开关 upload.cleanup_previous_versions 关着"}
         limit = max_delete or self.cleanup_max
         # ① 要扫的云端目录（只是路径字符串）
-        roots: list[str] = []
         try:
-            recs, _ = self.store.list_tasks(limit=2000)
+            # 增量只认「已上传」：待重试的文件每问一次秒传都会刷新 updated_at，
+            # 不过滤的话等待中的几百个目录每 5 分钟都会被列一遍
+            roots = [str(td).strip() for td in
+                     (self.store.target_dirs() if full
+                      else self.store.target_dirs(since, uploaded_only=True))
+                     if str(td).strip()]
         except Exception as exc:  # noqa: BLE001
             logger.warning("同集巡检：读取记录失败：%s", exc)
-            recs = []
-        for r in recs or []:
-            td = str(r.get("target_dir") or "").strip()
-            if td and td not in roots:
-                roots.append(td)
+            roots = []
         base = str((self.cfg.get("paths") or {}).get("target_root") or "").strip()
-        if base and base not in roots:
+        if full and base and base not in roots:
             roots.append(base)
         if not roots:
-            return {"removed": 0, "dirs": 0, "note": "没有可扫的云端目录"}
+            return {"removed": 0, "dirs": 0,
+                    "note": "没有可扫的云端目录" if full else "上次巡检后没有新上传的目录"}
+        max_depth = 3 if full else 0
 
         removed = 0
         scanned = 0
         lookup = self._local_lookup()
+        walked: set = set()                     # 跨入口共享，同一个云端目录只列一次
         for td in roots:
             rf = _SHARED.get("rate_limit")
             if rf and time.time() < float(rf.get("next_probe") or 0):
@@ -897,7 +872,7 @@ class Uploader:
                 logger.debug("同集巡检：目录 %s 没有 cid 缓存，跳过（不建目录）", td)
                 continue
             try:
-                tree = await self._cloud_walk(cid, 0, 3)
+                tree = await self._cloud_walk(cid, 0, max_depth, walked)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同集巡检：遍历 %s 失败：%s", td, exc)
                 continue
@@ -949,8 +924,9 @@ class Uploader:
             cache = getattr(self, "_dir_cache", None)
             if isinstance(cache, dict):
                 cache.clear()                               # 内容变了，缓存作废
+        kind = "全量" if full else "增量"
         return {"removed": removed, "dirs": scanned,
-                "note": f"扫了 {scanned} 个云端目录，清掉 {removed} 个同集旧版"}
+                "note": f"{kind}核对：扫了 {scanned} 个云端目录，清掉 {removed} 个同集旧版"}
 
     def _local_lookup(self, records: list[dict] | None = None):
         """云端条目 → 本地「下载时间」`(mtime, 首次入库时间)`；对不上返回 None。
@@ -1044,25 +1020,17 @@ class Uploader:
         name = os.path.basename(local_path)
         cur = self.store.get(local_path) or {}
         keep_fid = str(cur.get("file_id") or "")
+        # 用 hasattr 选路径，不能用 `except AttributeError` 兜：真实客户端与 dry-run 替身
+        # 都有 cleanup_episode_newest，那样写只有在它**内部**抛 AttributeError 时才会走到
+        # 老路径 —— 等于一出 bug 就悄悄换回注释里已判定会空转/误判的旧删除判据。
+        # 老路径只留给没有新方法的测试替身。
         try:
-            res = await self.mgr.cleanup_episode_newest(
-                pid, name, self.cleanup_max, keep_fid=keep_fid,
-                local_lookup=self._local_lookup(), dry_run=self.cleanup_dry)
-        except AttributeError:
-            # 兼容测试替身 / 旧实现（没有纯云端判据时退回老路径）
-            try:
-                size = os.path.getsize(local_path)
-            except OSError:
-                size = 0
-            keep_fids, keep_names = self._same_episode_keeps(cloud_dir, local_path)
-            try:
-                res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
-                                                      keep_fid=keep_fid,
-                                                      keep_fids=keep_fids,
-                                                      keep_names=keep_names)
-            except TypeError:
-                res = await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
-                                                      keep_fid=keep_fid)
+            if hasattr(self.mgr, "cleanup_episode_newest"):
+                res = await self.mgr.cleanup_episode_newest(
+                    pid, name, self.cleanup_max, keep_fid=keep_fid,
+                    local_lookup=self._local_lookup(), dry_run=self.cleanup_dry)
+            else:
+                res = await self._cleanup_legacy(cloud_dir, pid, name, local_path, keep_fid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("洗版清理出错（不影响上传）：%s", exc)
             return
@@ -1087,7 +1055,24 @@ class Uploader:
             cur = self.store.get(local_path) or {}
             self.store.set(local_path, message=(cur.get("message") or "") + tail)
 
-    def spawn_sweep(self) -> bool:
+    async def _cleanup_legacy(self, cloud_dir: str, pid: int, name: str, local_path: str,
+                              keep_fid: str) -> dict:
+        """老判据（cleanup_previous + 本地保护集合），只给没有 cleanup_episode_newest 的替身用。"""
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            size = 0
+        keep_fids, keep_names = self._same_episode_keeps(cloud_dir, local_path)
+        try:
+            return await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                   keep_fid=keep_fid,
+                                                   keep_fids=keep_fids,
+                                                   keep_names=keep_names)
+        except TypeError:
+            return await self.mgr.cleanup_previous(pid, name, size, self.cleanup_max,
+                                                   keep_fid=keep_fid)
+
+    def spawn_sweep(self, full: bool | None = None) -> bool:
         """把同集巡检丢到**后台**跑，不阻塞主循环。返回是否真的起了任务。
 
         为什么必须后台（实测数据，不是推测）：`scanner.scan_once()` / `uploader.dispatch()`
@@ -1102,14 +1087,25 @@ class Uploader:
 
         防重入：上一次巡检还没跑完就直接返回 False（巡检幂等，叠加没意义）。
         强引用：任务存进 `_SHARED["bg"]`，防止跑到一半被 GC 回收（与 `spawn` 同款）。
+
+        `full=None`（主循环定时）：本进程第一次、或距上次全量满 SWEEP_FULL_INTERVAL 时全量，
+        其余增量；`full=True`（界面「核对同集」）强制全量。
         """
         if _SHARED.get("sweep_running"):
             return False
         _SHARED["sweep_running"] = True
+        started = time.time()
+        last_full = _SHARED.get("sweep_last_full")
+        if full is None:
+            full = last_full is None or started - float(last_full) >= SWEEP_FULL_INTERVAL
+        prev_since = _SHARED.get("sweep_since")
+        since = None if prev_since is None else float(prev_since) - SWEEP_SINCE_SLACK
 
         async def run():
+            ok = False
             try:
-                r = await self.sweep_cloud_episode_duplicates()
+                r = await self.sweep_cloud_episode_duplicates(full=full, since=since)
+                ok = True
                 if (r or {}).get("removed"):
                     logger.info("同集巡检：%s", (r or {}).get("note"))
                 elif (r or {}).get("note"):
@@ -1117,6 +1113,11 @@ class Uploader:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("同集巡检出错（不影响上传）：%s", exc)
             finally:
+                if ok:
+                    # 只有跑完才推进窗口：出错的这轮下次增量还会再覆盖到
+                    _SHARED["sweep_since"] = started
+                    if full:
+                        _SHARED["sweep_last_full"] = started
                 _SHARED["sweep_running"] = False
 
         task = asyncio.get_running_loop().create_task(run())
