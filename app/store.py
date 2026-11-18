@@ -254,6 +254,22 @@ class Store:
                 "SELECT path, size, mtime, created_at, file_id, target_dir "
                 "FROM files WHERE status='已上传'").fetchall()]
 
+    def target_dirs(self, since: float | None = None, uploaded_only: bool = False) -> list[str]:
+        """库里出现过的云端目标目录（去重）。`since` 给了就只要这之后有更新的记录。
+
+        同集巡检用：原来取 `list_tasks(limit=2000)` 再在 Python 里去重 —— 只看最近更新的
+        2000 条，片库一大，更早传过的目录就永远巡检不到（实测 3000 个目录只看到 2000 个）。
+        """
+        sql = "SELECT DISTINCT target_dir FROM files WHERE target_dir IS NOT NULL AND target_dir<>''"
+        args: list = []
+        if uploaded_only:
+            sql += " AND status='已上传'"
+        if since is not None:
+            sql += " AND updated_at>=?"
+            args.append(float(since))
+        with self.lock:
+            return [r[0] for r in self.db.execute(sql + " ORDER BY target_dir", args).fetchall()]
+
     def counts(self) -> dict:
         with self.lock:
             rows = self.db.execute("SELECT status, COUNT(*) c FROM files GROUP BY status").fetchall()
