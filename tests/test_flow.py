@@ -6274,8 +6274,182 @@ async def case_review_fixes():
                 "洗版新判据出错不再退回旧判据；云端时间裁决时老版本让位")
 
 
+async def case_review_file_identity():
+    """[88] 空文件可结束；新内容不继承旧断点；空源被替换后不能误删。"""
+    from pathlib import Path
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0, fail_first=0, mode="rapid_only")
+    try:
+        empty = write_file(src, "Show/empty.mkv", 0)
+        scanner.scan_once(store, cfg)
+        rec = await drive(up, store, empty)
+        assert rec["status"] == "已上传", rec
+        assert rec["upload_mode"] == "rapid", rec
+        assert not up._file_changed_on_disk(empty, rec)
+
+        # 同路径换成非空内容，即便保留原 mtime，旧空文件记录也绝不能授权删除。
+        st = os.stat(empty)
+        Path(empty).write_bytes(b"replacement")
+        os.utime(empty, ns=(st.st_atime_ns, st.st_mtime_ns))
+        up.delete_after = True
+        up._delete_source(empty, rec)
+        assert Path(empty).read_bytes() == b"replacement"
+        assert store.get(empty)["source_deleted"] == 0
+
+        # 没被替换的空文件仍能按显式配置收尾删除，不能用“一律不删空文件”避错。
+        unchanged = write_file(src, "Show/unchanged.mkv", 0)
+        store.add(unchanged, 0, os.path.getmtime(unchanged))
+        up._delete_source(unchanged, store.get(unchanged))
+        assert not os.path.exists(unchanged)
+        assert store.get(unchanged)["source_deleted"] == 1
+
+        ps = 1024 * 1024
+        path = write_file(src, "Show/replaced.mkv", 2 * ps)
+        Path(path).write_bytes(b"N" * (2 * ps))
+        store.add(path, 1, 1.0)
+        store.set(path, sha1="old-sha", status="上传中", upload_id="upload-old",
+                  upload_oss_url="https://oss.example/o", upload_callback='{"cb":1}',
+                  upload_partsize=ps, upload_mode="uploaded", ino="old-inode",
+                  created_at=1, retry_count=8, first_failed_at=1, next_retry_at=10**12,
+                  source_deleted=1, file_id="old-file", progress=50, speed=123)
+        before = time.time()
+        up._requeue_changed_file(path)
+        fresh = store.get(path)
+        assert fresh["status"] == "待处理" and fresh["stable_count"] == 0, fresh
+        for key in ("sha1", "file_id", "upload_id", "upload_oss_url", "upload_callback",
+                    "upload_partsize", "upload_mode", "first_failed_at", "next_retry_at"):
+            assert fresh[key] is None, (key, fresh)
+        assert fresh["retry_count"] == fresh["source_deleted"] == fresh["progress"] == fresh["speed"] == 0
+        assert fresh["ino"] == scanner.file_ino(os.stat(path)), fresh
+        assert fresh["created_at"] >= before, fresh
+        # 真实 multipart 实现 + 纯内存 OSS：新文件必须从 0 开始，不能拼接旧前缀。
+        m = _bare_p115(store, ps)
+        with _FakeOSS({1: b"O" * ps}) as oss:
+            await m.multipart(path, 700, "new-sha", fresh)
+            assert oss.calls[0]["offset"] == 0 and oss.calls[0]["start"] == 1, oss.calls
+            assert oss.assembled() == b"N" * (2 * ps)
+        PASS.append("[88] 空文件正常秒传结束；被替换的空源保留；新内容清除旧断点/身份/退避后从零上传")
+    finally:
+        store.db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_review_resume_listing_failure():
+    """[89] 查询旧分块遇到已知临时故障必须保留断点，真正无效的旧记录仍可新建。"""
+    import errno
+    from unittest.mock import patch
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        ps = 1024 * 1024
+        path = write_file(src, "Show/resume.mkv", 2 * ps)
+        store.add(path, os.path.getsize(path), os.path.getmtime(path))
+        store.set(path, upload_id="upload-old", upload_oss_url="https://oss.example/o",
+                  upload_callback='{"cb":1}', upload_partsize=ps)
+        old = store.get(path)
+        auth_error = type("P115AuthenticationError", (Exception,), {})
+        errors = [ConnectionResetError("connection lost"), TimeoutError("timeout"),
+                  auth_error("expired"), p115.RateLimitedError("429"),
+                  OSError(errno.EBUSY, "busy"),
+                  urllib.error.HTTPError("https://oss.example/o", 503, "busy", {}, None)]
+        for exc in errors:
+            with _FakeOSS({1: b"O" * ps}) as oss:
+                async def fail_list(self, async_=True, **kw):
+                    raise exc
+
+                cls = oss.mods["p115client.tool"].P115MultipartUpload
+                with patch.object(cls, "list_parts", fail_list):
+                    try:
+                        await _bare_p115(store, ps).multipart(path, 700, "sha", old)
+                    except Exception as got:
+                        assert got is exc, (got, exc)
+                    else:
+                        raise AssertionError(f"{type(exc).__name__} 被吞掉后重新上传")
+                assert oss.calls == [] and oss.completed is None
+                for key in ("upload_id", "upload_oss_url", "upload_callback", "upload_partsize"):
+                    assert store.get(path)[key] == old[key], key
+                # 下一次成功查询必须继续旧前缀，而非换 upload_id 重传。
+                await _bare_p115(store, ps).multipart(path, 700, "sha", store.get(path))
+                assert oss.calls[0]["offset"] == ps and oss.calls[0]["start"] == 2, oss.calls
+                assert store.get(path)["upload_id"] == "upload-old"
+
+        # 已损坏的 JSON 断点保留原恢复行为；不把所有异常一概永久上抛。
+        store.set(path, upload_callback="invalid-json")
+        with _FakeOSS() as oss:
+            await _bare_p115(store, ps).multipart(path, 700, "sha", store.get(path))
+            assert oss.calls[0]["offset"] == 0
+            assert store.get(path)["upload_id"] == "upload-new"
+        PASS.append("[89] 旧分块查询的网络/超时/认证/限流/繁忙故障保留断点；下次从旧偏移继续；损坏记录可新建")
+    finally:
+        store.db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def case_review_backup_isolation():
+    """[90] 并发备份各用私有临时文件，失败不破坏上次有效备份。"""
+    import concurrent.futures
+    import sqlite3
+    from pathlib import Path
+    from unittest.mock import patch
+
+    cfg, store, mgr, up, tmp, src = make_env(stable_rounds=0)
+    try:
+        store.add(os.path.join(src, "fixture.mkv"), 42, 123)
+        dest = os.path.join(tmp, "state.db.bak")
+        gate = threading.Barrier(2)
+        seen = []
+        real_connect = sqlite3.connect
+
+        def connect(path, *args, **kw):
+            seen.append(str(path))
+            gate.wait(timeout=10)
+            return real_connect(path, *args, **kw)
+
+        with patch.object(store_store.sqlite3, "connect", connect):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(store.backup, dest) for _ in range(2)]
+                assert all(f.result(timeout=15) > 0 for f in futures)
+        assert len(seen) == len(set(seen)) == 2, seen
+        assert all(not os.path.exists(path) for path in seen)
+        con = real_connect(dest)
+        try:
+            assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert con.execute("SELECT size FROM files").fetchone()[0] == 42
+        finally:
+            con.close()
+        old = Path(dest).read_bytes()
+        for obj, attr in ((store_store.sqlite3, "connect"), (store_store.os, "replace")):
+            with patch.object(obj, attr, side_effect=OSError("synthetic backup failure")):
+                try:
+                    store.backup(dest)
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("注入的备份失败未上抛")
+            assert Path(dest).read_bytes() == old
+            assert list(Path(tmp).glob("state.db.bak.*.tmp")) == []
+        PASS.append("[90] 双线程同目标备份隔离、完整且不遗留临时文件；建连接/替换失败保留旧备份")
+    finally:
+        store.db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_review_field_lookup():
+    """[91] 去重后保留查字段的两个入口、对象身份和未知字段行为。"""
+    for group in cfgmod.FIELD_GROUPS:
+        for field in group["fields"]:
+            assert cfgmod.find_field(field["key"]) is field
+            assert cfgmod._field_by_key(field["key"]) is field
+    assert cfgmod.find_field("unknown.review.field") is None
+    PASS.append("[91] 字段查询共享实现，保留两个入口、元数据对象身份及未知字段返回 None")
+
+
 async def main():
     await case_folder_and_rapid_hit()
+    await case_review_file_identity()
+    await case_review_resume_listing_failure()
+    await case_review_backup_isolation()
+    case_review_field_lookup()
     await case_sha1_cached_no_reread()
     await case_small_file_goes_direct_upload()
     await case_retry_exhausted_falls_back()

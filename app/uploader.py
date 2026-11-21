@@ -14,6 +14,7 @@ import logging
 import mmap
 import os
 import random
+import stat
 import threading
 import time
 
@@ -536,7 +537,8 @@ class Uploader:
         except OSError:
             return True                                  # 文件没了，也按「已变」处理
         try:
-            if int(rec.get("size") or -1) != int(st.st_size):
+            size = rec.get("size")
+            if int(size if size is not None else -1) != st.st_size:
                 return True
             return abs(float(rec.get("mtime") or 0) - st.st_mtime) > 1e-6
         except (TypeError, ValueError):
@@ -546,8 +548,13 @@ class Uploader:
         """上传期间文件被替换：重置成新文件重新入队（不是「已上传」）。"""
         try:
             st = os.stat(path)
+            # 新内容不能继承旧分块、重试窗口或 inode/SHA1 身份。
             self.store.set(path, status="待处理", size=st.st_size, mtime=st.st_mtime,
-                           sha1=None, stable_count=0, file_id=None, progress=0.0,
+                           sha1=None, stable_count=0, file_id=None, progress=0.0, speed=0.0,
+                           upload_id=None, upload_callback=None, upload_oss_url=None,
+                           upload_partsize=None, upload_mode=None, retry_count=0,
+                           first_failed_at=None, next_retry_at=None,
+                           ino=scanner.file_ino(st), created_at=time.time(),
                            # 事实作废：文件是被换掉的，不是本程序收尾删的
                            source_deleted=0,
                            message="上传期间文件被替换（洗版重下），已按新内容重新入队")
@@ -594,18 +601,16 @@ class Uploader:
             if not real.startswith(root + os.sep):
                 logger.warning("不删（不在监控目录内）：%s", path)
                 return
-            if not os.path.isfile(real):
+            st = os.stat(real)
+            if not stat.S_ISREG(st.st_mode):
                 return
             size = int(rec.get("size") or 0)
-            if size and os.path.getsize(real) != size:
+            if st.st_size != size:
                 logger.warning("不删（大小已变，可能被换过）：%s", path)
                 return
             # 光比大小不够：洗版重下可能恰好同 size（同一集的不同版本往往只差几 MB，
             # 也存在大小完全相同的编码）。删是破坏性的，必须连 mtime 一起对上才动手。
-            try:
-                same_mtime = abs(float(rec.get("mtime") or 0) - os.path.getmtime(real)) <= 1e-6
-            except OSError:
-                same_mtime = False
+            same_mtime = abs(float(rec.get("mtime") or 0) - st.st_mtime) <= 1e-6
             if not same_mtime:
                 logger.warning("不删（修改时间已变，文件被换过）：%s", path)
                 self._requeue_changed_file(path)

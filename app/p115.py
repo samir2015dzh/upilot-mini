@@ -1051,6 +1051,10 @@ class P115:
                 parts = list(await up.list_parts(async_=True, headers=headers) or [])
                 logger.info("断点续传：%s 已有 %d 个分块", os.path.basename(file_path), len(parts))
             except Exception as exc:  # noqa: BLE001
+                # 暂时读不到分块不等于断点失效；交给调度器退避，不能重传已完成的块。
+                if (is_auth_error(exc) or is_rate_limited(exc)
+                        or is_soft_busy(exc) or is_part_retryable(exc)):
+                    raise
                 logger.warning("断点失效（%s），从头开始：%s", os.path.basename(file_path), exc)
                 up, parts = None, []
 

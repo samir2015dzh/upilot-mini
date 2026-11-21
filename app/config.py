@@ -685,11 +685,7 @@ def _plant(data: dict, key: str, value) -> None:
 
 
 def find_field(key: str) -> dict | None:
-    for group in FIELD_GROUPS:
-        for field in group["fields"]:
-            if field["key"] == key:
-                return field
-    return None
+    return _field_by_key(key)
 
 
 def coerce(field: dict, raw) -> object:
