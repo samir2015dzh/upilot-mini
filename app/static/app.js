@@ -400,7 +400,8 @@ async function refreshOverview() {
     $("#live-text").textContent = (S.auto ? `每 ${S.refreshMs / 1000} 秒自动刷新` : "自动刷新已关闭") + " · 刚刚同步";
   } catch (e) {
     $("#live-dot").classList.add("off");
-    $("#live-text").textContent = "连接中断，正在重连…";
+    $("#live-text").textContent = S.auto && S.tab !== "settings"
+      ? "连接中断，等待自动刷新…" : "连接中断，请手动刷新数据";
   }
 }
 
