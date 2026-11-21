@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -93,20 +94,25 @@ class Store:
     def backup(self, dest: str) -> int:
         """用 SQLite 在线备份 API 把整个库拷到 dest（先写临时文件再原子替换，读写不被阻塞太久）。
         返回备份文件字节数。库丢了的代价是所有文件的 SHA1 全部重算、断点全部作废，所以值得留一份。"""
-        tmp = f"{dest}.tmp"
+        target = Path(dest)
+        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+        os.close(fd)
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        out = sqlite3.connect(tmp)
-        try:
-            with self.lock:
-                self.db.backup(out, pages=1024)          # 分批拷，期间别的线程可以插队写
-            out.commit()
+            out = sqlite3.connect(tmp)
+            try:
+                with self.lock:
+                    self.db.backup(out, pages=1024)
+                out.commit()
+            finally:
+                out.close()
+            size = os.path.getsize(tmp)
+            os.replace(tmp, dest)
+            return size
         finally:
-            out.close()
-        os.replace(tmp, dest)
-        return os.path.getsize(dest)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _migrate(self) -> None:
         """老库补列：按 DDL 全量对齐，以后新增字段不用再手工登记一条 ALTER。
